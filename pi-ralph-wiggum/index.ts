@@ -10,6 +10,7 @@ import { Type } from "@sinclair/typebox";
 
 const RALPH_DIR = ".ralph";
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
+const SESSION_RESET_MARKER = "Previous Ralph loop transcript intentionally discarded. Continue from current task state only.";
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -39,6 +40,9 @@ Pause and reflect on your progress:
 Update the task file with your reflection, then continue working.`;
 
 type LoopStatus = "active" | "paused" | "completed";
+type SessionStrategy = "followUp" | "newSession";
+type SessionStrategyFailure = "followUp" | "stopAndAlert";
+
 
 interface LoopState {
 	name: string;
@@ -53,6 +57,8 @@ interface LoopState {
 	startedAt: string;
 	completedAt?: string;
 	lastReflectionAt: number; // Last iteration we reflected at
+	sessionStrategy: SessionStrategy;
+	sessionStrategyFailure: SessionStrategyFailure;
 }
 
 const STATUS_ICONS: Record<LoopStatus, string> = { active: "▶", paused: "⏸", completed: "✓" };
@@ -113,6 +119,15 @@ export default function (pi: ExtensionAPI) {
 
 	// --- State management ---
 
+	function parseSessionStrategy(value: unknown): SessionStrategy {
+		return value === "newSession" ? "newSession" : "followUp";
+	}
+
+	function parseSessionStrategyFailure(value: unknown): SessionStrategyFailure {
+		return value === "stopAndAlert" ? "stopAndAlert" : "followUp";
+	}
+
+
 	function migrateState(raw: Partial<LoopState> & { name: string }): LoopState {
 		if (!raw.status) raw.status = raw.active ? "active" : "paused";
 		raw.active = raw.status === "active";
@@ -123,6 +138,8 @@ export default function (pi: ExtensionAPI) {
 		if ("lastReflectionAtItems" in raw && raw.lastReflectionAt === undefined) {
 			raw.lastReflectionAt = (raw as any).lastReflectionAtItems;
 		}
+		raw.sessionStrategy = parseSessionStrategy(raw.sessionStrategy);
+		raw.sessionStrategyFailure = parseSessionStrategyFailure(raw.sessionStrategyFailure);
 		return raw as LoopState;
 	}
 
@@ -247,6 +264,21 @@ export default function (pi: ExtensionAPI) {
 		return parts.join("\n");
 	}
 
+	function buildResetPrompt(state: LoopState, taskContent: string, isReflection: boolean): string {
+		return `${SESSION_RESET_MARKER}\n\n${buildPrompt(state, taskContent, isReflection)}`;
+	}
+
+	function getIterationContent(ctx: ExtensionContext, state: LoopState): { content: string; needsReflection: boolean } | null {
+		const content = tryRead(path.resolve(ctx.cwd, state.taskFile));
+		if (!content) return null;
+		const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
+		return { content, needsReflection };
+	}
+
+	function dispatchNextIterationFollowUp(state: LoopState, taskContent: string, needsReflection: boolean): void {
+		pi.sendUserMessage(buildPrompt(state, taskContent, needsReflection), { deliverAs: "followUp" });
+	}
+
 	// --- Arg parsing ---
 
 	function parseArgs(argsStr: string) {
@@ -257,6 +289,8 @@ export default function (pi: ExtensionAPI) {
 			itemsPerIteration: 0,
 			reflectEvery: 0,
 			reflectInstructions: DEFAULT_REFLECT_INSTRUCTIONS,
+			sessionStrategy: "followUp" as SessionStrategy,
+			sessionStrategyFailure: "followUp" as SessionStrategyFailure,
 		};
 
 		for (let i = 0; i < tokens.length; i++) {
@@ -274,6 +308,12 @@ export default function (pi: ExtensionAPI) {
 			} else if (tok === "--reflect-instructions" && next) {
 				result.reflectInstructions = next.replace(/^"|"$/g, "");
 				i++;
+			} else if (tok === "--session-strategy" && next) {
+				result.sessionStrategy = parseSessionStrategy(next.replace(/^"|"$/g, ""));
+				i++;
+			} else if (tok === "--session-strategy-failure" && next) {
+				result.sessionStrategyFailure = parseSessionStrategyFailure(next.replace(/^"|"$/g, ""));
+				i++;
 			} else if (!tok.startsWith("--")) {
 				result.name = tok;
 			}
@@ -283,12 +323,12 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Commands ---
 
-	const commands: Record<string, (rest: string, ctx: ExtensionContext) => void> = {
+	const commands: Record<string, (rest: string, ctx: any) => void | Promise<void>> = {
 		start(rest, ctx) {
 			const args = parseArgs(rest);
 			if (!args.name) {
 				ctx.ui.notify(
-					"Usage: /ralph start <name|path> [--items-per-iteration N] [--reflect-every N] [--max-iterations N]",
+					"Usage: /ralph start <name|path> [--items-per-iteration N] [--reflect-every N] [--max-iterations N] [--session-strategy MODE] [--session-strategy-failure MODE]",
 					"warning",
 				);
 				return;
@@ -311,6 +351,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Created task file: ${taskFile}`, "info");
 			}
 
+
 			const state: LoopState = {
 				name: loopName,
 				taskFile,
@@ -323,6 +364,8 @@ export default function (pi: ExtensionAPI) {
 				status: "active",
 				startedAt: existing?.startedAt || new Date().toISOString(),
 				lastReflectionAt: 0,
+				sessionStrategy: args.sessionStrategy,
+				sessionStrategyFailure: args.sessionStrategyFailure,
 			};
 
 			saveState(ctx, state);
@@ -395,6 +438,53 @@ export default function (pi: ExtensionAPI) {
 			const needsReflection =
 				state.reflectEvery > 0 && state.iteration > 1 && (state.iteration - 1) % state.reflectEvery === 0;
 			pi.sendUserMessage(buildPrompt(state, content, needsReflection));
+		},
+
+		async _continue_session(rest, ctx) {
+			const loopName = rest.trim();
+			if (!loopName) return;
+
+			const state = loadState(ctx, loopName);
+			if (!state || state.status !== "active") return;
+
+			const iterationData = getIterationContent(ctx, state);
+			if (!iterationData) {
+				pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. Could not read task file: ${state.taskFile}`);
+				return;
+			}
+
+			const { content, needsReflection } = iterationData;
+			const resetPrompt = buildResetPrompt(state, content, needsReflection);
+
+			try {
+				if (typeof ctx.waitForIdle === "function") {
+					await ctx.waitForIdle();
+				}
+
+				const result = await ctx.newSession({
+					withSession: async (nextCtx: any) => {
+						await nextCtx.sendUserMessage(resetPrompt);
+					},
+				});
+
+				if (result?.cancelled) {
+					throw new Error("Fresh session creation was cancelled");
+				}
+			} catch (error) {
+				const detail = error instanceof Error ? error.message : String(error);
+				if (state.sessionStrategyFailure === "stopAndAlert") {
+					pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. Failed to create fresh session: ${detail}`);
+					return;
+				}
+
+				if (ctx.hasUI) {
+					ctx.ui.notify(
+						`Fresh-session continuation failed for "${state.name}". Falling back to follow-up: ${detail}`,
+						"warning",
+					);
+				}
+				dispatchNextIterationFollowUp(state, content, needsReflection);
+			}
 		},
 
 		status(_rest, ctx) {
@@ -548,12 +638,15 @@ Options:
   --items-per-iteration N  Suggest N items per turn (prompt hint)
   --reflect-every N        Reflect every N iterations
   --max-iterations N       Stop after N iterations (default 50)
+  --session-strategy MODE  Next-iteration dispatch: followUp or newSession
+  --session-strategy-failure MODE  On newSession failure: followUp or stopAndAlert
 
 To stop: press ESC to interrupt, then run /ralph-stop when idle
 
 Examples:
   /ralph start my-feature
-  /ralph start review --items-per-iteration 5 --reflect-every 10`;
+  /ralph start review --items-per-iteration 5 --reflect-every 10
+  /ralph start clean-slate --session-strategy newSession --session-strategy-failure stopAndAlert`;
 
 	pi.registerCommand("ralph", {
 		description: "Ralph Wiggum - long-running development loops",
@@ -614,6 +707,8 @@ Examples:
 			itemsPerIteration: Type.Optional(Type.Number({ description: "Suggest N items per turn (0 = no limit)" })),
 			reflectEvery: Type.Optional(Type.Number({ description: "Reflect every N iterations" })),
 			maxIterations: Type.Optional(Type.Number({ description: "Max iterations (default: 50)", default: 50 })),
+			sessionStrategy: Type.Optional(Type.String({ description: "How to dispatch the next iteration: followUp or newSession" })),
+			sessionStrategyFailure: Type.Optional(Type.String({ description: "What to do if fresh-session creation fails: followUp or stopAndAlert" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const loopName = sanitize(params.name);
@@ -639,6 +734,8 @@ Examples:
 				status: "active",
 				startedAt: new Date().toISOString(),
 				lastReflectionAt: 0,
+				sessionStrategy: parseSessionStrategy(params.sessionStrategy),
+				sessionStrategyFailure: parseSessionStrategyFailure(params.sessionStrategyFailure),
 			};
 
 			saveState(ctx, state);
@@ -697,20 +794,28 @@ Examples:
 				return { content: [{ type: "text", text: "Max iterations reached. Loop stopped." }], details: {} };
 			}
 
-			const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
+			const iterationData = getIterationContent(ctx, state);
+			if (!iterationData) {
+				pauseLoop(ctx, state);
+				return { content: [{ type: "text", text: `Error: Could not read task file: ${state.taskFile}` }], details: {} };
+			}
+
+			const { content, needsReflection } = iterationData;
 			if (needsReflection) state.lastReflectionAt = state.iteration;
 
 			saveState(ctx, state);
 			updateUI(ctx);
 
-			const content = tryRead(path.resolve(ctx.cwd, state.taskFile));
-			if (!content) {
-				pauseLoop(ctx, state);
-				return { content: [{ type: "text", text: `Error: Could not read task file: ${state.taskFile}` }], details: {} };
+			if (state.sessionStrategy === "newSession") {
+				pi.sendUserMessage(`/ralph _continue_session ${state.name}`, { deliverAs: "followUp" });
+				return {
+					content: [{ type: "text", text: `Iteration ${state.iteration - 1} complete. Fresh-session continuation queued.` }],
+					details: {},
+				};
 			}
 
 			// Queue next iteration - use followUp so user can still interrupt
-			pi.sendUserMessage(buildPrompt(state, content, needsReflection), { deliverAs: "followUp" });
+			dispatchNextIterationFollowUp(state, content, needsReflection);
 
 			return {
 				content: [{ type: "text", text: `Iteration ${state.iteration - 1} complete. Next iteration queued.` }],

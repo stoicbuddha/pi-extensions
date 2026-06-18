@@ -74,6 +74,34 @@ If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, ju
 | `--items-per-iteration N` | Suggest N items per turn (prompt hint) |
 | `--reflect-every N` | Reflect every N iterations |
 
+## Session Reset Options
+
+Session reset is configured per loop, alongside the other Ralph iteration settings.
+
+CLI example:
+
+```bash
+/ralph start clean-slate --session-strategy newSession --session-strategy-failure stopAndAlert
+```
+
+Agent tool example:
+
+```ts
+ralph_start({
+  name: "clean-slate",
+  taskContent: "# Task\n\n## Checklist\n- [ ] Item 1",
+  sessionStrategy: "newSession",
+  sessionStrategyFailure: "stopAndAlert"
+})
+```
+
+Options:
+
+- `sessionStrategy`: `followUp` or `newSession`
+- `sessionStrategyFailure`: `followUp` or `stopAndAlert`
+
+`newSession` starts the next Ralph iteration in a fresh session seeded from the current task file instead of carrying forward the prior loop transcript. If fresh-session creation fails, `sessionStrategyFailure` controls whether Ralph falls back to normal follow-up behavior or pauses and alerts you.
+
 ## Agent Tool
 
 The agent can self-start loops using `ralph_start`:
@@ -84,7 +112,9 @@ ralph_start({
   taskContent: "# Task\n\n## Checklist\n- [ ] Item 1",
   maxIterations: 50,
   itemsPerIteration: 3,
-  reflectEvery: 10
+  reflectEvery: 10,
+  sessionStrategy: "followUp",
+  sessionStrategyFailure: "followUp"
 })
 ```
 
