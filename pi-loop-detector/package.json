@@ -1,0 +1,30 @@
+{
+  "name": "@matt/pi-loop-detector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Detect looping agent behavior early and recommend deterministic interventions in Pi.",
+  "license": "MIT",
+  "author": "Matt",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ],
+    "skills": [
+      "SKILL.md"
+    ]
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@sinclair/typebox": "^0.34.38"
+  }
+}

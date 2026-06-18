@@ -1,0 +1,26 @@
+{
+  "name": "pi-loop-detector",
+  "version": "0.1.0",
+  "description": "Detects looping agent behavior and recommends deterministic interventions.",
+  "author": {
+    "name": "Matt"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Pi Loop Detector",
+    "shortDescription": "Detect repeated nonproductive agent behavior early.",
+    "longDescription": "Provides heuristic loop detection, compact evidence packets, optional isolated judging, and deterministic intervention recommendations.",
+    "developerName": "Matt",
+    "category": "Productivity",
+    "capabilities": [
+      "Analyze",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Detect whether this agent is stuck in a tool loop.",
+      "Build an evidence packet for suspicious repeated tool behavior.",
+      "Recommend a deterministic intervention for a looping run."
+    ],
+    "brandColor": "#B45309"
+  }
+}
