@@ -19,12 +19,23 @@ ralph_start({
 
 ## Loop Behavior
 
-1. **Write the task file**: Create `.ralph/<name>.md` with the task content. The tool does NOT create this file—you must write it yourself using the Write tool.
-2. Work on the task and update the file each iteration.
-3. Record verification evidence (commands run, file paths, outputs) in the task file.
-4. Call `ralph_done` to proceed to the next iteration.
-5. Output `<promise>COMPLETE</promise>` when finished.
-6. Stop when complete or when max iterations is reached (default 50).
+1. `ralph_start` imports the markdown task into canonical structured plan state at `.ralph/<name>.plan.json`.
+2. Ralph renders `.ralph/<name>.md` as a generated snapshot for humans.
+3. Use Ralph plan tools to inspect and update tasks, notes, evidence, and reflections.
+4. Do not edit the generated markdown snapshot directly.
+5. Call `ralph_done` to proceed to the next iteration.
+6. Output `<promise>COMPLETE</promise>` when finished.
+7. Stop when complete or when max iterations is reached (default 50).
+
+## Plan Tools
+
+- `ralph_get_plan` - Return the authoritative structured plan.
+- `ralph_list_tasks` - Return ordered tasks and statuses for quick inspection.
+- `ralph_update_task` - Safely update task status, details, notes, evidence, or order.
+- `ralph_add_task` - Add newly discovered work items.
+- `ralph_add_note` - Append loop-level progress or blocker notes.
+- `ralph_record_reflection` - Persist reflection checkpoints in canonical state.
+- `ralph_render_plan` - Regenerate the markdown snapshot from JSON state.
 
 ## User Commands
 
@@ -33,6 +44,10 @@ ralph_start({
 - `/ralph stop` - Pause loop (when agent idle).
 - `/ralph-stop` - Stop active loop (idle only).
 - `/ralph status` - Show loops.
+- `/ralph show-plan [loop]` - Show a structured plan summary.
+- `/ralph list-tasks [loop] [--status STATUS]` - Show structured tasks.
+- `/ralph task <done|block> <task-id> [loop]` - Quick task update.
+- `/ralph render-plan [loop]` - Regenerate the markdown snapshot.
 - `/ralph list --archived` - Show archived loops.
 - `/ralph archive <name>` - Move loop to archive.
 - `/ralph clean [--all]` - Clean completed loops.
@@ -41,7 +56,7 @@ ralph_start({
 
 Press ESC to interrupt streaming, send a normal message to resume, and run `/ralph-stop` when idle to end the loop.
 
-## Task File Format
+## Rendered Snapshot Format
 
 ```markdown
 # Task Title
@@ -64,10 +79,12 @@ Brief description.
 (Update with progress, decisions, blockers)
 ```
 
+The snapshot is informational. Canonical state lives in `.plan.json`.
+
 ## Best Practices
 
-1. Write a clear checklist with discrete items.
-2. Update checklist and notes as you go.
-3. Capture verification evidence for completed items.
+1. Start with a clear checklist in `taskContent`; Ralph will import it into structured tasks.
+2. Use Ralph plan tools instead of direct file edits.
+3. Capture verification evidence as task evidence or loop notes.
 4. Reflect when stuck to reassess approach.
 5. Output the completion marker only when truly done.

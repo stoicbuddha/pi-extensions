@@ -36,14 +36,15 @@ Then filter to just this extension in `~/.pi/agent/settings.json`:
 
 ## Recommended usage: just ask Pi
 You ask Pi to set up a ralph-wiggum loop.
-- Pi sets up `.ralph/<name>.md` with goals and a checklist (like a list of features to build, errors to check, or files to refactor)
+- Pi imports your initial markdown into canonical structured plan state at `.ralph/<name>.plan.json`
+- Pi renders `.ralph/<name>.md` as a generated snapshot for humans
 - You let Pi know:
   1. What the task is and completion / tests to run
   2. How many items to process per iteration
   3. How often to commit
   4. (optionally) After how many items it should take a step back and self-reflect
 - Pi runs `ralph_start`, beginning iteration 1.
-  - It gets a prompt telling it to work on the task, update the task file, and call ralph_done when it finishes that iteration
+  - It gets a prompt telling it to inspect and update task state via Ralph tools, then call `ralph_done` when it finishes that iteration
   - When the iteration is done, it calls `ralph_done`, resending the same prompt*
 - Pi runs until either:
   - All tasks are done (Pi sends `<promise>COMPLETE</promise>`)
@@ -60,6 +61,10 @@ If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, ju
 | `/ralph stop` | Pause current loop |
 | `/ralph-stop` | Stop active loop (idle only) |
 | `/ralph status` | Show all loops |
+| `/ralph show-plan [loop]` | Show structured plan summary |
+| `/ralph list-tasks [loop] [--status STATUS]` | Show structured tasks |
+| `/ralph task <done\|block> <task-id> [loop]` | Quick task status update |
+| `/ralph render-plan [loop]` | Regenerate markdown snapshot |
 | `/ralph list --archived` | Show archived loops |
 | `/ralph archive <name>` | Move loop to archive |
 | `/ralph clean [--all]` | Clean completed loops |
@@ -104,13 +109,11 @@ Options:
 - `sessionStrategy`: `followUp` or `newSession`
 - `sessionStrategyFailure`: `followUp` or `stopAndAlert`
 
-`newSession` does not create a separate Pi session tab/file. Pi only exposes literal session creation
-to slash-command handlers, while `ralph_done` runs as an agent tool. This mode targets the practical
-Ralph problem: clearing model-visible context between turns while preserving the UI transcript.
+`newSession` starts the next Ralph iteration in a fresh provider context seeded from the canonical structured plan state instead of carrying forward the prior loop transcript. Pi keeps the visible UI transcript intact rather than opening a separate session tab/file. If fresh-session creation fails, `sessionStrategyFailure` controls whether Ralph falls back to normal follow-up behavior or pauses and alerts you.
 
 ## Agent Tool
 
-The agent can self-start loops using `ralph_start`:
+The agent can self-start loops using `ralph_start`, then use plan tools such as `ralph_get_plan`, `ralph_list_tasks`, `ralph_update_task`, `ralph_add_task`, `ralph_add_note`, `ralph_record_reflection`, and `ralph_render_plan` to work without editing markdown directly:
 
 ```
 ralph_start({
@@ -123,6 +126,8 @@ ralph_start({
   sessionStrategyFailure: "followUp"
 })
 ```
+
+`taskContent` is still accepted for compatibility, but it is now imported once into structured plan state. After that, `.ralph/<name>.md` is generated output only.
 
 ## Credits
 
