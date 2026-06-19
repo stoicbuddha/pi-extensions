@@ -1396,7 +1396,6 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 						.map((c) => c.text)
 						.join("\n")
 				: "";
-		const shouldDispatchPendingReset = text.includes("Fresh-session continuation queued.");
 		if (naturalStop && text.includes(COMPLETE_MARKER)) {
 			completeLoop(
 				ctx,
@@ -1418,11 +1417,6 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			return;
 		}
 		if (state.pendingSessionReset) {
-			if (!shouldDispatchPendingReset) {
-				state.pendingSessionReset = false;
-				saveState(ctx, state);
-				return;
-			}
 			state.pendingSessionReset = false;
 			saveState(ctx, state);
 			state = loadState(ctx, state.name);
