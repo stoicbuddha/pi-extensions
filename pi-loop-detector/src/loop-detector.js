@@ -5,6 +5,7 @@ const DEFAULTS = {
   sameTool: {
     recentActions: 5,
     minRepeats: 3,
+    maxDistinctArgs: 1,
   },
   intentMismatch: {
     mismatchThreshold: 2,
@@ -180,9 +181,19 @@ export class LoopDetector {
     }
 
     const [toolName, count] = offender;
+    const offendingCalls = recentCalls.filter((event) => event.toolName === toolName);
+    const distinctArgs = new Set(offendingCalls.map((event) => event.argsSignature));
+    if (distinctArgs.size > this.config.sameTool.maxDistinctArgs) {
+      return null;
+    }
+
     const relatedResults = this.events
       .filter((event) => event.type === "tool_result" && event.toolName === toolName)
       .slice(-count);
+
+    if (relatedResults.length < Math.max(1, count - 1)) {
+      return null;
+    }
 
     const hasProgress = relatedResults.some((event) => event.ok && event.progress !== false);
     if (hasProgress) {

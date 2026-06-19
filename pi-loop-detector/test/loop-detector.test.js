@@ -86,6 +86,36 @@ test("does not trigger on repeated successful tool use", async () => {
   assert.equal(outcome, null);
 });
 
+test("does not trigger same-tool repetition when arguments materially change", async () => {
+  const detector = new LoopDetector();
+
+  await detector.handleEvent({ type: "tool_call", toolName: "search_query", args: { q: "a" } });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "search_query",
+    args: { q: "a" },
+    ok: true,
+    progress: true,
+    result: "found a",
+  });
+  await detector.handleEvent({ type: "tool_call", toolName: "search_query", args: { q: "b" } });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "search_query",
+    args: { q: "b" },
+    ok: true,
+    progress: true,
+    result: "found b",
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_call",
+    toolName: "search_query",
+    args: { q: "c" },
+  });
+
+  assert.equal(outcome, null);
+});
+
 test("detects repeated failures with similar inputs", async () => {
   const detector = new LoopDetector({
     sameTool: { minRepeats: 99 },
@@ -145,7 +175,9 @@ test("cooldown suppresses repeated interventions until behavior changes", async 
   const detector = new LoopDetector();
 
   await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
+  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
   await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
+  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
   const first = await detector.handleEvent({
     type: "tool_call",
     toolName: "rollback_status",
@@ -181,7 +213,9 @@ test("uses judge output to choose deterministic intervention", async () => {
   });
 
   await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
+  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
   await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
+  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
   const outcome = await detector.handleEvent({
     type: "tool_call",
     toolName: "rollback_status",
