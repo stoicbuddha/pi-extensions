@@ -78,6 +78,10 @@ If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, ju
 
 Session reset is configured per loop, alongside the other Ralph iteration settings.
 
+`newSession` provides a fresh provider context for each Ralph iteration. Pi keeps the visible session
+and transcript intact, but Ralph trims the messages sent to the model so the next iteration starts at
+the current Ralph prompt and task file instead of carrying the prior loop transcript.
+
 CLI example:
 
 ```bash
@@ -100,7 +104,9 @@ Options:
 - `sessionStrategy`: `followUp` or `newSession`
 - `sessionStrategyFailure`: `followUp` or `stopAndAlert`
 
-`newSession` starts the next Ralph iteration in a fresh session seeded from the current task file instead of carrying forward the prior loop transcript. If fresh-session creation fails, `sessionStrategyFailure` controls whether Ralph falls back to normal follow-up behavior or pauses and alerts you.
+`newSession` does not create a separate Pi session tab/file. Pi only exposes literal session creation
+to slash-command handlers, while `ralph_done` runs as an agent tool. This mode targets the practical
+Ralph problem: clearing model-visible context between turns while preserving the UI transcript.
 
 ## Agent Tool
 

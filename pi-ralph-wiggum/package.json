@@ -26,6 +26,9 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.38"
+  },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0"
   }

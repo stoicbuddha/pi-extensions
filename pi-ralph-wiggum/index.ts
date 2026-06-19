@@ -279,6 +279,27 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(buildPrompt(state, taskContent, needsReflection), { deliverAs: "followUp" });
 	}
 
+	function getMessageText(message: any): string {
+		if (!message) return "";
+		if (typeof message.content === "string") return message.content;
+		if (!Array.isArray(message.content)) return "";
+		return message.content
+			.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+			.map((part: any) => part.text)
+			.join("\n");
+	}
+
+	function findCurrentIterationStart(messages: any[], state: LoopState): number {
+		const iterationMarker = `RALPH LOOP: ${state.name} | Iteration ${state.iteration}`;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message?.role === "user" && getMessageText(message).includes(iterationMarker)) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
 	// --- Arg parsing ---
 
 	function parseArgs(argsStr: string) {
@@ -807,9 +828,14 @@ Examples:
 			updateUI(ctx);
 
 			if (state.sessionStrategy === "newSession") {
-				pi.sendUserMessage(`/ralph _continue_session ${state.name}`, { deliverAs: "followUp" });
+				dispatchNextIterationFollowUp(state, content, needsReflection);
 				return {
-					content: [{ type: "text", text: `Iteration ${state.iteration - 1} complete. Fresh-session continuation queued.` }],
+					content: [
+						{
+							type: "text",
+							text: `Iteration ${state.iteration - 1} complete. Next iteration queued with fresh provider context.`,
+						},
+					],
 					details: {},
 				};
 			}
@@ -825,6 +851,17 @@ Examples:
 	});
 
 	// --- Event handlers ---
+
+	pi.on("context", async (event, ctx) => {
+		if (!currentLoop) return;
+		const state = loadState(ctx, currentLoop);
+		if (!state || state.status !== "active" || state.sessionStrategy !== "newSession") return;
+
+		const start = findCurrentIterationStart(event.messages, state);
+		if (start === -1) return;
+
+		return { messages: event.messages.slice(start) };
+	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!currentLoop) return;
