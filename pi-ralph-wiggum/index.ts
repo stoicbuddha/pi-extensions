@@ -11,6 +11,7 @@ import { Type } from "@sinclair/typebox";
 const RALPH_DIR = ".ralph";
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
 const SESSION_RESET_MARKER = "Previous Ralph loop transcript intentionally discarded. Continue from current task state only.";
+const FAKE_RALPH_DONE_PATTERN = /<(?:invoke|tool_use|tool|function_call)\b[^>]*(?:name=["']ralph_done["']|ralph_done)[\s\S]*?<\/(?:invoke|tool_use|tool|function_call)>|<ralph_done\b[^>]*\/?>/i;
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -57,6 +58,7 @@ interface LoopState {
 	startedAt: string;
 	completedAt?: string;
 	lastReflectionAt: number; // Last iteration we reflected at
+	lastDoneReminderAt: number; // Last iteration where we reminded the agent to call ralph_done
 	sessionStrategy: SessionStrategy;
 	sessionStrategyFailure: SessionStrategyFailure;
 }
@@ -138,6 +140,7 @@ export default function (pi: ExtensionAPI) {
 		if ("lastReflectionAtItems" in raw && raw.lastReflectionAt === undefined) {
 			raw.lastReflectionAt = (raw as any).lastReflectionAtItems;
 		}
+		raw.lastDoneReminderAt = raw.lastDoneReminderAt ?? 0;
 		raw.sessionStrategy = parseSessionStrategy(raw.sessionStrategy);
 		raw.sessionStrategyFailure = parseSessionStrategyFailure(raw.sessionStrategyFailure);
 		return raw as LoopState;
@@ -252,14 +255,14 @@ export default function (pi: ExtensionAPI) {
 		);
 
 		if (state.itemsPerIteration > 0) {
-			parts.push(`**THIS ITERATION: Process approximately ${state.itemsPerIteration} items, then call ralph_done.**\n`);
+			parts.push(`**THIS ITERATION: Process approximately ${state.itemsPerIteration} items, then call the actual ralph_done tool.**\n`);
 			parts.push(`1. Work on the next ~${state.itemsPerIteration} items from your checklist`);
 		} else {
 			parts.push(`1. Continue working on the task`);
 		}
 		parts.push(`2. Update the task file (${state.taskFile}) with your progress`);
 		parts.push(`3. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
-		parts.push(`4. Otherwise, call the ralph_done tool to proceed to next iteration`);
+		parts.push(`4. Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name="ralph_done"></invoke>.`);
 
 		return parts.join("\n");
 	}
@@ -298,6 +301,10 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		return -1;
+	}
+
+	function isNaturalAssistantStop(message: any): boolean {
+		return message?.role === "assistant" && message.stopReason === "stop";
 	}
 
 	// --- Arg parsing ---
@@ -385,6 +392,7 @@ export default function (pi: ExtensionAPI) {
 				status: "active",
 				startedAt: existing?.startedAt || new Date().toISOString(),
 				lastReflectionAt: 0,
+				lastDoneReminderAt: 0,
 				sessionStrategy: args.sessionStrategy,
 				sessionStrategyFailure: args.sessionStrategyFailure,
 			};
@@ -755,6 +763,7 @@ Examples:
 				status: "active",
 				startedAt: new Date().toISOString(),
 				lastReflectionAt: 0,
+				lastDoneReminderAt: 0,
 				sessionStrategy: parseSessionStrategy(params.sessionStrategy),
 				sessionStrategyFailure: parseSessionStrategyFailure(params.sessionStrategyFailure),
 			};
@@ -876,7 +885,7 @@ Examples:
 		}
 		instructions += `- Update the task file as you progress\n`;
 		instructions += `- When FULLY COMPLETE: ${COMPLETE_MARKER}\n`;
-		instructions += `- Otherwise, call ralph_done tool to proceed to next iteration`;
+		instructions += `- Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name="ralph_done"></invoke>.`;
 
 		return {
 			systemPrompt: event.systemPrompt + `\n[RALPH LOOP - ${state.name} - Iteration ${iterStr}]\n\n${instructions}`,
@@ -890,6 +899,7 @@ Examples:
 
 		// Check for completion marker
 		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
+		const naturalStop = isNaturalAssistantStop(lastAssistant);
 		const text =
 			lastAssistant && Array.isArray(lastAssistant.content)
 				? lastAssistant.content
@@ -898,7 +908,7 @@ Examples:
 						.join("\n")
 				: "";
 
-		if (text.includes(COMPLETE_MARKER)) {
+		if (naturalStop && text.includes(COMPLETE_MARKER)) {
 			completeLoop(
 				ctx,
 				state,
@@ -908,6 +918,8 @@ Examples:
 			);
 			return;
 		}
+
+		if (!naturalStop) return;
 
 		// Check max iterations
 		if (state.maxIterations > 0 && state.iteration >= state.maxIterations) {
@@ -921,8 +933,17 @@ Examples:
 			return;
 		}
 
-		// Don't auto-continue - let the agent call ralph_done to proceed
-		// This allows user's "stop" message to be processed first
+		if (!ctx.hasPendingMessages() && state.lastDoneReminderAt !== state.iteration) {
+			state.lastDoneReminderAt = state.iteration;
+			saveState(ctx, state);
+			const fakeToolCall = FAKE_RALPH_DONE_PATTERN.test(text);
+			pi.sendUserMessage(
+				fakeToolCall
+					? `You wrote text that looks like a ralph_done tool call, but Pi did not execute it. If this iteration is done, call the actual ralph_done tool now using the tool interface. Do not write XML, <invoke>, or placeholder text. If the whole loop is complete, respond with ${COMPLETE_MARKER}.`
+					: `You are still in Ralph loop "${state.name}" at iteration ${state.iteration}. If you are done with the tasks for this iteration, call the actual ralph_done tool now using the tool interface. If the whole loop is complete, respond with ${COMPLETE_MARKER}. Otherwise, continue working on the current iteration and update ${state.taskFile}.`,
+				{ deliverAs: "followUp" },
+			);
+		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
