@@ -42,6 +42,14 @@ test("detects repeated intent/action mismatch", async () => {
   });
   await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
   await detector.handleEvent({
+    type: "tool_result",
+    toolName: "rollback_status",
+    args: {},
+    ok: false,
+    progress: false,
+    result: "failed",
+  });
+  await detector.handleEvent({
     type: "assistant_message",
     content: "Let me call `ralph_done` next.",
   });
@@ -54,6 +62,68 @@ test("detects repeated intent/action mismatch", async () => {
   assert.equal(outcome.trigger.kind, "intent_action_mismatch");
   assert.deepEqual(outcome.trigger.expectedTools, ["ralph_done"]);
   assert.deepEqual(outcome.trigger.actualToolSequence, ["rollback_status", "rollback_status"]);
+});
+
+test("does not treat ordinary prose as a tool declaration", async () => {
+  const detector = new LoopDetector();
+
+  await detector.handleEvent({
+    type: "assistant_message",
+    content: "Use a clear, professional tone suitable for an agent evaluation.",
+  });
+  await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolkitMCP_create_file",
+    args: { path: "ONBOARDING_PROPOSAL.md" },
+  });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolkitMCP_create_file",
+    args: { path: "ONBOARDING_PROPOSAL.md" },
+    ok: true,
+    progress: true,
+    result: { created: true, ok: true },
+  });
+  await detector.handleEvent({
+    type: "assistant_message",
+    content: "Ensure technical details like Argon2id are accurate based on the current code inspection.",
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolkitMCP_create_file",
+    args: { path: "ONBOARDING_PROPOSAL.md" },
+  });
+
+  assert.equal(outcome, null);
+});
+
+test("does not trigger intent mismatch when the alternate tool makes progress", async () => {
+  const detector = new LoopDetector();
+
+  await detector.handleEvent({
+    type: "assistant_message",
+    content: "I should call `ralph_done` now.",
+  });
+  await detector.handleEvent({ type: "tool_call", toolName: "ToolkitMCP_create_file", args: { path: "a.md" } });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolkitMCP_create_file",
+    args: { path: "a.md" },
+    ok: true,
+    progress: true,
+    result: { created: true },
+  });
+  await detector.handleEvent({
+    type: "assistant_message",
+    content: "Let me call `ralph_done` next.",
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolkitMCP_create_file",
+    args: { path: "a.md" },
+  });
+
+  assert.equal(outcome, null);
 });
 
 test("does not trigger on repeated successful tool use", async () => {

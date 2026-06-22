@@ -9,6 +9,7 @@ const DEFAULTS = {
   },
   intentMismatch: {
     mismatchThreshold: 2,
+    lookbackResults: 6,
   },
   failureRepetition: {
     minFailures: 3,
@@ -20,8 +21,9 @@ const DEFAULTS = {
 };
 
 const INTENT_PATTERNS = [
-  /(?:call|use|run)\s+`?([a-z0-9_-]+)`?/gi,
+  /(?:call|use|run)\s+`([a-z0-9_-]+)`(?:\s+(?:now|next))?/gi,
   /`([a-z0-9_-]+)`\s+(?:now|next)/gi,
+  /(?:call|use|run)\s+(?:the actual\s+)?([a-z0-9_-]+)\s+tool\b/gi,
 ];
 
 const SELF_CORRECTION_PATTERNS = [
@@ -218,14 +220,36 @@ export class LoopDetector {
     }
 
     const actualToolSequence = mismatches.map((item) => item.actualTool);
+    const repeatedActualTool = actualToolSequence.every(
+      (toolName) => toolName === actualToolSequence[0],
+    )
+      ? actualToolSequence[0]
+      : null;
+    if (!repeatedActualTool) {
+      return null;
+    }
+
+    const recentResults = this.events
+      .filter(
+        (event) =>
+          event.type === "tool_result" && event.toolName === repeatedActualTool,
+      )
+      .slice(-this.config.intentMismatch.lookbackResults);
+    const hasProgress = recentResults.some(
+      (event) => event.ok && event.progress !== false,
+    );
+    if (hasProgress) {
+      return null;
+    }
+
     const expectedTools = [...new Set(mismatches.flatMap((item) => item.expectedTools))];
     return {
       kind: "intent_action_mismatch",
       expectedTools,
       actualToolSequence,
-      offendingTool: actualToolSequence[actualToolSequence.length - 1],
+      offendingTool: repeatedActualTool,
       notes: [
-        `Assistant declared ${expectedTools.join(", ")} but executed ${actualToolSequence.join(", ")}.`,
+        `Assistant declared ${expectedTools.join(", ")} but repeated ${repeatedActualTool} without observable progress.`,
       ],
     };
   }
