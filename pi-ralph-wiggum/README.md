@@ -116,12 +116,12 @@ Options:
 
 Ralph stores the full canonical plan, notes, verification, and reflection history in `.ralph/<name>.plan.json` and renders the full `.ralph/<name>.md` snapshot for humans. Iteration prompts use a minimal next-task runtime view instead of injecting the entire history every time.
 
-The runtime view includes summary counts, a small goals list, one selected next task, and instructions for fetching more context only if that next task is ambiguous. Older history stays available through `ralph_get_plan`, `ralph_list_tasks`, and the generated plan files, but it is omitted from the prompt to keep long-running loops within model context limits.
+The runtime view includes summary counts, a small goals list, one selected next task, and instructions for fetching more context only if that next task is ambiguous. Older history stays available through the compact `ralph_get_plan` summary, `ralph_list_tasks`, and the generated plan files, but it is omitted from the prompt to keep long-running loops within model context limits.
 
 Each iteration prompt tells the agent to:
 
 - Start from the single Next Task in the runtime view.
-- Call `ralph_get_plan` or `ralph_list_tasks` only when that task lacks enough context.
+- Call compact `ralph_get_plan` or `ralph_list_tasks` only when that task lacks enough context.
 - Mark active work with `ralph_update_task`, usually `in_progress` before work and `done` with evidence after verification.
 - Use `blocked` plus a blocker note when work cannot continue.
 - Treat `.ralph/<name>.md` as generated output and mutate canonical state only through Ralph tools.

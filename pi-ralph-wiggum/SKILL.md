@@ -29,7 +29,7 @@ ralph_start({
 
 ## Plan Tools
 
-- `ralph_get_plan` - Return the authoritative structured plan.
+- `ralph_get_plan` - Return a compact authoritative plan summary.
 - `ralph_list_tasks` - Return ordered tasks and statuses for quick inspection.
 - `ralph_update_task` - Safely update task status, details, notes, evidence, or order.
 - `ralph_add_task` - Add newly discovered work items.

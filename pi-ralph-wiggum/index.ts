@@ -18,6 +18,10 @@ const PROMPT_SUMMARY_MAX_CHARS = 700;
 const PROMPT_MAX_GOALS = 5;
 const PROMPT_MAX_TASK_NOTES = 1;
 const PROMPT_MAX_TASK_EVIDENCE = 1;
+const GET_PLAN_DEFAULT_MAX_TASKS = 12;
+const GET_PLAN_MAX_NOTES = 3;
+const GET_PLAN_MAX_VERIFICATION = 3;
+const GET_PLAN_MAX_REFLECTIONS = 2;
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -458,6 +462,51 @@ export default function (pi: ExtensionAPI) {
 		return [summarizePlan(plan), "", ...(lines.length > 0 ? lines : ["No matching tasks."])].join("\n");
 	}
 
+	function buildCompactPlanResponse(plan: RalphPlan, options: { status?: TaskStatus; maxTasks?: number } = {}): string {
+		const maxTasks = Math.max(1, Math.min(50, Math.floor(options.maxTasks ?? GET_PLAN_DEFAULT_MAX_TASKS)));
+		const nextTask = selectNextTask(plan);
+		const candidateTasks = plan.tasks.filter((task) =>
+			options.status ? task.status === options.status : task.status !== "done" && task.status !== "cancelled",
+		);
+		const visibleTasks = candidateTasks.slice(0, maxTasks);
+		const sections = [
+			summarizePlan(plan),
+			"",
+			"Next task:",
+			nextTask ? formatPromptTask(nextTask) : "- No active task found.",
+			"",
+			`Tasks${options.status ? ` [${options.status}]` : " [open]"}:`,
+			...(visibleTasks.length > 0
+				? visibleTasks.map((task) => `- ${task.id} [${task.status}] ${truncateForPrompt(task.title, 180)}`)
+				: ["- No matching tasks."]),
+		];
+		if (candidateTasks.length > visibleTasks.length) {
+			sections.push(`- ${candidateTasks.length - visibleTasks.length} additional matching task(s) omitted. Use ralph_list_tasks with a status filter if needed.`);
+		}
+
+		if (plan.verification.length > 0) {
+			sections.push(
+				"",
+				"Recent verification:",
+				...plan.verification.slice(-GET_PLAN_MAX_VERIFICATION).map((entry) => `- ${truncateForPrompt(entry.text, 220)}`),
+			);
+		}
+		if (plan.notes.length > 0) {
+			sections.push("", "Recent notes:", ...plan.notes.slice(-GET_PLAN_MAX_NOTES).map((note) => `- ${truncateForPrompt(note.text, 220)}`));
+		}
+		if (plan.reflections.length > 0) {
+			sections.push(
+				"",
+				"Recent reflections:",
+				...plan.reflections
+					.slice(-GET_PLAN_MAX_REFLECTIONS)
+					.map((entry) => `- Iteration ${entry.iteration}: ${truncateForPrompt(entry.text, 220)}`),
+			);
+		}
+		sections.push("", "Use ralph_list_tasks with a status filter for a narrower task list.");
+		return sections.join("\n");
+	}
+
 	function normalizePlanText(lines: string[]): string {
 		return lines.map((line) => line.trim()).filter(Boolean).join("\n");
 	}
@@ -684,7 +733,7 @@ export default function (pi: ExtensionAPI) {
 		} else {
 			parts.push("1. Start from the single Next Task in the runtime view.");
 		}
-		parts.push("2. To figure out what to do next: read the Next Task id/title/details first. If that is insufficient, call ralph_get_plan for full context or ralph_list_tasks to list pending tasks; do not read the generated markdown snapshot just to discover task state.");
+		parts.push("2. To figure out what to do next: read the Next Task id/title/details first. If that is insufficient, call ralph_get_plan or ralph_list_tasks.");
 		parts.push("3. Before doing task work, mark the task in_progress with ralph_update_task if it is not already in progress.");
 		parts.push("4. Do the work using the available project tools. If a project tool reports that setup is required, such as setting the project cwd, do that setup once before retrying the tool.");
 		parts.push("5. When a task is complete, call ralph_update_task with status done and concise evidence describing what changed and how you verified it. If blocked, use status blocked with a blocker note. If partially done, leave it in_progress and add a note/evidence.");
@@ -1258,16 +1307,32 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 	pi.registerTool({
 		name: "ralph_get_plan",
 		label: "Get Ralph Plan",
-		description: "Return the canonical structured plan for the active loop or a named loop.",
-		promptSnippet: "Inspect Ralph's authoritative structured plan state.",
-		promptGuidelines: ["Use this before planning work when you need the current task state, goals, notes, or verification."],
+		description: "Return a compact summary of the active loop or a named loop.",
+		promptSnippet: "Inspect Ralph's compact plan summary without loading bulky plan state into context.",
+		promptGuidelines: [
+			"Use this only when the runtime prompt and ralph_list_tasks do not provide enough context.",
+			"Use ralph_list_tasks with a status filter when you only need task ids and titles.",
+		],
 		parameters: Type.Object({
 			loopName: Type.Optional(Type.String({ description: "Optional loop name. Defaults to the active loop." })),
+			status: Type.Optional(Type.String({ description: "Optional task status filter: todo, in_progress, blocked, done, cancelled." })),
+			maxTasks: Type.Optional(Type.Number({ description: "Maximum matching task summaries to include. Default 12, max 50." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const result = getPlanState(ctx, params.loopName);
 			if (!result) return { content: [{ type: "text", text: "Ralph loop not found." }], details: {} };
-			return { content: [{ type: "text", text: JSON.stringify(result.plan, null, 2) }], details: {} };
+			return {
+				content: [
+					{
+						type: "text",
+						text: buildCompactPlanResponse(result.plan, {
+							status: parseTaskStatus(params.status) ?? undefined,
+							maxTasks: params.maxTasks,
+						}),
+					},
+				],
+				details: {},
+			};
 		},
 	});
 
@@ -1276,7 +1341,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		label: "List Ralph Tasks",
 		description: "List ordered tasks for the active loop or a named loop.",
 		promptSnippet: "Get a compact view of Ralph tasks and statuses.",
-		promptGuidelines: ["Use this to identify the next tasks to work on without reading the full plan payload."],
+		promptGuidelines: ["Use this to identify the next tasks to work on without reading bulky plan state."],
 		parameters: Type.Object({
 			loopName: Type.Optional(Type.String({ description: "Optional loop name. Defaults to the active loop." })),
 			status: Type.Optional(Type.String({ description: "Optional status filter: todo, in_progress, blocked, done, cancelled." })),
@@ -1489,7 +1554,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		const iterStr = `${state.iteration}${state.maxIterations > 0 ? `/${state.maxIterations}` : ""}`;
 		let instructions = `You are in a Ralph loop working on generated plan snapshot: ${state.taskFile}\n`;
 		if (state.itemsPerIteration > 0) instructions += `- Work on ~${state.itemsPerIteration} task items this iteration\n`;
-		instructions += `- Start from the Next Task in the runtime prompt; call ralph_get_plan or ralph_list_tasks only when you need more task context\n`;
+		instructions += `- Start from the Next Task in the runtime prompt; call compact ralph_get_plan or ralph_list_tasks only when you need more task context\n`;
 		instructions += `- Mark active work in_progress, done, blocked, or cancelled with ralph_update_task\n`;
 		instructions += `- Record concise notes/evidence/reflections in structured Ralph state; do not edit generated markdown snapshots directly\n`;
 		instructions += `- When FULLY COMPLETE: ${COMPLETE_MARKER}\n`;
