@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { LoopDetector } from "./src/index.js";
 
@@ -35,7 +37,6 @@ interface RuntimeState {
 	detector: LoopDetector;
 	events: LoopEvent[];
 	inputHistory: string[];
-	lastAssistantDigest: string | null;
 	hostContext: any | null;
 	pendingRecovery: {
 		prompt: string;
@@ -43,6 +44,7 @@ interface RuntimeState {
 		offendingTool: string | null;
 		mode: RecoveryMode;
 	} | null;
+	recoveryMode: RecoveryMode;
 	recovering: boolean;
 	lastOutcome: LoopOutcome;
 	lastResetAt: string;
@@ -50,20 +52,69 @@ interface RuntimeState {
 
 const MAX_RUNTIME_EVENTS = 64;
 const MAX_INPUT_HISTORY = 6;
-const DEFAULT_RECOVERY_MODE: RecoveryMode = "newSession";
+const DEFAULT_RECOVERY_MODE: RecoveryMode = "steer";
+const MAX_INPUT_CHARS = 2000;
+const MAX_TOOL_ARG_STRING_CHARS = 500;
+const MAX_TOOL_ARGS_JSON_CHARS = 1400;
+const MAX_TOOL_RESULT_CHARS = 1000;
+const MAX_RECENT_TRANSCRIPT_CHARS = 5000;
+const MAX_RECOVERY_PROMPT_CHARS = 16000;
+const MAX_OBJECT_KEYS = 30;
+const MAX_ARRAY_ITEMS = 20;
+const REDACTED_ARG_KEYS = new Set([
+	"content",
+	"contents",
+	"new_str",
+	"old_str",
+	"newString",
+	"oldString",
+	"patch",
+	"diff",
+	"script",
+	"source",
+	"transcript",
+	"messages",
+	"stdout",
+	"stderr",
+	"output",
+	"result",
+	"results",
+]);
 
-function createRuntimeState(): RuntimeState {
+function createRuntimeState(config: Record<string, unknown> = {}): RuntimeState {
 	return {
-		detector: new LoopDetector(),
+		detector: new LoopDetector(config),
 		events: [],
 		inputHistory: [],
-		lastAssistantDigest: null,
 		hostContext: null,
 		pendingRecovery: null,
+		recoveryMode: parseRecoveryMode(config.recoveryMode),
 		recovering: false,
 		lastOutcome: null,
 		lastResetAt: new Date().toISOString(),
 	};
+}
+
+function parseRecoveryMode(value: unknown): RecoveryMode {
+	return value === "newSession" ? "newSession" : DEFAULT_RECOVERY_MODE;
+}
+
+function loadProjectConfig(ctx: any): Record<string, unknown> {
+	const cwd = typeof ctx?.cwd === "string" ? ctx.cwd : "";
+	if (!cwd) return {};
+	const configPath = path.join(cwd, ".pi-loop-detector.json");
+	if (!fs.existsSync(configPath)) return {};
+	try {
+		const parsed = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			return parsed as Record<string, unknown>;
+		}
+		if (ctx.hasUI) ctx.ui.notify(".pi-loop-detector.json must contain a JSON object; using defaults.", "warning");
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		if (ctx.hasUI) ctx.ui.notify(`Failed to read .pi-loop-detector.json; using defaults: ${detail}`, "warning");
+	}
+	return {};
 }
 
 function summarizeOutcome(outcome: LoopOutcome): string {
@@ -84,12 +135,69 @@ function recordRuntimeEvent(state: RuntimeState, event: LoopEvent): void {
 }
 
 function recordInput(state: RuntimeState, text: string): void {
-	const normalized = text.trim();
+	const normalized = truncateText(text.trim(), MAX_INPUT_CHARS);
 	if (!normalized) return;
 	state.inputHistory.push(normalized);
 	if (state.inputHistory.length > MAX_INPUT_HISTORY) {
 		state.inputHistory.splice(0, state.inputHistory.length - MAX_INPUT_HISTORY);
 	}
+}
+
+function truncateText(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	return `${text.slice(0, maxChars)}\n[truncated ${text.length - maxChars} chars]`;
+}
+
+function summarizeOmitted(value: unknown): string {
+	if (typeof value === "string") return `[omitted ${value.length} chars]`;
+	if (Array.isArray(value)) return `[omitted array with ${value.length} items]`;
+	if (value && typeof value === "object") return `[omitted object with ${Object.keys(value).length} keys]`;
+	return "[omitted]";
+}
+
+function sanitizeForPrompt(value: unknown, key = "", depth = 0): unknown {
+	if (REDACTED_ARG_KEYS.has(key)) return summarizeOmitted(value);
+	if (typeof value === "string") return truncateText(value, MAX_TOOL_ARG_STRING_CHARS);
+	if (value == null || typeof value !== "object") return value;
+	if (depth >= 4) return summarizeOmitted(value);
+	if (Array.isArray(value)) {
+		const items = value.slice(0, MAX_ARRAY_ITEMS).map((item) => sanitizeForPrompt(item, "", depth + 1));
+		if (value.length > MAX_ARRAY_ITEMS) items.push(`[truncated ${value.length - MAX_ARRAY_ITEMS} items]`);
+		return items;
+	}
+
+	const entries = Object.entries(value as Record<string, unknown>);
+	const output: Record<string, unknown> = {};
+	for (const [entryKey, entryValue] of entries.slice(0, MAX_OBJECT_KEYS)) {
+		output[entryKey] = sanitizeForPrompt(entryValue, entryKey, depth + 1);
+	}
+	if (entries.length > MAX_OBJECT_KEYS) {
+		output.__truncated_keys = entries.length - MAX_OBJECT_KEYS;
+	}
+	return output;
+}
+
+function compactJson(value: unknown, maxChars: number): string {
+	return truncateText(JSON.stringify(value ?? {}), maxChars);
+}
+
+function sanitizeToolArgs(args: Record<string, unknown>): Record<string, unknown> {
+	const sanitized = sanitizeForPrompt(args) as Record<string, unknown>;
+	const serialized = JSON.stringify(sanitized);
+	if (serialized.length <= MAX_TOOL_ARGS_JSON_CHARS) return sanitized;
+	return {
+		_summary: truncateText(serialized, MAX_TOOL_ARGS_JSON_CHARS),
+		_originalArgKeys: Object.keys(args),
+	};
+}
+
+function compactResultPayload(result: unknown): unknown {
+	if (typeof result === "string") return truncateText(result, MAX_TOOL_RESULT_CHARS);
+	if (result == null || typeof result !== "object") return result;
+	const sanitized = sanitizeForPrompt(result);
+	const serialized = JSON.stringify(sanitized);
+	if (serialized.length <= MAX_TOOL_RESULT_CHARS) return sanitized;
+	return truncateText(serialized, MAX_TOOL_RESULT_CHARS);
 }
 
 function extractText(value: unknown): string {
@@ -178,7 +286,7 @@ function normalizeToolCallEvent(event: any): LoopEvent | null {
 	return {
 		type: "tool_call",
 		toolName,
-		args: getToolArgs(event),
+		args: sanitizeToolArgs(getToolArgs(event)),
 		timestamp: typeof event?.timestamp === "string" ? event.timestamp : undefined,
 		id: typeof event?.id === "string" ? event.id : undefined,
 	};
@@ -191,10 +299,10 @@ function normalizeToolResultEvent(event: any): LoopEvent | null {
 	return {
 		type: "tool_result",
 		toolName,
-		args: getToolArgs(event),
+		args: sanitizeToolArgs(getToolArgs(event)),
 		ok: status.ok,
 		progress: status.progress,
-		result: inferResultPayload(event),
+		result: compactResultPayload(inferResultPayload(event)),
 		timestamp: typeof event?.timestamp === "string" ? event.timestamp : undefined,
 		id: typeof event?.id === "string" ? event.id : undefined,
 	};
@@ -246,11 +354,12 @@ function buildRecentTranscript(state: RuntimeState): string {
 				return `assistant_message: ${event.content.slice(0, 400)}`;
 			}
 			if (event.type === "tool_call") {
-				return `tool_call ${event.toolName}: ${JSON.stringify(event.args ?? {})}`;
+				return `tool_call ${event.toolName}: ${compactJson(event.args ?? {}, MAX_TOOL_ARGS_JSON_CHARS)}`;
 			}
 			return `tool_result ${event.toolName}: ok=${event.ok} progress=${String(event.progress)} result=${extractText(event.result).slice(0, 240)}`;
 		})
-		.join("\n");
+		.join("\n")
+		.slice(0, MAX_RECENT_TRANSCRIPT_CHARS);
 }
 
 function buildRecoveryPrompt(state: RuntimeState, outcome: NonNullable<LoopOutcome>, mode: RecoveryMode): string {
@@ -261,7 +370,7 @@ function buildRecoveryPrompt(state: RuntimeState, outcome: NonNullable<LoopOutco
 	const suspectedLoopStart = findSuspectedLoopStart(state, outcome);
 	const triggerNotes = outcome.trigger.notes?.join("\n- ") ?? "No notes.";
 	const assistantMessages = evidence.assistantMessages.map((msg) => `- ${msg.content.slice(0, 280)}`).join("\n") || "- None captured";
-	const toolCalls = evidence.toolCalls.map((call) => `- ${call.toolName} ${JSON.stringify(call.args ?? {})}`).join("\n") || "- None captured";
+	const toolCalls = evidence.toolCalls.map((call) => `- ${call.toolName} ${compactJson(call.args ?? {}, MAX_TOOL_ARGS_JSON_CHARS)}`).join("\n") || "- None captured";
 	const toolResults =
 		evidence.toolResults
 			.map((result) => `- ${result.toolName} ok=${result.ok} progress=${String(result.progress)} summary=${result.resultSummary}`)
@@ -271,7 +380,7 @@ function buildRecoveryPrompt(state: RuntimeState, outcome: NonNullable<LoopOutco
 			? "Previous transcript tail is suspected to be a nonproductive loop. Treat this as a fresh recovery context."
 			: "Loop detector interruption: evaluate the suspected loop before continuing.";
 
-	return `${resetHeader}
+	const prompt = `${resetHeader}
 
 ## Original Goal
 ${originalGoal}
@@ -332,6 +441,7 @@ Start your first response with exactly one fenced \`json\` block and no prose be
 \`\`\`
 
 After that JSON block, continue the task from the recovered state.`;
+	return truncateText(prompt, MAX_RECOVERY_PROMPT_CHARS);
 }
 
 async function flushPendingRecovery(
@@ -393,15 +503,16 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 		pi.sendUserMessage(prompt, options);
 	};
 
-	async function handleRuntimeEvent(event: LoopEvent, ctx: any, preferredMode: RecoveryMode = DEFAULT_RECOVERY_MODE): Promise<void> {
+	async function handleRuntimeEvent(event: LoopEvent, ctx: any, preferredMode?: RecoveryMode): Promise<void> {
+		const mode = preferredMode ?? runtime.recoveryMode;
 		recordRuntimeEvent(runtime, event);
 		const outcome = await runtime.detector.handleEvent(event);
 		runtime.lastOutcome = outcome;
 		if (!outcome?.intervention) return;
 		if (runtime.pendingRecovery || runtime.recovering) return;
 
-		const prompt = buildRecoveryPrompt(runtime, outcome, preferredMode);
-		if (preferredMode === "steer") {
+		const prompt = buildRecoveryPrompt(runtime, outcome, mode);
+		if (mode === "steer") {
 			sendMessage(prompt, { deliverAs: "steer" });
 			if (ctx.hasUI) {
 				ctx.ui.notify(`Loop detector sent in-session judge steering for ${outcome.trigger.kind}.`, "warning");
@@ -413,7 +524,7 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 			prompt,
 			triggerKind: outcome.trigger.kind,
 			offendingTool: outcome.trigger.offendingTool ?? outcome.judgeOutcome.offendingTool ?? null,
-			mode: preferredMode,
+			mode,
 		};
 
 		if (ctx.hasUI) {
@@ -431,7 +542,7 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 			const [command] = args.trim().split(/\s+/);
 
 			if (command === "reset") {
-				runtime = createRuntimeState();
+				runtime = createRuntimeState(loadProjectConfig(ctx));
 				if (ctx.hasUI) ctx.ui.notify("Loop detector runtime state reset.", "info");
 				return;
 			}
@@ -523,7 +634,7 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		runtime = createRuntimeState();
+		runtime = createRuntimeState(loadProjectConfig(ctx));
 		runtime.hostContext = ctx;
 		if (ctx.hasUI) {
 			ctx.ui.notify("Loop detector active for this session.", "info");
@@ -554,19 +665,15 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 	pi.on("agent_end", async (event, ctx) => {
 		const assistantText = getLatestAssistantMessage(event);
 		if (assistantText) {
-			const digest = assistantText.slice(0, 600);
-			if (digest !== runtime.lastAssistantDigest) {
-				runtime.lastAssistantDigest = digest;
-				await handleRuntimeEvent(
-					{
-						type: "assistant_message",
-						content: assistantText,
-						timestamp: typeof event?.timestamp === "string" ? event.timestamp : undefined,
-					},
-					ctx,
-					"steer",
-				);
-			}
+			await handleRuntimeEvent(
+				{
+					type: "assistant_message",
+					content: assistantText,
+					timestamp: typeof event?.timestamp === "string" ? event.timestamp : undefined,
+				},
+				ctx,
+				"steer",
+			);
 		}
 
 		await flushPendingRecovery(runtime, ctx, sendMessage);

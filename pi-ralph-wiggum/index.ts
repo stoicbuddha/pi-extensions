@@ -12,6 +12,12 @@ const RALPH_DIR = ".ralph";
 const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
 const SESSION_RESET_MARKER = "Previous Ralph loop transcript intentionally discarded. Continue from current task state only.";
 const FAKE_RALPH_DONE_PATTERN = /<(?:invoke|tool_use|tool|function_call)\b[^>]*(?:name=["']ralph_done["']|ralph_done)[\s\S]*?<\/(?:invoke|tool_use|tool|function_call)>|<ralph_done\b[^>]*\/?>/i;
+const PROMPT_PLAN_MAX_CHARS = 5000;
+const PROMPT_FIELD_MAX_CHARS = 500;
+const PROMPT_SUMMARY_MAX_CHARS = 700;
+const PROMPT_MAX_GOALS = 5;
+const PROMPT_MAX_TASK_NOTES = 1;
+const PROMPT_MAX_TASK_EVIDENCE = 1;
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -172,7 +178,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function parseSessionStrategy(value: unknown): SessionStrategy {
-		return value === "newSession" ? "newSession" : "followUp";
+		return value === "followUp" ? "followUp" : "newSession";
 	}
 
 	function parseSessionStrategyFailure(value: unknown): SessionStrategyFailure {
@@ -350,6 +356,82 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return sections.join("\n\n");
+	}
+
+	function truncateForPrompt(text: string, maxChars = PROMPT_FIELD_MAX_CHARS): string {
+		const normalized = text.replace(/\s+/g, " ").trim();
+		if (normalized.length <= maxChars) return normalized;
+		return `${normalized.slice(0, maxChars)}... [truncated ${normalized.length - maxChars} chars]`;
+	}
+
+	function formatPromptTask(task: RalphTask): string {
+		const lines = [`- [${task.status === "done" ? "x" : " "}] \`${task.id}\` ${truncateForPrompt(task.title, 220)} (${TASK_STATUS_LABELS[task.status]})`];
+		if (task.details?.trim()) lines.push(`  Details: ${truncateForPrompt(task.details)}`);
+		if (task.evidence.length > 0) {
+			const evidence = task.evidence.slice(-PROMPT_MAX_TASK_EVIDENCE).map((item) => truncateForPrompt(item, 260));
+			lines.push(`  Recent evidence: ${evidence.join(" | ")}${task.evidence.length > evidence.length ? ` (+${task.evidence.length - evidence.length} older)` : ""}`);
+		}
+		if (task.notes.length > 0) {
+			const notes = task.notes.slice(-PROMPT_MAX_TASK_NOTES).map((item) => truncateForPrompt(item, 260));
+			lines.push(`  Recent notes: ${notes.join(" | ")}${task.notes.length > notes.length ? ` (+${task.notes.length - notes.length} older)` : ""}`);
+		}
+		return lines.join("\n");
+	}
+
+	function capPromptPlan(text: string): string {
+		if (text.length <= PROMPT_PLAN_MAX_CHARS) return text;
+		return `${text.slice(0, PROMPT_PLAN_MAX_CHARS)}\n\n[Prompt plan truncated by ${text.length - PROMPT_PLAN_MAX_CHARS} chars. Use ralph_get_plan, ralph_list_tasks, or the .plan.json state for full history.]`;
+	}
+
+	function selectNextTask(plan: RalphPlan): RalphTask | null {
+		return (
+			plan.tasks.find((task) => task.status === "in_progress") ??
+			plan.tasks.find((task) => task.status === "todo") ??
+			plan.tasks.find((task) => task.status === "blocked") ??
+			null
+		);
+	}
+
+	function planToPromptText(plan: RalphPlan): string {
+		const counts = {
+			todo: 0,
+			in_progress: 0,
+			blocked: 0,
+			done: 0,
+			cancelled: 0,
+		};
+		for (const task of plan.tasks) counts[task.status]++;
+
+		const sections = [`# ${truncateForPrompt(plan.title, 220)}`];
+		if (plan.summary.trim()) sections.push(truncateForPrompt(plan.summary, PROMPT_SUMMARY_MAX_CHARS));
+		sections.push(
+			`Minimal runtime view. Full canonical state remains in \`.ralph/${plan.loopName}.plan.json\`; use Ralph tools only when you need more than the next task.`,
+			`Tasks: ${plan.tasks.length} total, ${counts.done} done, ${counts.in_progress} in progress, ${counts.blocked} blocked, ${counts.todo} todo, ${counts.cancelled} cancelled.`,
+		);
+
+		if (plan.goals.length > 0) {
+			const goals = plan.goals.slice(0, PROMPT_MAX_GOALS).map((goal) => `- ${truncateForPrompt(goal, 260)}`);
+			if (plan.goals.length > goals.length) goals.push(`- ${plan.goals.length - goals.length} additional goals omitted from prompt.`);
+			sections.push("## Goals", ...goals);
+		}
+
+		const nextTask = selectNextTask(plan);
+		sections.push(
+			"## Next Task",
+			nextTask
+				? formatPromptTask(nextTask)
+				: "- No active task found. If all work is complete, respond with the completion marker.",
+		);
+
+		sections.push(
+			"## How To Proceed",
+			"- Start with the next task above.",
+			"- If the next task is ambiguous, call ralph_get_plan or ralph_list_tasks instead of relying on old prompt history.",
+			"- If the task is blocked, either unblock it directly or call ralph_update_task with a concise blocker note and move to the next available task.",
+			"- Do not review old notes, reflections, or completed-task history unless the next task requires it.",
+		);
+
+		return capPromptPlan(sections.join("\n\n"));
 	}
 
 	function summarizePlan(plan: RalphPlan): string {
@@ -592,20 +674,24 @@ export default function (pi: ExtensionAPI) {
 
 		const parts = [header, ""];
 		if (isReflection) parts.push(state.reflectInstructions, "\n---\n");
-		parts.push(`## Current Plan (generated from ${state.taskFile})\n\n${taskContent}\n\n---`);
+		parts.push(`## Current Plan Runtime View (compact; generated from ${state.taskFile})\n\n${taskContent}\n\n---`);
 		parts.push(`\n## Instructions\n`);
 		parts.push("User controls: ESC pauses the assistant. Send a message to resume. Run /ralph-stop when idle to stop the loop.\n");
 		parts.push(`You are in a Ralph loop (iteration ${state.iteration}${state.maxIterations > 0 ? ` of ${state.maxIterations}` : ""}).\n`);
 		if (state.itemsPerIteration > 0) {
 			parts.push(`**THIS ITERATION: Process approximately ${state.itemsPerIteration} task items, then call the actual ralph_done tool.**\n`);
-			parts.push(`1. Use Ralph task tools to inspect the next ~${state.itemsPerIteration} tasks and work on them`);
+			parts.push(`1. Start from the single Next Task in the runtime view, then inspect additional tasks only if you need up to ~${state.itemsPerIteration} items for this iteration.`);
 		} else {
-			parts.push("1. Use Ralph task tools to inspect the plan and continue working on the next tasks");
+			parts.push("1. Start from the single Next Task in the runtime view.");
 		}
-		parts.push("2. Use Ralph plan tools to update task statuses, notes, reflections, and evidence");
-		parts.push(`3. Treat ${state.taskFile} as generated output; do not edit it directly`);
-		parts.push(`4. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
-		parts.push("5. Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name=\"ralph_done\"></invoke>.");
+		parts.push("2. To figure out what to do next: read the Next Task id/title/details first. If that is insufficient, call ralph_get_plan for full context or ralph_list_tasks to list pending tasks; do not read the generated markdown snapshot just to discover task state.");
+		parts.push("3. Before doing task work, mark the task in_progress with ralph_update_task if it is not already in progress.");
+		parts.push("4. Do the work using the available project tools. If a project tool reports that setup is required, such as setting the project cwd, do that setup once before retrying the tool.");
+		parts.push("5. When a task is complete, call ralph_update_task with status done and concise evidence describing what changed and how you verified it. If blocked, use status blocked with a blocker note. If partially done, leave it in_progress and add a note/evidence.");
+		parts.push("6. Treat Ralph state as canonical: use ralph_update_task, ralph_add_task, ralph_add_note, ralph_record_reflection, and related Ralph tools. Treat generated snapshot files as read-only output; do not edit them directly.");
+		parts.push(`7. Treat ${state.taskFile} as generated output; do not edit it directly.`);
+		parts.push(`8. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
+		parts.push("9. Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name=\"ralph_done\"></invoke>.");
 		return parts.join("\n");
 	}
 
@@ -615,7 +701,7 @@ export default function (pi: ExtensionAPI) {
 
 	function getIterationContent(ctx: ExtensionContext, state: LoopState): { content: string; needsReflection: boolean } | null {
 		const plan = ensurePlan(ctx, state);
-		const content = planToText(plan);
+		const content = planToPromptText(plan);
 		const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
 		return { content, needsReflection };
 	}
@@ -624,35 +710,43 @@ export default function (pi: ExtensionAPI) {
 		pi.sendUserMessage(buildPrompt(state, taskContent, needsReflection), { deliverAs: "followUp" });
 	}
 
+	function dispatchNextIterationResetFollowUp(state: LoopState, taskContent: string, needsReflection: boolean): void {
+		pi.sendUserMessage(buildResetPrompt(state, taskContent, needsReflection), { deliverAs: "followUp" });
+	}
+
 	function isNaturalAssistantStop(message: any): boolean {
 		return message?.role === "assistant" && message.stopReason === "stop";
 	}
-	async function dispatchNextIterationFreshSession(ctx: ExtensionContext, state: LoopState): Promise<void> {
+
+	function messageText(message: any): string {
+		if (typeof message?.content === "string") return message.content;
+		if (!Array.isArray(message?.content)) return "";
+		return message.content
+			.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+			.map((part: any) => part.text)
+			.join("\n");
+	}
+
+	function lastResetPromptMessage(messages: any[]): any | null {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message?.role !== "user") continue;
+			if (messageText(message).includes(SESSION_RESET_MARKER)) return message;
+			return null;
+		}
+		return null;
+	}
+
+	async function dispatchNextIterationFreshContext(ctx: ExtensionContext, state: LoopState): Promise<void> {
 		const iterationData = getIterationContent(ctx, state);
 		if (!iterationData) {
 			pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. Could not read plan file: ${state.taskFile}`);
 			return;
 		}
 		const { content, needsReflection } = iterationData;
-		const resetPrompt = buildResetPrompt(state, content, needsReflection);
-		try {
-			const result = await ctx.newSession({
-				withSession: async (nextCtx: any) => {
-					await nextCtx.sendUserMessage(resetPrompt);
-				},
-			});
-			if (result?.cancelled) throw new Error("Fresh session creation was cancelled");
-		} catch (error) {
-			const detail = error instanceof Error ? error.message : String(error);
-			if (state.sessionStrategyFailure === "stopAndAlert") {
-				pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. Failed to create fresh session: ${detail}`);
-				return;
-			}
-			if (ctx.hasUI) {
-				ctx.ui.notify(`Fresh-session continuation failed for "${state.name}". Falling back to follow-up: ${detail}`, "warning");
-			}
-			dispatchNextIterationFollowUp(state, content, needsReflection);
-		}
+		state.pendingSessionReset = true;
+		saveState(ctx, state);
+		dispatchNextIterationResetFollowUp(state, content, needsReflection);
 	}
 
 	function pauseLoop(ctx: ExtensionContext, state: LoopState, message?: string): void {
@@ -695,7 +789,7 @@ export default function (pi: ExtensionAPI) {
 			itemsPerIteration: 0,
 			reflectEvery: 0,
 			reflectInstructions: DEFAULT_REFLECT_INSTRUCTIONS,
-			sessionStrategy: "followUp" as SessionStrategy,
+			sessionStrategy: "newSession" as SessionStrategy,
 			sessionStrategyFailure: "followUp" as SessionStrategyFailure,
 		};
 		for (let i = 0; i < tokens.length; i++) {
@@ -755,7 +849,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	const commands: Record<string, (rest: string, ctx: any) => void | Promise<void>> = {
-		start(rest, ctx) {
+		async start(rest, ctx) {
 			const args = parseArgs(rest);
 			if (!args.name) {
 				ctx.ui.notify(
@@ -804,7 +898,11 @@ export default function (pi: ExtensionAPI) {
 			savePlanAndSnapshot(ctx, state, initialPlan);
 			currentLoop = loopName;
 			updateUI(ctx);
-			pi.sendUserMessage(buildPrompt(state, planToText(initialPlan), false));
+			if (state.sessionStrategy === "newSession") {
+				await dispatchNextIterationFreshContext(ctx, state);
+				return;
+			}
+			dispatchNextIterationFollowUp(state, planToPromptText(initialPlan), false);
 		},
 
 		stop(_rest, ctx) {
@@ -818,7 +916,7 @@ export default function (pi: ExtensionAPI) {
 			if (state) pauseLoop(ctx, state, `Paused Ralph loop: ${currentLoop} (iteration ${state.iteration})`);
 		},
 
-		resume(rest, ctx) {
+		async resume(rest, ctx) {
 			const loopName = rest.trim();
 			if (!loopName) {
 				ctx.ui.notify("Usage: /ralph resume <name>", "warning");
@@ -848,7 +946,11 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
 
 			const needsReflection = state.reflectEvery > 0 && state.iteration > 1 && (state.iteration - 1) % state.reflectEvery === 0;
-			pi.sendUserMessage(buildPrompt(state, planToText(plan), needsReflection));
+			if (state.sessionStrategy === "newSession") {
+				await dispatchNextIterationFreshContext(ctx, state);
+				return;
+			}
+			dispatchNextIterationFollowUp(state, planToPromptText(plan), needsReflection);
 		},
 
 		status(_rest, ctx) {
@@ -1048,7 +1150,7 @@ Options:
   --reflect-every N        Reflect every N iterations
   --max-iterations N       Stop after N iterations (default 50)
   --session-strategy MODE  Next-iteration dispatch: followUp or newSession
-  --session-strategy-failure MODE  On newSession failure: followUp or stopAndAlert
+  --session-strategy-failure MODE  Compatibility-only; currently unused
 
 To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 
@@ -1057,7 +1159,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		handler: async (args, ctx) => {
 			const [cmd] = args.trim().split(/\s+/);
 			const handler = commands[cmd];
-			if (handler) handler(args.slice(cmd.length).trim(), ctx);
+			if (handler) await handler(args.slice(cmd.length).trim(), ctx);
 			else ctx.ui.notify(HELP, "info");
 		},
 	});
@@ -1102,7 +1204,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			reflectEvery: Type.Optional(Type.Number({ description: "Reflect every N iterations" })),
 			maxIterations: Type.Optional(Type.Number({ description: "Max iterations (default: 50)", default: 50 })),
 			sessionStrategy: Type.Optional(Type.String({ description: "How to dispatch the next iteration: followUp or newSession" })),
-			sessionStrategyFailure: Type.Optional(Type.String({ description: "What to do if fresh-session creation fails: followUp or stopAndAlert" })),
+			sessionStrategyFailure: Type.Optional(Type.String({ description: "Compatibility-only; currently unused" })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const loopName = sanitize(params.name);
@@ -1132,7 +1234,20 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			savePlanAndSnapshot(ctx, state, plan);
 			currentLoop = loopName;
 			updateUI(ctx);
-			pi.sendUserMessage(buildPrompt(state, planToText(plan), false), { deliverAs: "followUp" });
+			if (state.sessionStrategy === "newSession") {
+				state.pendingSessionReset = true;
+				saveState(ctx, state);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Started loop "${loopName}" with ${plan.tasks.length} structured task(s). First iteration queued with fresh provider context.`,
+						},
+					],
+					details: {},
+				};
+			}
+			dispatchNextIterationFollowUp(state, planToPromptText(plan), false);
 			return {
 				content: [{ type: "text", text: `Started loop "${loopName}" with ${plan.tasks.length} structured task(s).` }],
 				details: {},
@@ -1374,13 +1489,25 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		const iterStr = `${state.iteration}${state.maxIterations > 0 ? `/${state.maxIterations}` : ""}`;
 		let instructions = `You are in a Ralph loop working on generated plan snapshot: ${state.taskFile}\n`;
 		if (state.itemsPerIteration > 0) instructions += `- Work on ~${state.itemsPerIteration} task items this iteration\n`;
-		instructions += `- Use Ralph plan tools instead of editing markdown directly\n`;
-		instructions += `- Record task updates, notes, evidence, and reflections in structured state\n`;
+		instructions += `- Start from the Next Task in the runtime prompt; call ralph_get_plan or ralph_list_tasks only when you need more task context\n`;
+		instructions += `- Mark active work in_progress, done, blocked, or cancelled with ralph_update_task\n`;
+		instructions += `- Record concise notes/evidence/reflections in structured Ralph state; do not edit generated markdown snapshots directly\n`;
 		instructions += `- When FULLY COMPLETE: ${COMPLETE_MARKER}\n`;
 		instructions += `- Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name="ralph_done"></invoke>.`;
 		return {
 			systemPrompt: event.systemPrompt + `\n[RALPH LOOP - ${state.name} - Iteration ${iterStr}]\n\n${instructions}`,
 		};
+	});
+
+	pi.on("context", async (event, ctx) => {
+		if (!currentLoop) return;
+		const state = loadState(ctx, currentLoop);
+		if (!state || state.status !== "active" || !state.pendingSessionReset) return;
+		const resetMessage = lastResetPromptMessage(event.messages);
+		if (!resetMessage) return;
+		state.pendingSessionReset = false;
+		saveState(ctx, state);
+		return { messages: [resetMessage] };
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -1421,7 +1548,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			saveState(ctx, state);
 			state = loadState(ctx, state.name);
 			if (!state || state.status !== "active") return;
-			await dispatchNextIterationFreshSession(ctx, state);
+			await dispatchNextIterationFreshContext(ctx, state);
 			return;
 		}
 

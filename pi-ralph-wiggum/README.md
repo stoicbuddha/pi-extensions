@@ -78,6 +78,8 @@ If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, ju
 | `--max-iterations N` | Stop after N iterations (default 50) |
 | `--items-per-iteration N` | Suggest N items per turn (prompt hint) |
 | `--reflect-every N` | Reflect every N iterations |
+| `--session-strategy MODE` | `newSession` (default) or `followUp` |
+| `--session-strategy-failure MODE` | Accepted for compatibility; currently unused |
 
 ## Session Reset Options
 
@@ -90,7 +92,7 @@ the current Ralph prompt and task file instead of carrying the prior loop transc
 CLI example:
 
 ```bash
-/ralph start clean-slate --session-strategy newSession --session-strategy-failure stopAndAlert
+/ralph start clean-slate --session-strategy newSession
 ```
 
 Agent tool example:
@@ -99,17 +101,31 @@ Agent tool example:
 ralph_start({
   name: "clean-slate",
   taskContent: "# Task\n\n## Checklist\n- [ ] Item 1",
-  sessionStrategy: "newSession",
-  sessionStrategyFailure: "stopAndAlert"
+  sessionStrategy: "newSession"
 })
 ```
 
 Options:
 
-- `sessionStrategy`: `followUp` or `newSession`
-- `sessionStrategyFailure`: `followUp` or `stopAndAlert`
+- `sessionStrategy`: `newSession` (default) or `followUp`
+- `sessionStrategyFailure`: accepted for compatibility with existing state/config, but Ralph no longer calls Pi's command-only session replacement API.
 
-`newSession` starts the next Ralph iteration in a fresh provider context seeded from the canonical structured plan state instead of carrying forward the prior loop transcript. Pi keeps the visible UI transcript intact rather than opening a separate session tab/file. If fresh-session creation fails, `sessionStrategyFailure` controls whether Ralph falls back to normal follow-up behavior or pauses and alerts you.
+`newSession` starts the next Ralph iteration in a fresh provider context seeded from the canonical structured plan state instead of carrying forward the prior loop transcript. Pi keeps the visible UI transcript intact rather than opening a separate session tab/file.
+
+## Runtime Prompt Size
+
+Ralph stores the full canonical plan, notes, verification, and reflection history in `.ralph/<name>.plan.json` and renders the full `.ralph/<name>.md` snapshot for humans. Iteration prompts use a minimal next-task runtime view instead of injecting the entire history every time.
+
+The runtime view includes summary counts, a small goals list, one selected next task, and instructions for fetching more context only if that next task is ambiguous. Older history stays available through `ralph_get_plan`, `ralph_list_tasks`, and the generated plan files, but it is omitted from the prompt to keep long-running loops within model context limits.
+
+Each iteration prompt tells the agent to:
+
+- Start from the single Next Task in the runtime view.
+- Call `ralph_get_plan` or `ralph_list_tasks` only when that task lacks enough context.
+- Mark active work with `ralph_update_task`, usually `in_progress` before work and `done` with evidence after verification.
+- Use `blocked` plus a blocker note when work cannot continue.
+- Treat `.ralph/<name>.md` as generated output and mutate canonical state only through Ralph tools.
+- Call the real `ralph_done` tool when the iteration should advance.
 
 ## Agent Tool
 
@@ -122,7 +138,7 @@ ralph_start({
   maxIterations: 50,
   itemsPerIteration: 3,
   reflectEvery: 10,
-  sessionStrategy: "followUp",
+  sessionStrategy: "newSession",
   sessionStrategyFailure: "followUp"
 })
 ```
