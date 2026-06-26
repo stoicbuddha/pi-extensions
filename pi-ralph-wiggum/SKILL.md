@@ -40,7 +40,7 @@ ralph_start({
 ## User Commands
 
 - `/ralph start <name|path>` - Start a new loop.
-- `/ralph resume <name>` - Resume loop.
+- `/ralph resume [name]` - Resume loop.
 - `/ralph stop` - Pause loop (when agent idle).
 - `/ralph-stop` - Stop active loop (idle only).
 - `/ralph status` - Show loops.

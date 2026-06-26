@@ -4,6 +4,7 @@
  */
 
 import * as fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
@@ -179,6 +180,72 @@ export default function (pi: ExtensionAPI) {
 
 	function nowIso(): string {
 		return new Date().toISOString();
+	}
+
+	function runGitCommand(ctx: ExtensionContext, args: string[]): { ok: boolean; stdout: string; stderr: string; status: number | null } {
+		const result = spawnSync("git", args, {
+			cwd: ctx.cwd,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		return {
+			ok: result.status === 0,
+			stdout: typeof result.stdout === "string" ? result.stdout : "",
+			stderr: typeof result.stderr === "string" ? result.stderr : "",
+			status: result.status,
+		};
+	}
+
+	function isNothingToCommit(output: string): boolean {
+		return /nothing to commit|working tree clean/i.test(output);
+	}
+
+	function buildGitCheckpointMessage(state: LoopState): string {
+		const completedIteration = Math.max(1, state.iteration - 1);
+		return `ralph: ${state.name} iteration ${completedIteration} checkpoint`;
+	}
+
+	function checkpointLoopState(ctx: ExtensionContext, state: LoopState): { ok: boolean; skipped: boolean; message: string } {
+		const addResult = runGitCommand(ctx, ["add", "."]);
+		if (!addResult.ok) {
+			return {
+				ok: false,
+				skipped: false,
+				message: `git add . failed: ${[addResult.stderr, addResult.stdout].filter(Boolean).join("\n").trim() || `exit ${addResult.status ?? "unknown"}`}`,
+			};
+		}
+
+		const commitMessage = buildGitCheckpointMessage(state);
+		const commitResult = runGitCommand(ctx, ["commit", "-m", commitMessage]);
+		if (!commitResult.ok) {
+			if (isNothingToCommit(`${commitResult.stdout}\n${commitResult.stderr}`)) {
+				return {
+					ok: true,
+					skipped: true,
+					message: "No git changes to commit; checkpoint skipped.",
+				};
+			}
+			return {
+				ok: false,
+				skipped: false,
+				message: `git commit failed: ${[commitResult.stderr, commitResult.stdout].filter(Boolean).join("\n").trim() || `exit ${commitResult.status ?? "unknown"}`}`,
+			};
+		}
+
+		const pushResult = runGitCommand(ctx, ["push"]);
+		if (!pushResult.ok) {
+			return {
+				ok: false,
+				skipped: false,
+				message: `git push failed: ${[pushResult.stderr, pushResult.stdout].filter(Boolean).join("\n").trim() || `exit ${pushResult.status ?? "unknown"}`}`,
+			};
+		}
+
+		return {
+			ok: true,
+			skipped: false,
+			message: `Created git checkpoint: ${commitMessage}`,
+		};
 	}
 
 	function parseSessionStrategy(value: unknown): SessionStrategy {
@@ -726,6 +793,7 @@ export default function (pi: ExtensionAPI) {
 		parts.push(`## Current Plan Runtime View (compact; generated from ${state.taskFile})\n\n${taskContent}\n\n---`);
 		parts.push(`\n## Instructions\n`);
 		parts.push("User controls: ESC pauses the assistant. Send a message to resume. Run /ralph-stop when idle to stop the loop.\n");
+		parts.push("Use the Graphify tools first when you need to understand the codebase structure or locate relevant files before reading them manually.\n");
 		parts.push(`You are in a Ralph loop (iteration ${state.iteration}${state.maxIterations > 0 ? ` of ${state.maxIterations}` : ""}).\n`);
 		if (state.itemsPerIteration > 0) {
 			parts.push(`**THIS ITERATION: Process approximately ${state.itemsPerIteration} task items, then call the actual ralph_done tool.**\n`);
@@ -966,10 +1034,29 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		async resume(rest, ctx) {
-			const loopName = rest.trim();
+			const requestedName = rest.trim();
+			let loopName = requestedName;
 			if (!loopName) {
-				ctx.ui.notify("Usage: /ralph resume <name>", "warning");
-				return;
+				if (currentLoop) {
+					const current = loadState(ctx, currentLoop);
+					if (current?.status === "paused") loopName = currentLoop;
+				}
+				if (!loopName) {
+					const pausedLoops = listLoops(ctx).filter((loop) => loop.status === "paused");
+					if (pausedLoops.length === 0) {
+						ctx.ui.notify("No paused Ralph loop found. Use /ralph start <name> to create one.", "warning");
+						return;
+					}
+					const mostRecentPaused = pausedLoops.reduce((best, candidate) => {
+						const bestMtime = safeMtimeMs(getPath(ctx, best.name, ".state.json"));
+						const candidateMtime = safeMtimeMs(getPath(ctx, candidate.name, ".state.json"));
+						return candidateMtime > bestMtime ? candidate : best;
+					});
+					loopName = mostRecentPaused.name;
+					if (pausedLoops.length > 1 && ctx.hasUI) {
+						ctx.ui.notify(`No name provided. Resuming most recently paused loop "${loopName}". Use /ralph resume [name] to choose a different loop.`, "info");
+					}
+				}
 			}
 			const state = loadState(ctx, loopName);
 			if (!state) {
@@ -1181,7 +1268,7 @@ export default function (pi: ExtensionAPI) {
 Commands:
   /ralph start <name|path> [options]  Start a new loop
   /ralph stop                         Pause current loop
-  /ralph resume <name>                Resume a paused loop
+  /ralph resume [name]                Resume a paused loop
   /ralph status                       Show all loops
   /ralph show-plan [loop]             Show structured plan summary
   /ralph list-tasks [loop] [--status STATUS]  Show structured tasks
@@ -1529,6 +1616,14 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			if (needsReflection) state.lastReflectionAt = state.iteration;
 			saveState(ctx, state);
 			updateUI(ctx);
+			const checkpointResult = checkpointLoopState(ctx, state);
+			if (!checkpointResult.ok) {
+				pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. ${checkpointResult.message}`);
+				return { content: [{ type: "text", text: `Error: ${checkpointResult.message}` }], details: {} };
+			}
+			if (checkpointResult.skipped && ctx.hasUI) {
+				ctx.ui.notify(checkpointResult.message, "info");
+			}
 			if (state.sessionStrategy === "newSession") {
 				state.pendingSessionReset = true;
 				saveState(ctx, state);
@@ -1553,6 +1648,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		if (!state || state.status !== "active") return;
 		const iterStr = `${state.iteration}${state.maxIterations > 0 ? `/${state.maxIterations}` : ""}`;
 		let instructions = `You are in a Ralph loop working on generated plan snapshot: ${state.taskFile}\n`;
+		instructions += `- Use the Graphify tools first when you need to understand the codebase structure or locate relevant files before reading them manually\n`;
 		if (state.itemsPerIteration > 0) instructions += `- Work on ~${state.itemsPerIteration} task items this iteration\n`;
 		instructions += `- Start from the Next Task in the runtime prompt; call compact ralph_get_plan or ralph_list_tasks only when you need more task context\n`;
 		instructions += `- Mark active work in_progress, done, blocked, or cancelled with ralph_update_task\n`;
@@ -1644,7 +1740,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		}
 		if (active.length > 0 && ctx.hasUI) {
 			const lines = active.map((l) => `  • ${l.name} (iteration ${l.iteration}${l.maxIterations > 0 ? `/${l.maxIterations}` : ""})`);
-			ctx.ui.notify(`Active Ralph loops:\n${lines.join("\n")}\n\nUse /ralph resume <name> to continue`, "info");
+			ctx.ui.notify(`Active Ralph loops:\n${lines.join("\n")}\n\nUse /ralph resume [name] to continue`, "info");
 		}
 		updateUI(ctx);
 	});

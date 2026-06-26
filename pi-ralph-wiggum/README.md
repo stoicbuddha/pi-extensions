@@ -57,7 +57,7 @@ If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, ju
 | Command | Description |
 |---------|-------------|
 | `/ralph start <name\|path>` | Start a new loop |
-| `/ralph resume <name>` | Resume a paused loop |
+| `/ralph resume [name]` | Resume a paused loop |
 | `/ralph stop` | Pause current loop |
 | `/ralph-stop` | Stop active loop (idle only) |
 | `/ralph status` | Show all loops |
