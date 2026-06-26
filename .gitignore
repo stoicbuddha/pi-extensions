@@ -5,3 +5,5 @@
 control/
 review/
 pi-loop-detector-presubagent/
+node_modules/
+/*/node_modules/

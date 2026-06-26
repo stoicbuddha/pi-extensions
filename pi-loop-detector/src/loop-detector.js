@@ -192,7 +192,7 @@ export class LoopDetector {
     this.lastJudgeOutcome = judgeOutcome;
     const review = this.#buildReview(judgeOutcome);
 
-    if (!judgeOutcome.is_loop || judgeOutcome.recommended_action === "ignore") {
+    if (!judgeOutcome.is_loop || judgeOutcome.action === "continue") {
       return {
         trigger,
         evidence,
@@ -203,10 +203,19 @@ export class LoopDetector {
     }
 
     const intervention = {
-      type: review.action === "steer" ? "steer" : (review.action === "stop" ? (judgeOutcome.recommended_action === "restrict_tools" ? "restrict_tools" : "pause") : "ignore"),
+      type: review.action,
       offendingTool: trigger.offendingTool ?? judgeOutcome.offendingTool ?? null,
-      message: review.message ?? buildInterventionMessage(judgeOutcome.recommended_action, trigger, trigger.offendingTool ?? judgeOutcome.offendingTool ?? null),
-      blockedTools: judgeOutcome.recommended_action === "restrict_tools" ? [trigger.offendingTool ?? judgeOutcome.offendingTool ?? null] : [],
+      message:
+        review.message ??
+        buildInterventionMessage(
+          review.action,
+          trigger,
+          trigger.offendingTool ?? judgeOutcome.offendingTool ?? null,
+        ),
+      blockedTools:
+        review.action === "stop" && trigger.offendingTool
+          ? [trigger.offendingTool]
+          : [],
     };
 
     this.lastInterventionType = intervention.type;
@@ -598,50 +607,60 @@ export class LoopDetector {
         is_loop: true,
         confidence: 0.7,
         reason: `Deterministic heuristic fired: ${evidence.trigger}.`,
-        recommended_action: "steer",
+        action: "steer",
+        steer_message: buildInterventionMessage("steer", { kind: evidence.trigger }, evidence.normalizedSummary.offendingTool ?? null),
         offendingTool: evidence.normalizedSummary.offendingTool ?? null,
       };
     }
 
-    const result = await judge(evidence);
-    return {
-      is_loop: Boolean(result?.is_loop),
-      confidence: Number(result?.confidence ?? 0),
-      reason: String(result?.reason ?? ""),
-      recommended_action: normalizeRecommendedAction(result?.recommended_action),
-      offendingTool:
-        result?.offendingTool ?? evidence.normalizedSummary.offendingTool ?? null,
-    };
+    try {
+      const result = await judge(evidence);
+      return {
+        is_loop: Boolean(result?.is_loop ?? result?.action !== "continue"),
+        confidence: Number(result?.confidence ?? 0),
+        reason: String(result?.reason ?? ""),
+        action: normalizeJudgeAction(result?.action ?? result?.recommended_action),
+        steer_message:
+          typeof result?.steer_message === "string"
+            ? result.steer_message
+            : typeof result?.message === "string"
+              ? result.message
+              : "",
+        offendingTool:
+          result?.offendingTool ?? evidence.normalizedSummary.offendingTool ?? null,
+      };
+    } catch (error) {
+      return {
+        is_loop: true,
+        confidence: 0,
+        reason: error instanceof Error ? error.message : String(error),
+        action: "stop",
+        offendingTool: evidence.normalizedSummary.offendingTool ?? null,
+      };
+    }
   }
 
   #buildReview(judgeOutcome) {
-    if (!judgeOutcome.is_loop || judgeOutcome.recommended_action === "ignore") {
+    if (!judgeOutcome.is_loop || judgeOutcome.action === "continue") {
       return {
         confidence: 0,
         action: "continue",
       };
     }
 
-    let action = "steer";
-    if (judgeOutcome.recommended_action === "pause" || judgeOutcome.recommended_action === "restrict_tools") {
-      action = "stop";
-    } else if (judgeOutcome.recommended_action === "steer") {
-      action = "steer";
-    }
-
     const review = {
       confidence: judgeOutcome.confidence,
-      action,
+      action: judgeOutcome.action === "steer" ? "steer" : "stop",
     };
 
-    if (action === "steer") {
-      review.message = judgeOutcome.reason;
+    if (review.action === "steer") {
+      review.message = judgeOutcome.steer_message || judgeOutcome.reason;
     }
 
     return review;
   }
   #buildIntervention(trigger, judgeOutcome) {
-    const type = judgeOutcome.recommended_action;
+    const type = judgeOutcome.action;
     const offendingTool = judgeOutcome.offendingTool ?? trigger.offendingTool ?? null;
     const message = buildInterventionMessage(type, trigger, offendingTool);
 
@@ -708,12 +727,10 @@ export function buildNormalizedSummary(trigger) {
 
 export function buildInterventionMessage(type, trigger, offendingTool) {
   switch (type) {
-    case "pause":
-      return `Loop detector paused the run after ${trigger.kind}. Resume only after changing strategy away from ${offendingTool ?? "the repeated action"}.`;
-    case "restrict_tools":
-      return `Loop detector observed ${trigger.kind}. Do not call ${offendingTool} on the next turn; choose a different corrective action.`;
-    case "ignore":
+    case "continue":
       return "Loop detector recorded the trigger and took no action.";
+    case "stop":
+      return `Loop detector halted the run after ${trigger.kind}. Resume only after changing strategy away from ${offendingTool ?? "the repeated action"}.`;
     case "steer":
     default:
       return `Repeated pattern detected: ${trigger.kind}. Next take a different corrective action and do not repeat ${offendingTool ?? "the same tool/action"}.`;
@@ -1083,11 +1100,17 @@ function isLowInformationTool(toolName, config = DEFAULTS) {
   return /(?:^|_)(?:status|list|show|inspect|read|view|cat|ls)(?:$|_)/i.test(toolInfo.name);
 }
 
-function normalizeRecommendedAction(value) {
-  if (value === "ignore" || value === "steer" || value === "pause" || value === "restrict_tools") {
+function normalizeJudgeAction(value) {
+  if (value === "continue" || value === "stop" || value === "steer") {
     return value;
   }
-  return "steer";
+  if (value === "ignore") {
+    return "continue";
+  }
+  if (value === "pause" || value === "restrict_tools") {
+    return "stop";
+  }
+  return "stop";
 }
 
 function stableStringify(value) {

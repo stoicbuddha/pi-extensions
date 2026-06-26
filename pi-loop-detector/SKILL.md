@@ -1,6 +1,6 @@
 ---
 name: pi-loop-detector
-description: Detect suspicious looping behavior from assistant messages, tool calls, and tool results, then recommend deterministic interventions. Use when an agent appears stuck repeating the same wrong action pattern.
+description: Detect suspicious looping behavior from assistant messages, tool calls, and tool results, then route the result through a subagent judge. Use when an agent appears stuck repeating the same wrong action pattern.
 ---
 
 # Pi Loop Detector
@@ -11,13 +11,8 @@ Use this extension when you need to classify whether recent agent behavior looks
 
 - which heuristic fired
 - a normalized evidence packet
-- a loop review object (`confidence`, `action`, and optional `message`)
-- a compatibility layer for the legacy intervention payload[
-  { "type": "assistant_message", "content": "I should call `ralph_done` now." },
-  { "type": "tool_call", "toolName": "rollback_status", "args": {} },
-  { "type": "tool_result", "toolName": "rollback_status", "args": {}, "ok": false, "result": "failed" }
-]
-```
+- a loop review object with `confidence`, `action: "continue" | "stop" | "steer"`, and optional `steer_message`
+- a sticky halt state until reset when the judge returns `stop`
 
 ## What It Detects
 
@@ -28,11 +23,8 @@ Use this extension when you need to classify whether recent agent behavior looks
 
 ## Interventions
 
-The extension keeps enforcement deterministic. It recommends one of:
+Host runtime code should apply the judge result deterministically:
 
-- `ignore`
-- `steer`
-- `pause`
-- `restrict_tools`
-
-Host runtime code should decide how to apply that recommendation.
+- `continue`: let the parent session proceed
+- `stop`: enter a sticky halted state until reset
+- `steer`: inject the returned `steer_message` directly into the parent session

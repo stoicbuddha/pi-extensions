@@ -476,7 +476,7 @@ test("uses judge output to choose deterministic intervention", async () => {
       is_loop: true,
       confidence: 0.93,
       reason: "clear loop",
-      recommended_action: "restrict_tools",
+      action: "stop",
       offendingTool: "rollback_status",
     }),
   });
@@ -491,7 +491,7 @@ test("uses judge output to choose deterministic intervention", async () => {
     args: {},
   });
 
-  assert.equal(outcome.intervention.type, "restrict_tools");
+  assert.equal(outcome.intervention.type, "stop");
   assert.deepEqual(outcome.intervention.blockedTools, ["rollback_status"]);
 });
 

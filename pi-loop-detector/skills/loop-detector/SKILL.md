@@ -1,6 +1,6 @@
 ---
 name: loop-detector
-description: Use the loop detector core in this plugin to capture runtime events, classify suspicious repetition, build judge-ready evidence packets, and return deterministic interventions.
+description: Use the loop detector core in this plugin to capture runtime events, classify suspicious repetition, build judge-ready evidence packets, and return subagent-friendly loop decisions.
 disable-model-invocation: false
 ---
 
@@ -17,9 +17,8 @@ Use this plugin when an agent runtime needs to detect repeated nonproductive beh
   - repeated failures with similar inputs
   - self-correction loops
 - Compact evidence packet generation
-- Optional isolated judge callback with structured output
-- Deterministic interventions: `ignore`, `steer`, `pause`, `restrict_tools`
-- Cooldown logic to avoid intervention spam
+- Judge output normalization for `continue`, `stop`, and `steer`
+- Sticky halted state support in the host runtime
 
 ## Runtime Contract
 
@@ -42,7 +41,7 @@ When a trigger fires, `handleEvent()` returns:
 }
 ```
 
-Use `intervention.message` as the steering or pause text exposed to the in-loop agent. Keep actual enforcement in the host runtime.
+`judgeOutcome.action` is normalized to `continue`, `stop`, or `steer`. Host runtime code should apply `steer_message` directly if present and treat `stop` as sticky until reset.
 
 ## Judge Contract
 
@@ -52,6 +51,8 @@ Provide an async `judge(evidence)` callback if you want isolated model review. R
 {
   confidence: 0.95,
   action: "steer", // "continue" | "stop" | "steer"
-  message: "Please try a different tool." // optional
+  steer_message: "Please try a different tool."
 }
-```If no judge is provided, the detector defaults to deterministic `steer` behavior after a heuristic fires.
+```
+
+If no judge is provided, the detector defaults to deterministic `steer` behavior after a heuristic fires.

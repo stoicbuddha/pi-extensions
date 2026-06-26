@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { LoopDetector } from "./src/index.js";
+import { evaluateLoopWithSubagent } from "./src/subagent-bridge.js";
 
 type LoopEvent =
 	| {
@@ -31,34 +32,33 @@ type LoopEvent =
 	  };
 
 type LoopOutcome = Awaited<ReturnType<LoopDetector["handleEvent"]>>;
-type RecoveryMode = "steer" | "newSession";
+type JudgeAction = "continue" | "stop" | "steer";
+type JudgeBridge = (evidence: unknown, state: RuntimeState) => Promise<{
+	confidence: number;
+	action: JudgeAction;
+	steer_message?: string;
+	reason?: string;
+	offendingTool?: string | null;
+}>;
 
 interface RuntimeState {
 	detector: LoopDetector;
 	events: LoopEvent[];
 	inputHistory: string[];
 	hostContext: any | null;
-	pendingRecovery: {
-		prompt: string;
-		triggerKind: string;
-		offendingTool: string | null;
-		mode: RecoveryMode;
-	} | null;
-	recoveryMode: RecoveryMode;
-	recovering: boolean;
+	halted: boolean;
+	haltReason: string | null;
 	lastOutcome: LoopOutcome;
 	lastResetAt: string;
 }
 
 const MAX_RUNTIME_EVENTS = 64;
 const MAX_INPUT_HISTORY = 6;
-const DEFAULT_RECOVERY_MODE: RecoveryMode = "steer";
+const DEFAULT_JUDGE_TIMEOUT_MS = 15_000;
 const MAX_INPUT_CHARS = 2000;
 const MAX_TOOL_ARG_STRING_CHARS = 500;
 const MAX_TOOL_ARGS_JSON_CHARS = 1400;
 const MAX_TOOL_RESULT_CHARS = 1000;
-const MAX_RECENT_TRANSCRIPT_CHARS = 5000;
-const MAX_RECOVERY_PROMPT_CHARS = 16000;
 const MAX_OBJECT_KEYS = 30;
 const MAX_ARRAY_ITEMS = 20;
 const REDACTED_ARG_KEYS = new Set([
@@ -81,22 +81,25 @@ const REDACTED_ARG_KEYS = new Set([
 	"results",
 ]);
 
-function createRuntimeState(config: Record<string, unknown> = {}): RuntimeState {
-	return {
-		detector: new LoopDetector(config),
+function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: JudgeBridge): RuntimeState {
+	const state = {
+		detector: null as unknown as LoopDetector,
 		events: [],
 		inputHistory: [],
 		hostContext: null,
-		pendingRecovery: null,
-		recoveryMode: parseRecoveryMode(config.recoveryMode),
-		recovering: false,
+		halted: false,
+		haltReason: null,
 		lastOutcome: null,
 		lastResetAt: new Date().toISOString(),
-	};
-}
+	} as RuntimeState;
 
-function parseRecoveryMode(value: unknown): RecoveryMode {
-	return value === "newSession" ? "newSession" : DEFAULT_RECOVERY_MODE;
+	const judge = typeof judgeBridge === "function" ? (evidence: unknown) => judgeBridge(evidence, state as RuntimeState) : undefined;
+	state.detector = new LoopDetector({
+		...config,
+		judge,
+	});
+
+	return state;
 }
 
 function loadProjectConfig(ctx: any): Record<string, unknown> {
@@ -122,7 +125,7 @@ function summarizeOutcome(outcome: LoopOutcome): string {
 		return "No suspicious loop pattern detected.";
 	}
 
-	const action = outcome.intervention?.type ?? outcome.judgeOutcome.recommended_action;
+	const action = outcome.intervention?.type ?? outcome.judgeOutcome.action;
 	const reason = outcome.judgeOutcome.reason || outcome.trigger.kind;
 	return `Loop detected via ${outcome.trigger.kind}. Action: ${action}. Reason: ${reason}`;
 }
@@ -175,10 +178,6 @@ function sanitizeForPrompt(value: unknown, key = "", depth = 0): unknown {
 		output.__truncated_keys = entries.length - MAX_OBJECT_KEYS;
 	}
 	return output;
-}
-
-function compactJson(value: unknown, maxChars: number): string {
-	return truncateText(JSON.stringify(value ?? {}), maxChars);
 }
 
 function sanitizeToolArgs(args: Record<string, unknown>): Record<string, unknown> {
@@ -319,221 +318,53 @@ function getLatestAssistantMessage(event: any): string {
 	return "";
 }
 
-function findSuspectedLoopStart(state: RuntimeState, outcome: NonNullable<LoopOutcome>): string {
-	const offendingTool = outcome.trigger.offendingTool ?? outcome.judgeOutcome.offendingTool ?? null;
-	const recent = state.events.slice(-16);
-
-	if (offendingTool) {
-		const firstToolCall = recent.find(
-			(event) => event.type === "tool_call" && event.toolName === offendingTool,
+function createJudgeBridge(pi: ExtensionAPI): JudgeBridge {
+	return async (evidence, state) => {
+		const context = state.hostContext;
+		const piAny = pi as any;
+		return evaluateLoopWithSubagent(
+			[context, piAny, context?.subagents, piAny?.subagents, context?.extensions?.["pi-subagents"], piAny?.extensions?.["pi-subagents"]],
+			evidence,
+			{ timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS },
 		);
-		if (firstToolCall) {
-			return `First recent repeated call to ${offendingTool}${firstToolCall.timestamp ? ` at ${firstToolCall.timestamp}` : ""}.`;
-		}
+	};
+}
 
-		const firstToolResult = recent.find(
-			(event) => event.type === "tool_result" && event.toolName === offendingTool,
-		);
-		if (firstToolResult) {
-			return `First recent repeated result for ${offendingTool}${firstToolResult.timestamp ? ` at ${firstToolResult.timestamp}` : ""}.`;
+function applyJudgeOutcome(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>, sendMessage: (prompt: string, options?: { deliverAs?: "followUp" | "steer" }) => void): void {
+	if (!outcome?.intervention) return;
+	if (outcome.judgeOutcome.action === "continue") return;
+	if (state.halted) return;
+
+	if (outcome.judgeOutcome.action === "stop") {
+		state.halted = true;
+		state.haltReason = outcome.judgeOutcome.reason || outcome.trigger.kind;
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Loop detector halted on ${outcome.trigger.kind}; reset required.`, "warning");
 		}
+		return;
 	}
 
-	const firstEvidenceEvent = state.events[Math.max(0, state.events.length - 8)];
-	if (!firstEvidenceEvent) return "Unknown.";
-	return `Within the last ${Math.min(8, state.events.length)} captured runtime events${firstEvidenceEvent.timestamp ? `, beginning around ${firstEvidenceEvent.timestamp}` : ""}.`;
-}
-
-function buildRecentTranscript(state: RuntimeState): string {
-	const recent = state.events.slice(-12);
-	if (recent.length === 0) return "No recent runtime events captured.";
-
-	return recent
-		.map((event) => {
-			if (event.type === "assistant_message") {
-				return `assistant_message: ${event.content.slice(0, 400)}`;
-			}
-			if (event.type === "tool_call") {
-				return `tool_call ${event.toolName}: ${compactJson(event.args ?? {}, MAX_TOOL_ARGS_JSON_CHARS)}`;
-			}
-			return `tool_result ${event.toolName}: ok=${event.ok} progress=${String(event.progress)} result=${extractText(event.result).slice(0, 240)}`;
-		})
-		.join("\n")
-		.slice(0, MAX_RECENT_TRANSCRIPT_CHARS);
-}
-
-function buildRecoveryPrompt(state: RuntimeState, outcome: NonNullable<LoopOutcome>, mode: RecoveryMode): string {
-	const offendingTool = outcome.trigger.offendingTool ?? outcome.judgeOutcome.offendingTool ?? null;
-	const recentGoal = state.inputHistory.length > 0 ? state.inputHistory[state.inputHistory.length - 1] : "No user goal captured in this session.";
-	const originalGoal = state.inputHistory.length > 0 ? state.inputHistory[0] : recentGoal;
-	const evidence = outcome.evidence;
-	const suspectedLoopStart = findSuspectedLoopStart(state, outcome);
-	const triggerNotes = outcome.trigger.notes?.join("\n- ") ?? "No notes.";
-	const assistantMessages = evidence.assistantMessages.map((msg) => `- ${msg.content.slice(0, 280)}`).join("\n") || "- None captured";
-	const toolCalls = evidence.toolCalls.map((call) => `- ${call.toolName} ${compactJson(call.args ?? {}, MAX_TOOL_ARGS_JSON_CHARS)}`).join("\n") || "- None captured";
-	const toolResults =
-		evidence.toolResults
-			.map((result) => `- ${result.toolName} ok=${result.ok} progress=${String(result.progress)} summary=${result.resultSummary}`)
-			.join("\n") || "- None captured";
-	const resetHeader =
-		mode === "newSession"
-			? "Previous transcript tail is suspected to be a nonproductive loop. Treat this as a fresh recovery context."
-			: "Loop detector interruption: evaluate the suspected loop before continuing.";
-
-	const prompt = `${resetHeader}
-
-## Original Goal
-${originalGoal}
-
-## Most Recent User Direction
-${recentGoal}
-
-## Suspected Loop
-- Trigger: ${outcome.trigger.kind}
-- Offending tool: ${offendingTool ?? "unknown"}
-- Suspected loop start: ${suspectedLoopStart}
-- Judge reason: ${outcome.judgeOutcome.reason || "Deterministic heuristic trigger"}
-- Confidence: ${outcome.judgeOutcome.confidence}
-- Notes:
-- ${triggerNotes}
-
-## Recent Assistant Messages
-${assistantMessages}
-
-## Recent Tool Calls
-${toolCalls}
-
-## Recent Tool Results
-${toolResults}
-
-## Recent Runtime Transcript
-${buildRecentTranscript(state)}
-
-## Recovery Instructions
-1. First perform an isolated loop judgment. Decide whether the prior run was genuinely stuck in a loop.
-2. Be explicitly skeptical of the parent session's recent self-explanations, self-corrections, and confident narration. Treat them as potentially compromised loop behavior rather than reliable evidence.
-3. Give more weight to observable tool calls, tool results, and concrete failures than to the parent's reflective prose when they conflict.
-4. If it was not a loop, say so briefly and continue the task normally.
-5. If it was a loop, summarize the last known good state before the loop in 2-4 bullets.
-6. Name the concrete constraint, missing precondition, or mistaken assumption that caused the repetition.
-7. Choose a different next action that addresses that constraint directly.
-8. Do not repeat ${offendingTool ?? "the same tool/action"} with materially similar inputs until the blocking condition has changed.
-9. Continue the task from the recovered state instead of narrating the failed loop again.
-
-## Required First Output
-Start your first response with exactly one fenced \`json\` block and no prose before it:
-
-\`\`\`json
-{
-  "is_loop": true,
-  "confidence": 0.0,
-  "loop_start": "short description",
-  "last_good_state": [
-    "bullet 1",
-    "bullet 2"
-  ],
-  "cause": "short description",
-  "next_steps": [
-    "step 1",
-    "step 2"
-  ]
-}
-\`\`\`
-
-After that JSON block, continue the task from the recovered state.`;
-	return truncateText(prompt, MAX_RECOVERY_PROMPT_CHARS);
-}
-
-async function flushPendingRecovery(
-	state: RuntimeState,
-	ctx: any,
-	sendMessage: (prompt: string, options?: { deliverAs?: "followUp" | "steer" }) => void,
-): Promise<void> {
-	if (!state.pendingRecovery || state.recovering) return;
-
-	const pending = state.pendingRecovery;
-	state.pendingRecovery = null;
-	state.recovering = true;
-
-	try {
-		if (pending.mode === "steer") {
-			sendMessage(pending.prompt, { deliverAs: "steer" });
-			if (ctx.hasUI) {
-				ctx.ui.notify(`Loop detector sent steering for ${pending.triggerKind}.`, "warning");
-			}
-			return;
-		}
-
-		const recoveryCtx = typeof ctx?.newSession === "function" ? ctx : state.hostContext;
-		if (!recoveryCtx || typeof recoveryCtx.newSession !== "function") {
-			throw new Error("fresh session API unavailable");
-		}
-
-		if (typeof recoveryCtx.waitForIdle === "function") {
-			await recoveryCtx.waitForIdle();
-		}
-
-		const result = await recoveryCtx.newSession({
-			withSession: async (nextCtx: any) => {
-				await nextCtx.sendUserMessage(pending.prompt);
-			},
-		});
-
-		if (result?.cancelled) {
-			throw new Error("Fresh session creation was cancelled");
-		}
-
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Loop detector started a fresh recovery session for ${pending.triggerKind}.`, "warning");
-		}
-	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
-		sendMessage(pending.prompt, { deliverAs: "followUp" });
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Fresh recovery session failed; queued follow-up recovery prompt instead: ${detail}`, "warning");
-		}
-	} finally {
-		state.recovering = false;
+	const steerMessage = outcome.judgeOutcome.steer_message || outcome.review?.message || outcome.judgeOutcome.reason;
+	if (steerMessage) {
+		sendMessage(steerMessage, { deliverAs: "steer" });
+	}
+	if (ctx.hasUI) {
+		ctx.ui.notify(`Loop detector sent subagent steering for ${outcome.trigger.kind}.`, "warning");
 	}
 }
 
 export default function loopDetectorExtension(pi: ExtensionAPI) {
-	let runtime = createRuntimeState();
+	let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi));
 	const sendMessage = (prompt: string, options?: { deliverAs?: "followUp" | "steer" }) => {
 		pi.sendUserMessage(prompt, options);
 	};
 
-	async function handleRuntimeEvent(event: LoopEvent, ctx: any, preferredMode?: RecoveryMode): Promise<void> {
-		const mode = preferredMode ?? runtime.recoveryMode;
+	async function handleRuntimeEvent(event: LoopEvent, ctx: any): Promise<void> {
 		recordRuntimeEvent(runtime, event);
+		if (runtime.halted) return;
 		const outcome = await runtime.detector.handleEvent(event);
 		runtime.lastOutcome = outcome;
-		if (!outcome?.intervention) return;
-		if (runtime.pendingRecovery || runtime.recovering) return;
-
-		const prompt = buildRecoveryPrompt(runtime, outcome, mode);
-		if (mode === "steer") {
-			sendMessage(prompt, { deliverAs: "steer" });
-			if (ctx.hasUI) {
-				ctx.ui.notify(`Loop detector sent in-session judge steering for ${outcome.trigger.kind}.`, "warning");
-			}
-			return;
-		}
-
-		runtime.pendingRecovery = {
-			prompt,
-			triggerKind: outcome.trigger.kind,
-			offendingTool: outcome.trigger.offendingTool ?? outcome.judgeOutcome.offendingTool ?? null,
-			mode,
-		};
-
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Loop detector triggered on ${outcome.trigger.kind}; preparing fresh-context judge recovery.`, "warning");
-		}
-
-		if (typeof ctx?.isIdle === "function" && ctx.isIdle()) {
-			await flushPendingRecovery(runtime, ctx, sendMessage);
-		}
+		applyJudgeOutcome(runtime, ctx, outcome, sendMessage);
 	}
 
 	pi.registerCommand("loop-detector", {
@@ -542,23 +373,17 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 			const [command] = args.trim().split(/\s+/);
 
 			if (command === "reset") {
-				runtime = createRuntimeState(loadProjectConfig(ctx));
+				runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+				runtime.hostContext = ctx;
 				if (ctx.hasUI) ctx.ui.notify("Loop detector runtime state reset.", "info");
-				return;
-			}
-
-			if (command === "recover") {
-				await flushPendingRecovery(runtime, ctx, sendMessage);
 				return;
 			}
 
 			if (command === "status") {
 				const summary = runtime.lastOutcome ? summarizeOutcome(runtime.lastOutcome) : "No loop detected in this session.";
-				const pending = runtime.pendingRecovery
-					? `Pending recovery: ${runtime.pendingRecovery.triggerKind} via ${runtime.pendingRecovery.mode}`
-					: "Pending recovery: none";
+				const halted = runtime.halted ? `Halted: yes (${runtime.haltReason ?? "unknown"})` : "Halted: no";
 				if (ctx.hasUI) {
-					ctx.ui.notify(`${summary}\n${pending}\nCaptured events: ${runtime.events.length}`, "info");
+					ctx.ui.notify(`${summary}\n${halted}\nCaptured events: ${runtime.events.length}`, "info");
 				}
 				return;
 			}
@@ -568,7 +393,6 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 					[
 						"Loop Detector",
 						"  /loop-detector status   Show runtime detector state",
-						"  /loop-detector recover  Execute any pending recovery immediately",
 						"  /loop-detector reset    Clear captured detector state",
 					].join("\n"),
 					"info",
@@ -624,7 +448,8 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 						inputEvents === runtime.events
 							? {
 									capturedEvents: runtime.events.length,
-									pendingRecovery: runtime.pendingRecovery,
+									halted: runtime.halted,
+									haltReason: runtime.haltReason,
 									lastResetAt: runtime.lastResetAt,
 							  }
 							: undefined,
@@ -634,7 +459,7 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		runtime = createRuntimeState(loadProjectConfig(ctx));
+		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
 		runtime.hostContext = ctx;
 		if (ctx.hasUI) {
 			ctx.ui.notify("Loop detector active for this session.", "info");
@@ -665,21 +490,15 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 	pi.on("agent_end", async (event, ctx) => {
 		const assistantText = getLatestAssistantMessage(event);
 		if (assistantText) {
+			const timestamp = typeof (event as any)?.timestamp === "string" ? (event as any).timestamp : undefined;
 			await handleRuntimeEvent(
 				{
 					type: "assistant_message",
 					content: assistantText,
-					timestamp: typeof event?.timestamp === "string" ? event.timestamp : undefined,
+					timestamp,
 				},
 				ctx,
-				"steer",
 			);
 		}
-
-		await flushPendingRecovery(runtime, ctx, sendMessage);
-	});
-
-	pi.on("turn_end", async (_event, ctx) => {
-		await flushPendingRecovery(runtime, ctx, sendMessage);
 	});
 }

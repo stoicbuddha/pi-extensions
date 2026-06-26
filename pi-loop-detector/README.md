@@ -6,9 +6,9 @@ This repo implements the loop detector plan as a small plugin package plus a reu
 
 - Rolling event buffer with compact retained state
 - Deterministic heuristics for suspicious repeated behavior
-- Evidence packet generation sized for isolated judge-model calls
-- Deterministic intervention handling after judge output
-- Cooldown and early-clear behavior
+- Evidence packet generation sized for isolated subagent judge calls
+- Judge bridge with `continue`, `stop`, and `steer` outcomes
+- Sticky halt handling until reset
 - Node tests covering positive, negative, and recovery paths
 
 ## Usage
@@ -20,24 +20,26 @@ const detector = new LoopDetector({
   judge: async (evidence) => ({
     confidence: 0.92,
     action: "steer",
-    message: "Please try a different tool.",
+    steer_message: "Please try a different tool.",
   }),
+});
+
 const outcome = await detector.handleEvent({
   type: "tool_call",
   toolName: "rollback_status",
   args: { id: 1 },
 });
 
-if (outcome?.intervention) {
-  console.log(outcome.intervention.message);
+if (outcome?.judgeOutcome.action === "steer") {
+  console.log(outcome.judgeOutcome.steer_message);
 }
 ```
 
 ## Notes
 
 - The detector uses only stable runtime signals from the plan: messages, tool calls, tool results, failures, and normalized arguments.
-- The judge never executes interventions directly; it only returns structured advice.
-- Enforcement stays deterministic in the host runtime.
+- The judge bridge should be isolated from the parent transcript and should return structured JSON.
+- `stop` is sticky in the host runtime until an explicit reset.
 
 ## Optional Project Config
 
@@ -46,7 +48,6 @@ Create `.pi-loop-detector.json` in a project root to tune generic detection for 
 ```json
 {
   "version": 1,
-  "recoveryMode": "steer",
   "toolAliases": [
     { "match": "^(?:ToolKitMCP|ToolkitMCP|Toolkit MCP)_(.+)$", "replace": "$1" }
   ],
@@ -96,7 +97,6 @@ Create `.pi-loop-detector.json` in a project root to tune generic detection for 
 ### Fields
 
 - `toolAliases`: regex replacements applied before classification. Use this to strip MCP server prefixes.
-- `recoveryMode`: `steer` (default) sends an in-session steering prompt when a loop is detected. `newSession` starts a separate fresh recovery session, which is useful for severe loops but creates an additional provider request.
 - `toolClasses`: ordered regex rules that assign a normalized tool name to a class.
 - `classes`: default behavior per class.
 - `tools`: exact per-tool overrides after alias normalization.
@@ -138,18 +138,6 @@ Tune looser when the model should get more room to recover on its own:
 
 This is useful when the model is often able to talk itself out of a bad approach after one or two failed attempts.
 
-Tune looser when a workflow legitimately repeats similar actions:
-
-```json
-{
-  "tools": {
-    "screenshot_url": { "class": "read", "sameCycleRepeats": 4, "sameToolRepeats": 5 }
-  }
-}
-```
-
-This is useful for UI work where repeated screenshots after visible changes are normal.
-
 Mark successful tools as non-progress when `ok: true` only means "the command ran":
 
 ```json
@@ -172,13 +160,3 @@ Mark tool-specific no-progress messages when an edit tool can reject a candidate
   }
 }
 ```
-
-Use fresh recovery sessions only when you want the loop detector to isolate the judge/recovery prompt from the current transcript:
-
-```json
-{
-  "recoveryMode": "newSession"
-}
-```
-
-That can improve recovery quality for badly contaminated contexts, but it also means a detection event can launch a second provider task. Keep the default `steer` mode when prompt volume or local-model context pressure is the main concern.
