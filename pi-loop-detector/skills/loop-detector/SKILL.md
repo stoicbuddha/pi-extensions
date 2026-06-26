@@ -50,12 +50,8 @@ Provide an async `judge(evidence)` callback if you want isolated model review. R
 
 ```js
 {
-  is_loop: true,
-  confidence: 0.91,
-  reason: "Repeated intent/action mismatch with same wrong tool",
-  recommended_action: "steer",
-  offendingTool: "rollback_status"
+  confidence: 0.95,
+  action: "steer", // "continue" | "stop" | "steer"
+  message: "Please try a different tool." // optional
 }
-```
-
-If no judge is provided, the detector defaults to deterministic `steer` behavior after a heuristic fires.
+```If no judge is provided, the detector defaults to deterministic `steer` behavior after a heuristic fires.

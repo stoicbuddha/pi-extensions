@@ -1,3 +1,4 @@
+// Test comment for JS file
 const DEFAULTS = {
   bufferSize: 64,
   evidenceWindow: 8,
@@ -189,6 +190,7 @@ export class LoopDetector {
     const evidence = this.#buildEvidencePacket(trigger);
     const judgeOutcome = await this.#runJudge(evidence);
     this.lastJudgeOutcome = judgeOutcome;
+    const review = this.#buildReview(judgeOutcome);
 
     if (!judgeOutcome.is_loop || judgeOutcome.recommended_action === "ignore") {
       return {
@@ -196,10 +198,17 @@ export class LoopDetector {
         evidence,
         judgeOutcome,
         intervention: null,
+        review,
       };
     }
 
-    const intervention = this.#buildIntervention(trigger, judgeOutcome);
+    const intervention = {
+      type: review.action === "steer" ? "steer" : (review.action === "stop" ? (judgeOutcome.recommended_action === "restrict_tools" ? "restrict_tools" : "pause") : "ignore"),
+      offendingTool: trigger.offendingTool ?? judgeOutcome.offendingTool ?? null,
+      message: review.message ?? buildInterventionMessage(judgeOutcome.recommended_action, trigger, trigger.offendingTool ?? judgeOutcome.offendingTool ?? null),
+      blockedTools: judgeOutcome.recommended_action === "restrict_tools" ? [trigger.offendingTool ?? judgeOutcome.offendingTool ?? null] : [],
+    };
+
     this.lastInterventionType = intervention.type;
     this.cooldownRemaining = this.config.cooldownEvents;
 
@@ -208,6 +217,7 @@ export class LoopDetector {
       evidence,
       judgeOutcome,
       intervention,
+      review,
     };
   }
 
@@ -232,6 +242,7 @@ export class LoopDetector {
     const stillPending = [];
     for (const pending of this.pendingIntents) {
       if (pending.tools.includes(toolName)) {
+        stillPending.push(pending);
         continue;
       }
       this.intentMismatches.push({
@@ -247,7 +258,6 @@ export class LoopDetector {
     this.pendingIntents = [];
     this.intentMismatches = this.intentMismatches.slice(-10);
   }
-
   #trimEvents() {
     if (this.events.length > this.config.bufferSize) {
       this.events.splice(0, this.events.length - this.config.bufferSize);
@@ -604,6 +614,32 @@ export class LoopDetector {
     };
   }
 
+  #buildReview(judgeOutcome) {
+    if (!judgeOutcome.is_loop || judgeOutcome.recommended_action === "ignore") {
+      return {
+        confidence: 0,
+        action: "continue",
+      };
+    }
+
+    let action = "steer";
+    if (judgeOutcome.recommended_action === "pause" || judgeOutcome.recommended_action === "restrict_tools") {
+      action = "stop";
+    } else if (judgeOutcome.recommended_action === "steer") {
+      action = "steer";
+    }
+
+    const review = {
+      confidence: judgeOutcome.confidence,
+      action,
+    };
+
+    if (action === "steer") {
+      review.message = judgeOutcome.reason;
+    }
+
+    return review;
+  }
   #buildIntervention(trigger, judgeOutcome) {
     const type = judgeOutcome.recommended_action;
     const offendingTool = judgeOutcome.offendingTool ?? trigger.offendingTool ?? null;

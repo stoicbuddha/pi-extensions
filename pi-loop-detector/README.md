@@ -18,19 +18,10 @@ import { LoopDetector } from "./src/index.js";
 
 const detector = new LoopDetector({
   judge: async (evidence) => ({
-    is_loop: true,
     confidence: 0.92,
-    reason: "Repeated wrong tool call with no progress",
-    recommended_action: "steer",
-    offendingTool: evidence.normalizedSummary.offendingTool,
+    action: "steer",
+    message: "Please try a different tool.",
   }),
-});
-
-await detector.handleEvent({
-  type: "assistant_message",
-  content: "I should call `ralph_done` now.",
-});
-
 const outcome = await detector.handleEvent({
   type: "tool_call",
   toolName: "rollback_status",

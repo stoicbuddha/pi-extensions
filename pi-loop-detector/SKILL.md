@@ -9,19 +9,10 @@ Use this extension when you need to classify whether recent agent behavior looks
 
 ## Available Tool
 
-`detect_loop` analyzes a compact event list and returns:
-
 - which heuristic fired
 - a normalized evidence packet
-- a judge-style structured outcome
-- a deterministic intervention recommendation
-
-## Event Format
-
-Provide events in time order:
-
-```json
-[
+- a loop review object (`confidence`, `action`, and optional `message`)
+- a compatibility layer for the legacy intervention payload[
   { "type": "assistant_message", "content": "I should call `ralph_done` now." },
   { "type": "tool_call", "toolName": "rollback_status", "args": {} },
   { "type": "tool_result", "toolName": "rollback_status", "args": {}, "ok": false, "result": "failed" }
