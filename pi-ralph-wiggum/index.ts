@@ -6,6 +6,7 @@
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -73,6 +74,9 @@ interface LoopState {
 	sessionStrategy: SessionStrategy;
 	sessionStrategyFailure: SessionStrategyFailure;
 	pendingSessionReset?: boolean;
+	createdAt?: string;
+	updatedAt?: string;
+	archivedAt?: string | null;
 }
 
 interface RalphNote {
@@ -130,6 +134,8 @@ const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
 
 export default function (pi: ExtensionAPI) {
 	let currentLoop: string | null = null;
+	let dbHandle: { cwd: string; dbPath: string; db: DatabaseSync } | null = null;
+	const importedCwds = new Set<string>();
 
 	const ralphDir = (ctx: ExtensionContext) => path.resolve(ctx.cwd, RALPH_DIR);
 	const archiveDir = (ctx: ExtensionContext) => path.join(ralphDir(ctx), "archive");
@@ -180,6 +186,461 @@ export default function (pi: ExtensionAPI) {
 
 	function nowIso(): string {
 		return new Date().toISOString();
+	}
+
+	type DbLoopRow = {
+		id: string;
+		name: string;
+		task_file: string;
+		status: LoopStatus;
+		iteration: number;
+		max_iterations: number;
+		items_per_iteration: number;
+		reflect_every: number;
+		reflect_instructions: string;
+		session_strategy: SessionStrategy;
+		session_strategy_failure: SessionStrategyFailure;
+		pending_session_reset: number;
+		last_reflection_at: number;
+		last_done_reminder_at: number;
+		started_at: string;
+		completed_at: string | null;
+		created_at: string;
+		updated_at: string;
+		archived_at: string | null;
+	};
+
+	type DbPlanRow = {
+		loop_id: string;
+		title: string;
+		summary: string;
+		next_task_number: number;
+		imported_from_markdown: number;
+		created_at: string;
+		updated_at: string;
+	};
+
+	function dbPath(ctx: ExtensionContext): string {
+		return path.join(ralphDir(ctx), "ralph.sqlite");
+	}
+
+	function ensureRalphDir(ctx: ExtensionContext): void {
+		const dir = ralphDir(ctx);
+		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+	}
+
+	function openDb(ctx: ExtensionContext): DatabaseSync {
+		const file = dbPath(ctx);
+		if (!dbHandle || dbHandle.cwd !== ctx.cwd || dbHandle.dbPath !== file) {
+			ensureRalphDir(ctx);
+			dbHandle = { cwd: ctx.cwd, dbPath: file, db: new DatabaseSync(file) };
+			initDbSchema(dbHandle.db);
+		}
+		if (!importedCwds.has(ctx.cwd)) {
+			importedCwds.add(ctx.cwd);
+			importLegacyLoops(ctx, dbHandle.db);
+		}
+		return dbHandle.db;
+	}
+
+	function initDbSchema(db: DatabaseSync): void {
+		db.exec("PRAGMA foreign_keys = ON;");
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS schema_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS loops (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL UNIQUE,
+				task_file TEXT NOT NULL,
+				status TEXT NOT NULL,
+				iteration INTEGER NOT NULL,
+				max_iterations INTEGER NOT NULL,
+				items_per_iteration INTEGER NOT NULL,
+				reflect_every INTEGER NOT NULL,
+				reflect_instructions TEXT NOT NULL,
+				session_strategy TEXT NOT NULL,
+				session_strategy_failure TEXT NOT NULL,
+				pending_session_reset INTEGER NOT NULL DEFAULT 0,
+				last_reflection_at INTEGER NOT NULL DEFAULT 0,
+				last_done_reminder_at INTEGER NOT NULL DEFAULT 0,
+				started_at TEXT NOT NULL,
+				completed_at TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL,
+				archived_at TEXT
+			);
+
+			CREATE TABLE IF NOT EXISTS plans (
+				loop_id TEXT PRIMARY KEY REFERENCES loops(id) ON DELETE CASCADE,
+				title TEXT NOT NULL,
+				summary TEXT NOT NULL,
+				next_task_number INTEGER NOT NULL,
+				imported_from_markdown INTEGER NOT NULL DEFAULT 0,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS plan_goals (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+				goal TEXT NOT NULL,
+				order_index INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_plan_goals_loop_order ON plan_goals(loop_id, order_index);
+
+			CREATE TABLE IF NOT EXISTS tasks (
+				id TEXT PRIMARY KEY,
+				loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+				task_key TEXT NOT NULL,
+				title TEXT NOT NULL,
+				status TEXT NOT NULL,
+				order_index INTEGER NOT NULL,
+				details TEXT,
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
+
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_loop_key ON tasks(loop_id, task_key);
+			CREATE INDEX IF NOT EXISTS idx_tasks_loop_order ON tasks(loop_id, order_index);
+
+			CREATE TABLE IF NOT EXISTS task_entries (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+				task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+				kind TEXT NOT NULL,
+				body TEXT NOT NULL,
+				iteration INTEGER,
+				created_at TEXT NOT NULL,
+				meta_json TEXT
+			);
+			CREATE INDEX IF NOT EXISTS idx_task_entries_loop_kind ON task_entries(loop_id, kind, created_at);
+
+			CREATE TABLE IF NOT EXISTS loop_entries (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+				kind TEXT NOT NULL,
+				body TEXT NOT NULL,
+				iteration INTEGER,
+				created_at TEXT NOT NULL,
+				meta_json TEXT
+			);
+			CREATE INDEX IF NOT EXISTS idx_loop_entries_loop_kind ON loop_entries(loop_id, kind, created_at);
+
+			CREATE TABLE IF NOT EXISTS loop_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				loop_id TEXT NOT NULL REFERENCES loops(id) ON DELETE CASCADE,
+				kind TEXT NOT NULL,
+				body TEXT,
+				iteration INTEGER,
+				created_at TEXT NOT NULL,
+				meta_json TEXT
+			);
+			CREATE INDEX IF NOT EXISTS idx_loop_events_loop_kind ON loop_events(loop_id, kind, created_at);
+		`);
+		db.exec(`INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');`);
+	}
+
+	function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
+		db.exec("BEGIN IMMEDIATE");
+		try {
+			const result = fn();
+			db.exec("COMMIT");
+			return result;
+		} catch (error) {
+			db.exec("ROLLBACK");
+			throw error;
+		}
+	}
+
+	function stateToRow(state: LoopState): DbLoopRow {
+		const now = state.updatedAt ?? nowIso();
+		return {
+			id: state.name,
+			name: state.name,
+			task_file: state.taskFile,
+			status: state.status,
+			iteration: state.iteration,
+			max_iterations: state.maxIterations,
+			items_per_iteration: state.itemsPerIteration,
+			reflect_every: state.reflectEvery,
+			reflect_instructions: state.reflectInstructions,
+			session_strategy: state.sessionStrategy,
+			session_strategy_failure: state.sessionStrategyFailure,
+			pending_session_reset: state.pendingSessionReset ? 1 : 0,
+			last_reflection_at: state.lastReflectionAt ?? 0,
+			last_done_reminder_at: state.lastDoneReminderAt ?? 0,
+			started_at: state.startedAt,
+			completed_at: state.completedAt ?? null,
+			created_at: state.createdAt ?? state.startedAt,
+			updated_at: now,
+			archived_at: state.archivedAt ?? null,
+		};
+	}
+
+	function rowToState(row: DbLoopRow): LoopState {
+		return {
+			name: row.name,
+			taskFile: row.task_file,
+			iteration: row.iteration,
+			maxIterations: row.max_iterations,
+			itemsPerIteration: row.items_per_iteration,
+			reflectEvery: row.reflect_every,
+			reflectInstructions: row.reflect_instructions,
+			active: row.status === "active",
+			status: row.status,
+			startedAt: row.started_at,
+			completedAt: row.completed_at ?? undefined,
+			lastReflectionAt: row.last_reflection_at,
+			lastDoneReminderAt: row.last_done_reminder_at,
+			sessionStrategy: row.session_strategy,
+			sessionStrategyFailure: row.session_strategy_failure,
+			pendingSessionReset: row.pending_session_reset === 1,
+			createdAt: row.created_at,
+			updatedAt: row.updated_at,
+			archivedAt: row.archived_at,
+		};
+	}
+
+	function exportLegacyState(ctx: ExtensionContext, state: LoopState): void {
+		const filePath = getPath(ctx, state.name, ".state.json", !!state.archivedAt);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf-8");
+	}
+
+	function exportLegacyPlan(ctx: ExtensionContext, plan: RalphPlan, archived = false): void {
+		const filePath = getPath(ctx, plan.loopName, ".plan.json", archived);
+		ensureDir(filePath);
+		fs.writeFileSync(filePath, JSON.stringify(plan, null, 2), "utf-8");
+	}
+
+	function upsertLoop(db: DatabaseSync, state: LoopState): void {
+		const row = stateToRow(state);
+		db.prepare(`
+			INSERT INTO loops (
+				id, name, task_file, status, iteration, max_iterations, items_per_iteration,
+				reflect_every, reflect_instructions, session_strategy, session_strategy_failure,
+				pending_session_reset, last_reflection_at, last_done_reminder_at, started_at,
+				completed_at, created_at, updated_at, archived_at
+			) VALUES (
+				@id, @name, @task_file, @status, @iteration, @max_iterations, @items_per_iteration,
+				@reflect_every, @reflect_instructions, @session_strategy, @session_strategy_failure,
+				@pending_session_reset, @last_reflection_at, @last_done_reminder_at, @started_at,
+				@completed_at, @created_at, @updated_at, @archived_at
+			)
+			ON CONFLICT(id) DO UPDATE SET
+				name = excluded.name,
+				task_file = excluded.task_file,
+				status = excluded.status,
+				iteration = excluded.iteration,
+				max_iterations = excluded.max_iterations,
+				items_per_iteration = excluded.items_per_iteration,
+				reflect_every = excluded.reflect_every,
+				reflect_instructions = excluded.reflect_instructions,
+				session_strategy = excluded.session_strategy,
+				session_strategy_failure = excluded.session_strategy_failure,
+				pending_session_reset = excluded.pending_session_reset,
+				last_reflection_at = excluded.last_reflection_at,
+				last_done_reminder_at = excluded.last_done_reminder_at,
+				started_at = excluded.started_at,
+				completed_at = excluded.completed_at,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at,
+				archived_at = excluded.archived_at
+		`).run(row);
+	}
+
+	function replacePlan(db: DatabaseSync, plan: RalphPlan): void {
+		const createdAt = plan.meta.createdAt;
+		const updatedAt = plan.meta.updatedAt;
+		db.prepare(`
+			INSERT INTO plans (loop_id, title, summary, next_task_number, imported_from_markdown, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(loop_id) DO UPDATE SET
+				title = excluded.title,
+				summary = excluded.summary,
+				next_task_number = excluded.next_task_number,
+				imported_from_markdown = excluded.imported_from_markdown,
+				created_at = excluded.created_at,
+				updated_at = excluded.updated_at
+		`).run(plan.loopName, plan.title, plan.summary, plan.meta.nextTaskNumber, plan.meta.importedFromMarkdown ? 1 : 0, createdAt, updatedAt);
+		db.prepare("DELETE FROM plan_goals WHERE loop_id = ?").run(plan.loopName);
+		db.prepare("DELETE FROM tasks WHERE loop_id = ?").run(plan.loopName);
+		db.prepare("DELETE FROM task_entries WHERE loop_id = ?").run(plan.loopName);
+		db.prepare("DELETE FROM loop_entries WHERE loop_id = ?").run(plan.loopName);
+		const insertGoal = db.prepare("INSERT INTO plan_goals (loop_id, goal, order_index) VALUES (?, ?, ?)");
+		const insertTask = db.prepare(`
+			INSERT INTO tasks (id, loop_id, task_key, title, status, order_index, details, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`);
+		const insertTaskEntry = db.prepare(`
+			INSERT INTO task_entries (loop_id, task_id, kind, body, iteration, created_at, meta_json)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`);
+		const insertLoopEntry = db.prepare(`
+			INSERT INTO loop_entries (loop_id, kind, body, iteration, created_at, meta_json)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`);
+		for (const [index, goal] of plan.goals.entries()) {
+			insertGoal.run(plan.loopName, goal, index + 1);
+		}
+		for (const task of plan.tasks) {
+			const taskId = `${plan.loopName}:${task.id}`;
+			insertTask.run(taskId, plan.loopName, task.id, task.title, task.status, task.order, task.details ?? null, createdAt, updatedAt);
+			for (const note of task.notes) {
+				insertTaskEntry.run(plan.loopName, taskId, "note", note, null, createdAt, null);
+			}
+			for (const evidence of task.evidence) {
+				insertTaskEntry.run(plan.loopName, taskId, "evidence", evidence, null, createdAt, null);
+			}
+		}
+		for (const note of plan.notes) {
+			insertLoopEntry.run(plan.loopName, "note", note.text, null, note.at, null);
+		}
+		for (const reflection of plan.reflections) {
+			insertLoopEntry.run(plan.loopName, "reflection", reflection.text, reflection.iteration, reflection.at, null);
+		}
+		for (const verification of plan.verification) {
+			insertLoopEntry.run(plan.loopName, "verification", verification.text, null, verification.at, null);
+		}
+	}
+
+	function planFromDb(db: DatabaseSync, loopName: string): RalphPlan | null {
+		const planRow = db.prepare("SELECT * FROM plans WHERE loop_id = ?").get(loopName) as DbPlanRow | undefined;
+		if (!planRow) return null;
+		const taskRows = db.prepare("SELECT * FROM tasks WHERE loop_id = ? ORDER BY order_index ASC").all(loopName) as Array<{
+			id: string;
+			task_key: string;
+			title: string;
+			status: TaskStatus;
+			order_index: number;
+			details: string | null;
+			created_at: string;
+			updated_at: string;
+		}>;
+		const goalRows = db.prepare("SELECT goal FROM plan_goals WHERE loop_id = ? ORDER BY order_index ASC").all(loopName) as Array<{ goal: string }>;
+		const taskEntries = db.prepare("SELECT * FROM task_entries WHERE loop_id = ? ORDER BY created_at ASC, id ASC").all(loopName) as Array<{
+			task_id: string;
+			kind: string;
+			body: string;
+			created_at: string;
+		}>;
+		const loopEntries = db.prepare("SELECT * FROM loop_entries WHERE loop_id = ? ORDER BY created_at ASC, id ASC").all(loopName) as Array<{
+			kind: string;
+			body: string;
+			iteration: number | null;
+			created_at: string;
+		}>;
+		const taskById = new Map<string, RalphTask>();
+		const tasks = taskRows.map((row, index) => {
+			const task: RalphTask = {
+				id: row.task_key,
+				title: row.title,
+				status: parseTaskStatus(row.status) ?? "todo",
+				order: row.order_index ?? index + 1,
+				details: row.details ?? undefined,
+				evidence: [],
+				notes: [],
+			};
+			taskById.set(row.id, task);
+			return task;
+		});
+		for (const entry of taskEntries) {
+			const task = taskById.get(entry.task_id);
+			if (!task) continue;
+			if (entry.kind === "evidence") task.evidence.push(entry.body);
+			else if (entry.kind === "note") task.notes.push(entry.body);
+		}
+		const notes: RalphNote[] = [];
+		const reflections: RalphReflection[] = [];
+		const verification: RalphVerificationEntry[] = [];
+		for (const entry of loopEntries) {
+			if (entry.kind === "note") notes.push({ at: entry.created_at, text: entry.body });
+			else if (entry.kind === "reflection") reflections.push({ at: entry.created_at, iteration: entry.iteration ?? 0, text: entry.body });
+			else if (entry.kind === "verification") verification.push({ at: entry.created_at, text: entry.body });
+		}
+		return migratePlan(
+			{
+				loopName,
+				title: planRow.title,
+				summary: planRow.summary,
+				goals: goalRows.map((row) => row.goal),
+				tasks,
+				notes,
+				reflections,
+				verification,
+				meta: {
+					createdAt: planRow.created_at,
+					updatedAt: planRow.updated_at,
+					nextTaskNumber: planRow.next_task_number,
+					importedFromMarkdown: planRow.imported_from_markdown === 1,
+				},
+			},
+			loopName,
+		);
+	}
+
+	function stateFromDb(db: DatabaseSync, name: string, archived = false): LoopState | null {
+		const row = db.prepare(
+			`SELECT * FROM loops WHERE name = ? AND ${archived ? "archived_at IS NOT NULL" : "archived_at IS NULL"} LIMIT 1`,
+		).get(name) as DbLoopRow | undefined;
+		return row ? rowToState(row) : null;
+	}
+
+	function listStatesFromDb(db: DatabaseSync, archived = false): LoopState[] {
+		const rows = db.prepare(
+			`SELECT * FROM loops WHERE ${archived ? "archived_at IS NOT NULL" : "archived_at IS NULL"} ORDER BY updated_at DESC, name DESC`,
+		).all() as DbLoopRow[];
+		return rows.map(rowToState);
+	}
+
+	function importLegacyLoop(ctx: ExtensionContext, db: DatabaseSync, statePath: string, archived = false): void {
+		const content = tryRead(statePath);
+		if (!content) return;
+		const rawState = migrateState(JSON.parse(content));
+		if (stateFromDb(db, rawState.name, archived)) return;
+		const legacyPlanPath = getPath(ctx, rawState.name, ".plan.json", archived);
+		const legacySnapshotPath = path.resolve(ctx.cwd, rawState.taskFile);
+		let plan: RalphPlan | null = null;
+		const planContent = tryRead(legacyPlanPath);
+		if (planContent) {
+			plan = migratePlan(JSON.parse(planContent), rawState.name);
+		} else if (fs.existsSync(legacySnapshotPath)) {
+			const snapshotContent = tryRead(legacySnapshotPath);
+			if (snapshotContent) plan = parseLegacyMarkdownPlan(snapshotContent, rawState.name);
+		}
+		if (!plan) plan = parseLegacyMarkdownPlan(DEFAULT_TEMPLATE, rawState.name);
+		withTransaction(db, () => {
+			upsertLoop(db, rawState);
+			replacePlan(db, plan as RalphPlan);
+		});
+	}
+
+	function importLegacyLoops(ctx: ExtensionContext, db: DatabaseSync): void {
+		const dirs = [
+			{ dir: archiveDir(ctx), archived: true },
+			{ dir: ralphDir(ctx), archived: false },
+		];
+		for (const { dir, archived } of dirs) {
+			if (!fs.existsSync(dir)) continue;
+			for (const file of fs.readdirSync(dir)) {
+				if (!file.endsWith(".state.json")) continue;
+				const statePath = path.join(dir, file);
+				importLegacyLoop(ctx, db, statePath, archived);
+			}
+		}
+	}
+
+	function deleteLoop(ctx: ExtensionContext, name: string, archived = false): void {
+		const db = openDb(ctx);
+		withTransaction(db, () => {
+			db.prepare(`DELETE FROM loops WHERE name = ? AND ${archived ? "archived_at IS NOT NULL" : "archived_at IS NULL"}`).run(name);
+		});
+		tryDelete(getPath(ctx, name, ".state.json", archived));
+		tryDelete(getPath(ctx, name, ".plan.json", archived));
+		tryDelete(getPath(ctx, name, ".md", archived));
 	}
 
 	function runGitCommand(ctx: ExtensionContext, args: string[]): { ok: boolean; stdout: string; stderr: string; status: number | null } {
@@ -248,6 +709,24 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	function runGraphifyUpdate(ctx: ExtensionContext): { ok: boolean; message?: string } {
+		const result = spawnSync("graphify", ["update", "."], {
+			cwd: ctx.cwd,
+			encoding: "utf-8",
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (result.status === 0) {
+			return { ok: true };
+		}
+		const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+		const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+		const message = [stderr, stdout].filter(Boolean).join("\n").trim() || `exit ${result.status ?? "unknown"}`;
+		if (/ENOENT|not found|command not found/i.test(message)) {
+			return { ok: false, message: "graphify not available; skipped graph update." };
+		}
+		return { ok: false, message: `graphify update failed: ${message}` };
+	}
+
 	function parseSessionStrategy(value: unknown): SessionStrategy {
 		return value === "followUp" ? "followUp" : "newSession";
 	}
@@ -283,32 +762,35 @@ export default function (pi: ExtensionAPI) {
 		raw.sessionStrategy = parseSessionStrategy(raw.sessionStrategy);
 		raw.sessionStrategyFailure = parseSessionStrategyFailure(raw.sessionStrategyFailure);
 		raw.pendingSessionReset = raw.pendingSessionReset === true;
+		raw.createdAt = raw.createdAt ?? raw.startedAt ?? nowIso();
+		raw.updatedAt = raw.updatedAt ?? raw.createdAt;
+		raw.archivedAt = raw.archivedAt ?? null;
 		return raw as LoopState;
 	}
 
 	function loadState(ctx: ExtensionContext, name: string, archived = false): LoopState | null {
-		const content = tryRead(getPath(ctx, name, ".state.json", archived));
-		return content ? migrateState(JSON.parse(content)) : null;
+		const db = openDb(ctx);
+		const state = stateFromDb(db, name, archived);
+		if (state) return state;
+		const statePath = getPath(ctx, name, ".state.json", archived);
+		if (!fs.existsSync(statePath)) return null;
+		importLegacyLoop(ctx, db, statePath, archived);
+		return stateFromDb(db, name, archived);
 	}
 
 	function saveState(ctx: ExtensionContext, state: LoopState, archived = false): void {
 		state.active = state.status === "active";
-		const filePath = getPath(ctx, state.name, ".state.json", archived);
-		ensureDir(filePath);
-		fs.writeFileSync(filePath, JSON.stringify(state, null, 2), "utf-8");
+		state.updatedAt = nowIso();
+		const db = openDb(ctx);
+		withTransaction(db, () => {
+			upsertLoop(db, state);
+		});
+		exportLegacyState(ctx, state);
 	}
 
 	function listLoops(ctx: ExtensionContext, archived = false): LoopState[] {
-		const dir = archived ? archiveDir(ctx) : ralphDir(ctx);
-		if (!fs.existsSync(dir)) return [];
-		return fs
-			.readdirSync(dir)
-			.filter((f) => f.endsWith(".state.json"))
-			.map((f) => {
-				const content = tryRead(path.join(dir, f));
-				return content ? migrateState(JSON.parse(content)) : null;
-			})
-			.filter((s): s is LoopState => s !== null);
+		const db = openDb(ctx);
+		return listStatesFromDb(db, archived);
 	}
 
 	function migratePlan(raw: Partial<RalphPlan>, loopName: string): RalphPlan {
@@ -369,16 +851,28 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function loadPlan(ctx: ExtensionContext, name: string, archived = false): RalphPlan | null {
-		const content = tryRead(getPath(ctx, name, ".plan.json", archived));
+		const db = openDb(ctx);
+		const plan = planFromDb(db, name);
+		if (plan) return plan;
+		const planPath = getPath(ctx, name, ".plan.json", archived);
+		if (!fs.existsSync(planPath)) return null;
+		const content = tryRead(planPath);
 		return content ? migratePlan(JSON.parse(content), name) : null;
 	}
 
 	function savePlan(ctx: ExtensionContext, plan: RalphPlan, archived = false): void {
 		plan.tasks = plan.tasks.sort((a, b) => a.order - b.order).map((task, index) => ({ ...task, order: index + 1 }));
 		plan.meta.updatedAt = nowIso();
-		const filePath = getPath(ctx, plan.loopName, ".plan.json", archived);
-		ensureDir(filePath);
-		fs.writeFileSync(filePath, JSON.stringify(plan, null, 2), "utf-8");
+		const db = openDb(ctx);
+		withTransaction(db, () => {
+			replacePlan(db, plan);
+			const loop = stateFromDb(db, plan.loopName, archived);
+			if (loop) {
+				loop.updatedAt = plan.meta.updatedAt;
+				upsertLoop(db, loop);
+			}
+		});
+		exportLegacyPlan(ctx, plan, archived);
 	}
 
 	function planToText(plan: RalphPlan): string {
@@ -712,7 +1206,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function ensurePlan(ctx: ExtensionContext, state: LoopState, sourceContent?: string): RalphPlan {
-		const existingPlan = loadPlan(ctx, state.name);
+		const existingPlan = loadPlan(ctx, state.name, !!state.archivedAt);
 		if (existingPlan) {
 			writePlanSnapshot(ctx, state, existingPlan);
 			return existingPlan;
@@ -720,23 +1214,52 @@ export default function (pi: ExtensionAPI) {
 
 		const rawContent = sourceContent ?? tryRead(path.resolve(ctx.cwd, state.taskFile)) ?? DEFAULT_TEMPLATE;
 		const plan = parseLegacyMarkdownPlan(rawContent, state.name);
-		savePlan(ctx, plan);
+		savePlan(ctx, plan, !!state.archivedAt);
 		writePlanSnapshot(ctx, state, plan);
 		return plan;
 	}
 
 	function savePlanAndSnapshot(ctx: ExtensionContext, state: LoopState, plan: RalphPlan): void {
-		savePlan(ctx, plan);
+		savePlan(ctx, plan, !!state.archivedAt);
 		writePlanSnapshot(ctx, state, plan);
 	}
 
 	function getPlanState(ctx: ExtensionContext, loopName?: string): { state: LoopState; plan: RalphPlan } | null {
-		const name = loopName ?? currentLoop;
-		if (!name) return null;
-		const state = loadState(ctx, name);
+		const state = resolveLoopState(ctx, loopName);
 		if (!state) return null;
 		const plan = ensurePlan(ctx, state);
 		return { state, plan };
+	}
+
+	function mostRecentActiveLoop(ctx: ExtensionContext): LoopState | null {
+		const activeLoops = listLoops(ctx).filter((loop) => loop.status === "active");
+		if (activeLoops.length === 0) return null;
+		return activeLoops.reduce((best, candidate) => {
+			const bestUpdated = best.updatedAt ?? best.startedAt;
+			const candidateUpdated = candidate.updatedAt ?? candidate.startedAt;
+			return candidateUpdated > bestUpdated ? candidate : best;
+		});
+	}
+
+	function resolveLoopName(ctx: ExtensionContext, loopName?: string): string | null {
+		if (loopName) return loopName;
+		if (currentLoop) {
+			const current = loadState(ctx, currentLoop);
+			if (current && current.status === "active") return currentLoop;
+		}
+		const active = mostRecentActiveLoop(ctx);
+		if (!active) return null;
+		currentLoop = active.name;
+		return active.name;
+	}
+
+	function resolveLoopState(ctx: ExtensionContext, loopName?: string): LoopState | null {
+		const resolvedName = resolveLoopName(ctx, loopName);
+		if (!resolvedName) return null;
+		const state = loadState(ctx, resolvedName);
+		if (!state) return null;
+		if (state.status === "active") currentLoop = state.name;
+		return state;
 	}
 
 	function findTask(plan: RalphPlan, taskId: string): RalphTask | null {
@@ -753,6 +1276,14 @@ export default function (pi: ExtensionAPI) {
 		plan.verification.push({ at: nowIso(), text });
 	}
 
+	function recordLoopEvent(ctx: ExtensionContext, loopId: string, kind: string, body?: string, iteration?: number, meta?: unknown): void {
+		const db = openDb(ctx);
+		db.prepare(`
+			INSERT INTO loop_events (loop_id, kind, body, iteration, created_at, meta_json)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`).run(loopId, kind, body ?? null, iteration ?? null, nowIso(), meta ? JSON.stringify(meta) : null);
+	}
+
 	function formatLoop(l: LoopState): string {
 		const status = `${STATUS_ICONS[l.status]} ${l.status}`;
 		const iter = l.maxIterations > 0 ? `${l.iteration}/${l.maxIterations}` : `${l.iteration}`;
@@ -761,7 +1292,7 @@ export default function (pi: ExtensionAPI) {
 
 	function updateUI(ctx: ExtensionContext): void {
 		if (!ctx.hasUI) return;
-		const state = currentLoop ? loadState(ctx, currentLoop) : null;
+		const state = resolveLoopState(ctx, currentLoop ?? undefined);
 		if (!state) {
 			ctx.ui.setStatus("ralph", undefined);
 			ctx.ui.setWidget("ralph", undefined);
@@ -793,7 +1324,7 @@ export default function (pi: ExtensionAPI) {
 		parts.push(`## Current Plan Runtime View (compact; generated from ${state.taskFile})\n\n${taskContent}\n\n---`);
 		parts.push(`\n## Instructions\n`);
 		parts.push("User controls: ESC pauses the assistant. Send a message to resume. Run /ralph-stop when idle to stop the loop.\n");
-		parts.push("Use the Graphify tools first when you need to understand the codebase structure or locate relevant files before reading them manually.\n");
+		parts.push("Use Graphify first. The graph is already built, so it is usually the fastest, highest-information way to orient yourself and find the right files. Prefer Graphify over opening files manually when choosing your next move.\n");
 		parts.push(`You are in a Ralph loop (iteration ${state.iteration}${state.maxIterations > 0 ? ` of ${state.maxIterations}` : ""}).\n`);
 		if (state.itemsPerIteration > 0) {
 			parts.push(`**THIS ITERATION: Process approximately ${state.itemsPerIteration} task items, then call the actual ralph_done tool.**\n`);
@@ -801,14 +1332,15 @@ export default function (pi: ExtensionAPI) {
 		} else {
 			parts.push("1. Start from the single Next Task in the runtime view.");
 		}
-		parts.push("2. To figure out what to do next: read the Next Task id/title/details first. If that is insufficient, call ralph_get_plan or ralph_list_tasks.");
-		parts.push("3. Before doing task work, mark the task in_progress with ralph_update_task if it is not already in progress.");
-		parts.push("4. Do the work using the available project tools. If a project tool reports that setup is required, such as setting the project cwd, do that setup once before retrying the tool.");
-		parts.push("5. When a task is complete, call ralph_update_task with status done and concise evidence describing what changed and how you verified it. If blocked, use status blocked with a blocker note. If partially done, leave it in_progress and add a note/evidence.");
-		parts.push("6. Treat Ralph state as canonical: use ralph_update_task, ralph_add_task, ralph_add_note, ralph_record_reflection, and related Ralph tools. Treat generated snapshot files as read-only output; do not edit them directly.");
-		parts.push(`7. Treat ${state.taskFile} as generated output; do not edit it directly.`);
-		parts.push(`8. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
-		parts.push("9. Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name=\"ralph_done\"></invoke>.");
+		parts.push("2. Before reading files, use Graphify to inspect the codebase structure and locate the most relevant path. Since the graph already exists, Graphify is the quickest route to high-value context.");
+		parts.push("3. To figure out what to do next: read the Next Task id/title/details first. If that is insufficient, call ralph_get_plan or ralph_list_tasks.");
+		parts.push("4. Before doing task work, mark the task in_progress with ralph_update_task if it is not already in progress.");
+		parts.push("5. Do the work using the available project tools. If a project tool reports that setup is required, such as setting the project cwd, do that setup once before retrying the tool.");
+		parts.push("6. When a task is complete, call ralph_update_task with status done and concise evidence describing what changed and how you verified it. If blocked, use status blocked with a blocker note. If partially done, leave it in_progress and add a note/evidence.");
+		parts.push("7. Treat Ralph state as canonical: use ralph_update_task, ralph_add_task, ralph_add_note, ralph_record_reflection, and related Ralph tools. Treat generated snapshot files as read-only output; do not edit them directly.");
+		parts.push(`8. Treat ${state.taskFile} as generated output; do not edit it directly.`);
+		parts.push(`9. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
+		parts.push("10. Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name=\"ralph_done\"></invoke>.");
 		return parts.join("\n");
 	}
 
@@ -871,6 +1403,7 @@ export default function (pi: ExtensionAPI) {
 		state.active = false;
 		state.pendingSessionReset = false;
 		saveState(ctx, state);
+		recordLoopEvent(ctx, state.name, "pause", message ?? "Paused Ralph loop", state.iteration);
 		currentLoop = null;
 		updateUI(ctx);
 		if (message && ctx.hasUI) ctx.ui.notify(message, "info");
@@ -882,6 +1415,7 @@ export default function (pi: ExtensionAPI) {
 		state.active = false;
 		state.pendingSessionReset = false;
 		saveState(ctx, state);
+		recordLoopEvent(ctx, state.name, "complete", banner, state.iteration);
 		currentLoop = null;
 		updateUI(ctx);
 		pi.sendUserMessage(banner);
@@ -893,6 +1427,7 @@ export default function (pi: ExtensionAPI) {
 		state.active = false;
 		state.pendingSessionReset = false;
 		saveState(ctx, state);
+		recordLoopEvent(ctx, state.name, "stop", message ?? "Stopped Ralph loop", state.iteration);
 		currentLoop = null;
 		updateUI(ctx);
 		if (message && ctx.hasUI) ctx.ui.notify(message, "info");
@@ -1014,6 +1549,7 @@ export default function (pi: ExtensionAPI) {
 			const initialPlan = ensurePlan(ctx, state);
 			savePlanAndSnapshot(ctx, state, initialPlan);
 			currentLoop = loopName;
+			recordLoopEvent(ctx, state.name, "start", "Started Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 			updateUI(ctx);
 			if (state.sessionStrategy === "newSession") {
 				await dispatchNextIterationFreshContext(ctx, state);
@@ -1024,12 +1560,12 @@ export default function (pi: ExtensionAPI) {
 
 		stop(_rest, ctx) {
 			if (!currentLoop) {
-				const active = listLoops(ctx).find((l) => l.status === "active");
+				const active = mostRecentActiveLoop(ctx);
 				if (active) pauseLoop(ctx, active, `Paused Ralph loop: ${active.name} (iteration ${active.iteration})`);
 				else ctx.ui.notify("No active Ralph loop", "warning");
 				return;
 			}
-			const state = loadState(ctx, currentLoop);
+			const state = resolveLoopState(ctx, currentLoop);
 			if (state) pauseLoop(ctx, state, `Paused Ralph loop: ${currentLoop} (iteration ${state.iteration})`);
 		},
 
@@ -1038,7 +1574,7 @@ export default function (pi: ExtensionAPI) {
 			let loopName = requestedName;
 			if (!loopName) {
 				if (currentLoop) {
-					const current = loadState(ctx, currentLoop);
+					const current = resolveLoopState(ctx, currentLoop);
 					if (current?.status === "paused") loopName = currentLoop;
 				}
 				if (!loopName) {
@@ -1048,9 +1584,9 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const mostRecentPaused = pausedLoops.reduce((best, candidate) => {
-						const bestMtime = safeMtimeMs(getPath(ctx, best.name, ".state.json"));
-						const candidateMtime = safeMtimeMs(getPath(ctx, candidate.name, ".state.json"));
-						return candidateMtime > bestMtime ? candidate : best;
+						const bestUpdated = best.updatedAt ?? best.startedAt;
+						const candidateUpdated = candidate.updatedAt ?? candidate.startedAt;
+						return candidateUpdated > bestUpdated ? candidate : best;
 					});
 					loopName = mostRecentPaused.name;
 					if (pausedLoops.length > 1 && ctx.hasUI) {
@@ -1058,7 +1594,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 			}
-			const state = loadState(ctx, loopName);
+			const state = resolveLoopState(ctx, loopName);
 			if (!state) {
 				ctx.ui.notify(`Loop "${loopName}" not found`, "error");
 				return;
@@ -1068,7 +1604,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (currentLoop && currentLoop !== loopName) {
-				const curr = loadState(ctx, currentLoop);
+				const curr = resolveLoopState(ctx, currentLoop);
 				if (curr) pauseLoop(ctx, curr);
 			}
 
@@ -1076,6 +1612,7 @@ export default function (pi: ExtensionAPI) {
 			state.active = true;
 			state.iteration++;
 			saveState(ctx, state);
+			recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 			const plan = ensurePlan(ctx, state);
 			currentLoop = loopName;
 			updateUI(ctx);
@@ -1109,8 +1646,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (currentLoop === loopName) currentLoop = null;
-			tryDelete(getPath(ctx, loopName, ".state.json"));
-			tryDelete(getPath(ctx, loopName, ".plan.json"));
+			deleteLoop(ctx, loopName);
 			ctx.ui.notify(`Cancelled: ${loopName}`, "info");
 			updateUI(ctx);
 		},
@@ -1131,22 +1667,14 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (currentLoop === loopName) currentLoop = null;
-
-			const srcState = getPath(ctx, loopName, ".state.json");
-			const dstState = getPath(ctx, loopName, ".state.json", true);
-			ensureDir(dstState);
-			if (fs.existsSync(srcState)) fs.renameSync(srcState, dstState);
-
-			const srcPlan = getPath(ctx, loopName, ".plan.json");
-			const dstPlan = getPath(ctx, loopName, ".plan.json", true);
-			ensureDir(dstPlan);
-			if (fs.existsSync(srcPlan)) fs.renameSync(srcPlan, dstPlan);
-
-			const srcTask = path.resolve(ctx.cwd, state.taskFile);
-			if (srcTask.startsWith(ralphDir(ctx)) && !srcTask.startsWith(archiveDir(ctx))) {
-				const dstTask = getPath(ctx, loopName, ".md", true);
-				if (fs.existsSync(srcTask)) fs.renameSync(srcTask, dstTask);
-			}
+			state.archivedAt = nowIso();
+			state.taskFile = path.join(RALPH_DIR, "archive", `${sanitize(path.basename(state.taskFile, path.extname(state.taskFile)))}.md`);
+			saveState(ctx, state, true);
+			const plan = ensurePlan(ctx, state);
+			savePlanAndSnapshot(ctx, state, plan);
+			tryDelete(getPath(ctx, loopName, ".state.json"));
+			tryDelete(getPath(ctx, loopName, ".plan.json"));
+			tryDelete(getPath(ctx, loopName, ".md"));
 
 			ctx.ui.notify(`Archived: ${loopName}`, "info");
 			updateUI(ctx);
@@ -1160,8 +1688,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			for (const loop of completed) {
-				tryDelete(getPath(ctx, loop.name, ".state.json"));
-				tryDelete(getPath(ctx, loop.name, ".plan.json"));
+				deleteLoop(ctx, loop.name);
 				if (all) tryDelete(getPath(ctx, loop.name, ".md"));
 				if (currentLoop === loop.name) currentLoop = null;
 			}
@@ -1191,6 +1718,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				currentLoop = null;
+				dbHandle = null;
+				importedCwds.delete(ctx.cwd);
 				const ok = tryRemoveDir(dir);
 				if (ctx.hasUI) ctx.ui.notify(ok ? "Removed .ralph directory." : "Failed to remove .ralph directory.", ok ? "info" : "error");
 				updateUI(ctx);
@@ -1307,9 +1836,9 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 				if (ctx.hasUI) ctx.ui.notify("Agent is busy. Press ESC to interrupt, then run /ralph-stop.", "warning");
 				return;
 			}
-			let state = currentLoop ? loadState(ctx, currentLoop) : null;
+			let state = resolveLoopState(ctx, currentLoop ?? undefined);
 			if (!state) {
-				const active = listLoops(ctx).find((l) => l.status === "active");
+				const active = mostRecentActiveLoop(ctx);
 				if (!active) {
 					if (ctx.hasUI) ctx.ui.notify("No active Ralph loop", "warning");
 					return;
@@ -1590,13 +2119,14 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		],
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			if (!currentLoop) return { content: [{ type: "text", text: "No active Ralph loop." }], details: {} };
-			const state = loadState(ctx, currentLoop);
+			const state = resolveLoopState(ctx);
+			if (!state) return { content: [{ type: "text", text: "No active Ralph loop." }], details: {} };
 			if (!state || state.status !== "active") return { content: [{ type: "text", text: "Ralph loop is not active." }], details: {} };
 			if (ctx.hasPendingMessages()) {
 				return { content: [{ type: "text", text: "Pending messages already queued. Skipping ralph_done." }], details: {} };
 			}
 			state.iteration++;
+			recordLoopEvent(ctx, state.name, "ralph_done", "Iteration advanced", state.iteration, { sessionStrategy: state.sessionStrategy });
 			if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
 				completeLoop(
 					ctx,
@@ -1624,6 +2154,10 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			if (checkpointResult.skipped && ctx.hasUI) {
 				ctx.ui.notify(checkpointResult.message, "info");
 			}
+			const graphifyResult = runGraphifyUpdate(ctx);
+			if (!graphifyResult.ok && graphifyResult.message && ctx.hasUI) {
+				ctx.ui.notify(graphifyResult.message, graphifyResult.message.includes("skipped") ? "info" : "warning");
+			}
 			if (state.sessionStrategy === "newSession") {
 				state.pendingSessionReset = true;
 				saveState(ctx, state);
@@ -1643,12 +2177,11 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!currentLoop) return;
-		const state = loadState(ctx, currentLoop);
+		const state = resolveLoopState(ctx);
 		if (!state || state.status !== "active") return;
 		const iterStr = `${state.iteration}${state.maxIterations > 0 ? `/${state.maxIterations}` : ""}`;
 		let instructions = `You are in a Ralph loop working on generated plan snapshot: ${state.taskFile}\n`;
-		instructions += `- Use the Graphify tools first when you need to understand the codebase structure or locate relevant files before reading them manually\n`;
+		instructions += `- Use Graphify first. The graph is already built, so it is usually the fastest way to get high-value context and locate the right files before opening anything manually.\n`;
 		if (state.itemsPerIteration > 0) instructions += `- Work on ~${state.itemsPerIteration} task items this iteration\n`;
 		instructions += `- Start from the Next Task in the runtime prompt; call compact ralph_get_plan or ralph_list_tasks only when you need more task context\n`;
 		instructions += `- Mark active work in_progress, done, blocked, or cancelled with ralph_update_task\n`;
@@ -1661,8 +2194,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 	});
 
 	pi.on("context", async (event, ctx) => {
-		if (!currentLoop) return;
-		const state = loadState(ctx, currentLoop);
+		const state = resolveLoopState(ctx);
 		if (!state || state.status !== "active" || !state.pendingSessionReset) return;
 		const resetMessage = lastResetPromptMessage(event.messages);
 		if (!resetMessage) return;
@@ -1671,9 +2203,19 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		return { messages: [resetMessage] };
 	});
 
+	pi.on("session_before_compact", async (event, ctx) => {
+		const state = resolveLoopState(ctx);
+		if (!state || state.status !== "active") return;
+		recordLoopEvent(ctx, state.name, "session_before_compact", "Pi is compacting the session", state.iteration, {
+			reason: event?.reason ?? null,
+			willRetry: event?.willRetry ?? null,
+		});
+		state.pendingSessionReset = true;
+		saveState(ctx, state);
+	});
+
 	pi.on("agent_end", async (event, ctx) => {
-		if (!currentLoop) return;
-		let state = loadState(ctx, currentLoop);
+		let state = resolveLoopState(ctx);
 		if (!state || state.status !== "active") return;
 		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
 		const naturalStop = isNaturalAssistantStop(lastAssistant);
@@ -1722,7 +2264,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			pi.sendUserMessage(
 				fakeToolCall
 					? `You wrote text that looks like a ralph_done tool call, but Pi did not execute it. If this iteration is done, call the actual ralph_done tool now using the tool interface. Do not write XML, <invoke>, or placeholder text. If the whole loop is complete, respond with ${COMPLETE_MARKER}.`
-					: `You are still in Ralph loop "${state.name}" at iteration ${state.iteration}. If you are done with the tasks for this iteration, call the actual ralph_done tool now using the tool interface. If the whole loop is complete, respond with ${COMPLETE_MARKER}. Otherwise, continue working on the current iteration and update ${state.taskFile}.`,
+					: `You are still in Ralph loop "${state.name}" at iteration ${state.iteration}. If you are done with the tasks for this iteration, call the actual ralph_done tool now using the tool interface. If the whole loop is complete, respond with ${COMPLETE_MARKER}. Otherwise, continue working on the current iteration and use Ralph tools to update canonical state.`,
 				{ deliverAs: "followUp" },
 			);
 		}
@@ -1732,9 +2274,9 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		const active = listLoops(ctx).filter((l) => l.status === "active");
 		if (!currentLoop && active.length > 0) {
 			const mostRecent = active.reduce((best, candidate) => {
-				const bestMtime = safeMtimeMs(getPath(ctx, best.name, ".state.json"));
-				const candidateMtime = safeMtimeMs(getPath(ctx, candidate.name, ".state.json"));
-				return candidateMtime > bestMtime ? candidate : best;
+				const bestUpdated = best.updatedAt ?? best.startedAt;
+				const candidateUpdated = candidate.updatedAt ?? candidate.startedAt;
+				return candidateUpdated > bestUpdated ? candidate : best;
 			});
 			currentLoop = mostRecent.name;
 		}
@@ -1746,9 +2288,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
-		if (currentLoop) {
-			const state = loadState(ctx, currentLoop);
-			if (state) saveState(ctx, state);
-		}
+		const state = resolveLoopState(ctx);
+		if (state) saveState(ctx, state);
 	});
 }

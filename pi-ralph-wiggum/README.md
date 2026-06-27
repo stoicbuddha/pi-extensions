@@ -36,7 +36,8 @@ Then filter to just this extension in `~/.pi/agent/settings.json`:
 
 ## Recommended usage: just ask Pi
 You ask Pi to set up a ralph-wiggum loop.
-- Pi imports your initial markdown into canonical structured plan state at `.ralph/<name>.plan.json`
+- Pi creates `.ralph/ralph.sqlite` as the canonical state store if it does not already exist
+- Pi imports your initial markdown into canonical structured plan state in SQLite
 - Pi renders `.ralph/<name>.md` as a generated snapshot for humans
 - You let Pi know:
   1. What the task is and completion / tests to run
@@ -51,6 +52,15 @@ You ask Pi to set up a ralph-wiggum loop.
   - Max iterations (default 50)
   - You hit `esc` (pausing the loop)
 If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, just tell Pi to continue to keep going.
+
+### State and migration
+
+Ralph now keeps loop state in `.ralph/ralph.sqlite` and treats the markdown snapshot as derived output.
+
+- The SQLite database and schema are created automatically on first use.
+- Existing projects with legacy `.ralph/<name>.state.json` and `.ralph/<name>.plan.json` files are imported automatically the first time Ralph opens that workspace.
+- If both SQLite state and legacy files exist, SQLite wins.
+- The generated `.md` snapshot remains for human inspection and can be regenerated at any time with `/ralph render-plan` or `ralph_render_plan`.
 
 ## Commands
 
@@ -114,7 +124,7 @@ Options:
 
 ## Runtime Prompt Size
 
-Ralph stores the full canonical plan, notes, verification, and reflection history in `.ralph/<name>.plan.json` and renders the full `.ralph/<name>.md` snapshot for humans. Iteration prompts use a minimal next-task runtime view instead of injecting the entire history every time.
+Ralph stores the full canonical loop, plan, task, note, verification, reflection, and event history in `.ralph/ralph.sqlite` and renders the full `.ralph/<name>.md` snapshot for humans. Iteration prompts use a minimal next-task runtime view instead of injecting the entire history every time.
 
 The runtime view includes summary counts, a small goals list, one selected next task, and instructions for fetching more context only if that next task is ambiguous. Older history stays available through the compact `ralph_get_plan` summary, `ralph_list_tasks`, and the generated plan files, but it is omitted from the prompt to keep long-running loops within model context limits.
 
@@ -143,7 +153,7 @@ ralph_start({
 })
 ```
 
-`taskContent` is still accepted for compatibility, but it is now imported once into structured plan state. After that, `.ralph/<name>.md` is generated output only.
+`taskContent` is still accepted for compatibility, but it is now imported once into structured plan state in SQLite. After that, `.ralph/<name>.md` is generated output only.
 
 ## Credits
 

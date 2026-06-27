@@ -19,13 +19,20 @@ ralph_start({
 
 ## Loop Behavior
 
-1. `ralph_start` imports the markdown task into canonical structured plan state at `.ralph/<name>.plan.json`.
+1. `ralph_start` imports the markdown task into canonical structured plan state in `.ralph/ralph.sqlite`.
 2. Ralph renders `.ralph/<name>.md` as a generated snapshot for humans.
 3. Use Ralph plan tools to inspect and update tasks, notes, evidence, and reflections.
 4. Do not edit the generated markdown snapshot directly.
 5. Call `ralph_done` to proceed to the next iteration.
 6. Output `<promise>COMPLETE</promise>` when finished.
 7. Stop when complete or when max iterations is reached (default 50).
+
+## State Storage
+
+- The SQLite database and schema are created automatically the first time Ralph is used in a workspace.
+- Existing `.ralph/<name>.state.json` and `.ralph/<name>.plan.json` files are imported automatically on first access.
+- If both SQLite and legacy files exist, SQLite is treated as canonical.
+- Use `ralph_render_plan` if you need to regenerate the human-readable snapshot from the database state.
 
 ## Plan Tools
 
@@ -79,7 +86,7 @@ Brief description.
 (Update with progress, decisions, blockers)
 ```
 
-The snapshot is informational. Canonical state lives in `.plan.json`.
+The snapshot is informational. Canonical state lives in `.ralph/ralph.sqlite`.
 
 ## Best Practices
 
