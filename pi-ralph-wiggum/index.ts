@@ -71,6 +71,9 @@ interface LoopState {
 	completedAt?: string;
 	lastReflectionAt: number; // Last iteration we reflected at
 	lastDoneReminderAt: number; // Last iteration where we reminded the agent to call ralph_done
+	resumeGeneration: number;
+	lastResumeDispatchedGeneration: number;
+	currentTaskId?: string | null;
 	sessionStrategy: SessionStrategy;
 	sessionStrategyFailure: SessionStrategyFailure;
 	pendingSessionReset?: boolean;
@@ -203,6 +206,9 @@ export default function (pi: ExtensionAPI) {
 		pending_session_reset: number;
 		last_reflection_at: number;
 		last_done_reminder_at: number;
+		resume_generation: number;
+		last_resume_dispatched_generation: number;
+		current_task_id: string | null;
 		started_at: string;
 		completed_at: string | null;
 		created_at: string;
@@ -266,6 +272,9 @@ export default function (pi: ExtensionAPI) {
 				pending_session_reset INTEGER NOT NULL DEFAULT 0,
 				last_reflection_at INTEGER NOT NULL DEFAULT 0,
 				last_done_reminder_at INTEGER NOT NULL DEFAULT 0,
+				resume_generation INTEGER NOT NULL DEFAULT 0,
+				last_resume_dispatched_generation INTEGER NOT NULL DEFAULT 0,
+				current_task_id TEXT,
 				started_at TEXT NOT NULL,
 				completed_at TEXT,
 				created_at TEXT NOT NULL,
@@ -341,6 +350,22 @@ export default function (pi: ExtensionAPI) {
 			CREATE INDEX IF NOT EXISTS idx_loop_events_loop_kind ON loop_events(loop_id, kind, created_at);
 		`);
 		db.exec(`INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');`);
+		ensureLoopSchemaColumns(db);
+	}
+
+	function ensureLoopSchemaColumns(db: DatabaseSync): void {
+		const columns = new Set(
+			(db.prepare("PRAGMA table_info(loops)").all() as Array<{ name: string }>).map((row) => row.name),
+		);
+		if (!columns.has("resume_generation")) {
+			db.exec(`ALTER TABLE loops ADD COLUMN resume_generation INTEGER NOT NULL DEFAULT 0;`);
+		}
+		if (!columns.has("last_resume_dispatched_generation")) {
+			db.exec(`ALTER TABLE loops ADD COLUMN last_resume_dispatched_generation INTEGER NOT NULL DEFAULT 0;`);
+		}
+		if (!columns.has("current_task_id")) {
+			db.exec(`ALTER TABLE loops ADD COLUMN current_task_id TEXT;`);
+		}
 	}
 
 	function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
@@ -372,6 +397,9 @@ export default function (pi: ExtensionAPI) {
 			pending_session_reset: state.pendingSessionReset ? 1 : 0,
 			last_reflection_at: state.lastReflectionAt ?? 0,
 			last_done_reminder_at: state.lastDoneReminderAt ?? 0,
+			resume_generation: state.resumeGeneration ?? 0,
+			last_resume_dispatched_generation: state.lastResumeDispatchedGeneration ?? 0,
+			current_task_id: state.currentTaskId ?? null,
 			started_at: state.startedAt,
 			completed_at: state.completedAt ?? null,
 			created_at: state.createdAt ?? state.startedAt,
@@ -395,6 +423,9 @@ export default function (pi: ExtensionAPI) {
 			completedAt: row.completed_at ?? undefined,
 			lastReflectionAt: row.last_reflection_at,
 			lastDoneReminderAt: row.last_done_reminder_at,
+			resumeGeneration: row.resume_generation,
+			lastResumeDispatchedGeneration: row.last_resume_dispatched_generation,
+			currentTaskId: row.current_task_id,
 			sessionStrategy: row.session_strategy,
 			sessionStrategyFailure: row.session_strategy_failure,
 			pendingSessionReset: row.pending_session_reset === 1,
@@ -759,6 +790,9 @@ export default function (pi: ExtensionAPI) {
 			raw.lastReflectionAt = (raw as any).lastReflectionAtItems;
 		}
 		raw.lastDoneReminderAt = raw.lastDoneReminderAt ?? 0;
+		raw.resumeGeneration = raw.resumeGeneration ?? 0;
+		raw.lastResumeDispatchedGeneration = raw.lastResumeDispatchedGeneration ?? 0;
+		raw.currentTaskId = raw.currentTaskId ?? null;
 		raw.sessionStrategy = parseSessionStrategy(raw.sessionStrategy);
 		raw.sessionStrategyFailure = parseSessionStrategyFailure(raw.sessionStrategyFailure);
 		raw.pendingSessionReset = raw.pendingSessionReset === true;
@@ -948,16 +982,23 @@ export default function (pi: ExtensionAPI) {
 		return `${text.slice(0, PROMPT_PLAN_MAX_CHARS)}\n\n[Prompt plan truncated by ${text.length - PROMPT_PLAN_MAX_CHARS} chars. Use ralph_get_plan, ralph_list_tasks, or the .plan.json state for full history.]`;
 	}
 
-	function selectNextTask(plan: RalphPlan): RalphTask | null {
-		return (
-			plan.tasks.find((task) => task.status === "in_progress") ??
-			plan.tasks.find((task) => task.status === "todo") ??
-			plan.tasks.find((task) => task.status === "blocked") ??
-			null
-		);
+	function selectNextTask(plan: RalphPlan, preferredTaskId?: string | null, currentTaskId?: string | null): RalphTask | null {
+		if (preferredTaskId) {
+			const preferredTask = findTask(plan, preferredTaskId);
+			if (preferredTask && preferredTask.status !== "done" && preferredTask.status !== "cancelled") {
+				return preferredTask;
+			}
+		}
+		if (currentTaskId) {
+			const currentTask = findTask(plan, currentTaskId);
+			if (currentTask && currentTask.status !== "done" && currentTask.status !== "cancelled") {
+				return currentTask;
+			}
+		}
+		return plan.tasks.find((task) => task.status === "in_progress") ?? plan.tasks.find((task) => task.status === "todo") ?? plan.tasks.find((task) => task.status === "blocked") ?? null;
 	}
 
-	function planToPromptText(plan: RalphPlan): string {
+	function planToPromptText(state: LoopState, plan: RalphPlan): string {
 		const counts = {
 			todo: 0,
 			in_progress: 0,
@@ -980,7 +1021,7 @@ export default function (pi: ExtensionAPI) {
 			sections.push("## Goals", ...goals);
 		}
 
-		const nextTask = selectNextTask(plan);
+		const nextTask = selectNextTask(plan, state.currentTaskId, state.currentTaskId);
 		sections.push(
 			"## Next Task",
 			nextTask
@@ -1023,9 +1064,12 @@ export default function (pi: ExtensionAPI) {
 		return [summarizePlan(plan), "", ...(lines.length > 0 ? lines : ["No matching tasks."])].join("\n");
 	}
 
-	function buildCompactPlanResponse(plan: RalphPlan, options: { status?: TaskStatus; maxTasks?: number } = {}): string {
+	function buildCompactPlanResponse(
+		plan: RalphPlan,
+		options: { status?: TaskStatus; maxTasks?: number; currentTaskId?: string | null } = {},
+	): string {
 		const maxTasks = Math.max(1, Math.min(50, Math.floor(options.maxTasks ?? GET_PLAN_DEFAULT_MAX_TASKS)));
-		const nextTask = selectNextTask(plan);
+		const nextTask = selectNextTask(plan, options.currentTaskId, options.currentTaskId);
 		const candidateTasks = plan.tasks.filter((task) =>
 			options.status ? task.status === options.status : task.status !== "done" && task.status !== "cancelled",
 		);
@@ -1033,9 +1077,9 @@ export default function (pi: ExtensionAPI) {
 		const sections = [
 			summarizePlan(plan),
 			"",
-			"Next task:",
-			nextTask ? formatPromptTask(nextTask) : "- No active task found.",
-			"",
+				"Current task:",
+				nextTask ? formatPromptTask(nextTask) : "- No active task found.",
+				"",
 			`Tasks${options.status ? ` [${options.status}]` : " [open]"}:`,
 			...(visibleTasks.length > 0
 				? visibleTasks.map((task) => `- ${task.id} [${task.status}] ${truncateForPrompt(task.title, 180)}`)
@@ -1287,7 +1331,8 @@ export default function (pi: ExtensionAPI) {
 	function formatLoop(l: LoopState): string {
 		const status = `${STATUS_ICONS[l.status]} ${l.status}`;
 		const iter = l.maxIterations > 0 ? `${l.iteration}/${l.maxIterations}` : `${l.iteration}`;
-		return `${l.name}: ${status} (iteration ${iter})`;
+		const currentTask = l.currentTaskId ? ` · task ${l.currentTaskId}` : "";
+		return `${l.name}: ${status} (iteration ${iter})${currentTask}`;
 	}
 
 	function updateUI(ctx: ExtensionContext): void {
@@ -1307,7 +1352,7 @@ export default function (pi: ExtensionAPI) {
 		const title = theme.fg("success", theme.bold("Ralph Wiggum"));
 		const status = theme.fg(
 			"dim",
-			` · 🔁 ${state.name} · ${STATUS_ICONS[state.status]} ${state.status} · 🔢 ${state.iteration}${maxStr} · 📄 ${state.taskFile}${reflection} · Esc pause · msg resume · /ralph-stop stop`,
+			` · 🔁 ${state.name} · ${STATUS_ICONS[state.status]} ${state.status} · 🔢 ${state.iteration}${maxStr} · 📄 ${state.taskFile}${reflection}${state.currentTaskId ? ` · 📌 ${state.currentTaskId}` : ""} · Esc pause · msg resume · /ralph-stop stop`,
 		);
 		ctx.ui.setStatus("ralph", `${title}${status}`);
 		ctx.ui.setWidget("ralph", undefined);
@@ -1350,7 +1395,8 @@ export default function (pi: ExtensionAPI) {
 
 	function getIterationContent(ctx: ExtensionContext, state: LoopState): { content: string; needsReflection: boolean } | null {
 		const plan = ensurePlan(ctx, state);
-		const content = planToPromptText(plan);
+		syncCurrentTask(ctx, state, plan);
+		const content = planToPromptText(state, plan);
 		const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
 		return { content, needsReflection };
 	}
@@ -1396,6 +1442,58 @@ export default function (pi: ExtensionAPI) {
 		state.pendingSessionReset = true;
 		saveState(ctx, state);
 		dispatchNextIterationResetFollowUp(state, content, needsReflection);
+	}
+
+	function logCompactionResumeDecision(
+		ctx: ExtensionContext,
+		state: LoopState,
+		kind: string,
+		meta: Record<string, unknown>,
+		message?: string,
+	): void {
+		recordLoopEvent(ctx, state.name, kind, message ?? kind, state.iteration, meta);
+	}
+
+	function maybeDispatchCompactionResume(ctx: ExtensionContext, state: LoopState, trigger: string): boolean {
+		if (state.status !== "active") return false;
+		if (!state.pendingSessionReset) return false;
+		if (state.resumeGeneration <= state.lastResumeDispatchedGeneration) {
+			logCompactionResumeDecision(ctx, state, "compaction_resume_skip", {
+				trigger,
+				reason: "already_dispatched",
+				resumeGeneration: state.resumeGeneration,
+				lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration,
+			});
+			return false;
+		}
+		if (ctx.hasPendingMessages()) {
+			logCompactionResumeDecision(ctx, state, "compaction_resume_deferred", {
+				trigger,
+				reason: "pending_messages",
+				resumeGeneration: state.resumeGeneration,
+				lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration,
+			});
+			return false;
+		}
+		state.lastResumeDispatchedGeneration = state.resumeGeneration;
+		state.pendingSessionReset = false;
+		saveState(ctx, state);
+		logCompactionResumeDecision(ctx, state, "compaction_resume_dispatch", {
+			trigger,
+			resumeGeneration: state.resumeGeneration,
+			lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration,
+		});
+		return true;
+	}
+
+	function syncCurrentTask(ctx: ExtensionContext, state: LoopState, plan: RalphPlan, preferredTaskId?: string | null): RalphTask | null {
+		const selectedTask = selectNextTask(plan, preferredTaskId ?? null, state.currentTaskId);
+		const nextTaskId = selectedTask?.id ?? null;
+		if (state.currentTaskId !== nextTaskId) {
+			state.currentTaskId = nextTaskId;
+			saveState(ctx, state);
+		}
+		return selectedTask;
 	}
 
 	function pauseLoop(ctx: ExtensionContext, state: LoopState, message?: string): void {
@@ -1540,22 +1638,25 @@ export default function (pi: ExtensionAPI) {
 				startedAt: existing?.startedAt || nowIso(),
 				lastReflectionAt: 0,
 				lastDoneReminderAt: 0,
+				resumeGeneration: 0,
+				lastResumeDispatchedGeneration: 0,
 				sessionStrategy: args.sessionStrategy,
 				sessionStrategyFailure: args.sessionStrategyFailure,
 				pendingSessionReset: false,
 			};
 
-			saveState(ctx, state);
-			const initialPlan = ensurePlan(ctx, state);
-			savePlanAndSnapshot(ctx, state, initialPlan);
-			currentLoop = loopName;
+				saveState(ctx, state);
+				const initialPlan = ensurePlan(ctx, state);
+				savePlanAndSnapshot(ctx, state, initialPlan);
+				syncCurrentTask(ctx, state, initialPlan);
+				currentLoop = loopName;
 			recordLoopEvent(ctx, state.name, "start", "Started Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 			updateUI(ctx);
 			if (state.sessionStrategy === "newSession") {
 				await dispatchNextIterationFreshContext(ctx, state);
 				return;
 			}
-			dispatchNextIterationFollowUp(state, planToPromptText(initialPlan), false);
+			dispatchNextIterationFollowUp(state, planToPromptText(state, initialPlan), false);
 		},
 
 		stop(_rest, ctx) {
@@ -1611,10 +1712,11 @@ export default function (pi: ExtensionAPI) {
 			state.status = "active";
 			state.active = true;
 			state.iteration++;
-			saveState(ctx, state);
-			recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
-			const plan = ensurePlan(ctx, state);
-			currentLoop = loopName;
+				saveState(ctx, state);
+				recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
+				const plan = ensurePlan(ctx, state);
+				syncCurrentTask(ctx, state, plan);
+				currentLoop = loopName;
 			updateUI(ctx);
 			ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
 
@@ -1623,7 +1725,7 @@ export default function (pi: ExtensionAPI) {
 				await dispatchNextIterationFreshContext(ctx, state);
 				return;
 			}
-			dispatchNextIterationFollowUp(state, planToPromptText(plan), needsReflection);
+				dispatchNextIterationFollowUp(state, planToPromptText(state, plan), needsReflection);
 		},
 
 		status(_rest, ctx) {
@@ -1912,7 +2014,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 					details: {},
 				};
 			}
-			dispatchNextIterationFollowUp(state, planToPromptText(plan), false);
+			dispatchNextIterationFollowUp(state, planToPromptText(state, plan), false);
 			return {
 				content: [{ type: "text", text: `Started loop "${loopName}" with ${plan.tasks.length} structured task(s).` }],
 				details: {},
@@ -1944,6 +2046,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 						text: buildCompactPlanResponse(result.plan, {
 							status: parseTaskStatus(params.status) ?? undefined,
 							maxTasks: params.maxTasks,
+							currentTaskId: result.state.currentTaskId,
 						}),
 					},
 				],
@@ -2044,6 +2147,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 				withoutTask.splice(index, 0, task);
 				result.plan.tasks = withoutTask;
 			}
+			syncCurrentTask(ctx, result.state, result.plan, params.status ? task.id : result.state.currentTaskId);
 			savePlanAndSnapshot(ctx, result.state, result.plan);
 			return { content: [{ type: "text", text: `Updated ${task.id}: ${task.title} [${task.status}]` }], details: {} };
 		},
@@ -2206,12 +2310,16 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 	pi.on("session_before_compact", async (event, ctx) => {
 		const state = resolveLoopState(ctx);
 		if (!state || state.status !== "active") return;
+		state.resumeGeneration = (state.resumeGeneration ?? 0) + 1;
+		state.pendingSessionReset = true;
+		saveState(ctx, state);
 		recordLoopEvent(ctx, state.name, "session_before_compact", "Pi is compacting the session", state.iteration, {
 			reason: event?.reason ?? null,
 			willRetry: event?.willRetry ?? null,
+			resumeGeneration: state.resumeGeneration,
+			lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration ?? 0,
+			pendingSessionReset: state.pendingSessionReset ?? false,
 		});
-		state.pendingSessionReset = true;
-		saveState(ctx, state);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -2219,6 +2327,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		if (!state || state.status !== "active") return;
 		const lastAssistant = [...event.messages].reverse().find((m) => m.role === "assistant");
 		const naturalStop = isNaturalAssistantStop(lastAssistant);
+		const hasPendingMessages = ctx.hasPendingMessages();
 		const text =
 			lastAssistant && Array.isArray(lastAssistant.content)
 				? lastAssistant.content
@@ -2226,6 +2335,14 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 						.map((c) => c.text)
 						.join("\n")
 				: "";
+		recordLoopEvent(ctx, state.name, "agent_end_observed", "Pi ended the assistant turn", state.iteration, {
+			naturalStop,
+			hasPendingMessages,
+			pendingSessionReset: state.pendingSessionReset ?? false,
+			resumeGeneration: state.resumeGeneration ?? 0,
+			lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration ?? 0,
+			lastAssistantStopReason: lastAssistant?.stopReason ?? null,
+		});
 		if (naturalStop && text.includes(COMPLETE_MARKER)) {
 			completeLoop(
 				ctx,
@@ -2246,9 +2363,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			);
 			return;
 		}
-		if (state.pendingSessionReset) {
-			state.pendingSessionReset = false;
-			saveState(ctx, state);
+		if (state.pendingSessionReset && maybeDispatchCompactionResume(ctx, state, "agent_end")) {
 			state = loadState(ctx, state.name);
 			if (!state || state.status !== "active") return;
 			await dispatchNextIterationFreshContext(ctx, state);
@@ -2279,6 +2394,16 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 				return candidateUpdated > bestUpdated ? candidate : best;
 			});
 			currentLoop = mostRecent.name;
+		}
+		const state = resolveLoopState(ctx);
+		if (state && state.status === "active" && state.pendingSessionReset) {
+			const dispatched = maybeDispatchCompactionResume(ctx, state, "session_start");
+			if (dispatched) {
+				const reloaded = loadState(ctx, state.name);
+				if (reloaded && reloaded.status === "active") {
+					await dispatchNextIterationFreshContext(ctx, reloaded);
+				}
+			}
 		}
 		if (active.length > 0 && ctx.hasUI) {
 			const lines = active.map((l) => `  • ${l.name} (iteration ${l.iteration}${l.maxIterations > 0 ? `/${l.maxIterations}` : ""})`);

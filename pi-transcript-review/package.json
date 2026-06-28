@@ -1,0 +1,29 @@
+{
+  "name": "@matt/pi-transcript-review",
+  "version": "0.1.0",
+  "description": "Capture Pi conversation transcripts into SQLite for later review and analysis.",
+  "license": "MIT",
+  "author": "Matt",
+  "keywords": [
+    "pi-package"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.38"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@types/node": "^22.16.3",
+    "typescript": "^5.8.3"
+  }
+}
