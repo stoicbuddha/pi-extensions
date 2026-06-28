@@ -453,13 +453,15 @@ export default function (pi: ExtensionAPI) {
 			INSERT INTO loops (
 				id, name, task_file, status, iteration, max_iterations, items_per_iteration,
 				reflect_every, reflect_instructions, session_strategy, session_strategy_failure,
-				pending_session_reset, last_reflection_at, last_done_reminder_at, started_at,
-				completed_at, created_at, updated_at, archived_at
+				pending_session_reset, last_reflection_at, last_done_reminder_at, resume_generation,
+				last_resume_dispatched_generation, current_task_id, started_at, completed_at,
+				created_at, updated_at, archived_at
 			) VALUES (
 				@id, @name, @task_file, @status, @iteration, @max_iterations, @items_per_iteration,
 				@reflect_every, @reflect_instructions, @session_strategy, @session_strategy_failure,
-				@pending_session_reset, @last_reflection_at, @last_done_reminder_at, @started_at,
-				@completed_at, @created_at, @updated_at, @archived_at
+				@pending_session_reset, @last_reflection_at, @last_done_reminder_at, @resume_generation,
+				@last_resume_dispatched_generation, @current_task_id, @started_at, @completed_at,
+				@created_at, @updated_at, @archived_at
 			)
 			ON CONFLICT(id) DO UPDATE SET
 				name = excluded.name,
@@ -475,6 +477,9 @@ export default function (pi: ExtensionAPI) {
 				pending_session_reset = excluded.pending_session_reset,
 				last_reflection_at = excluded.last_reflection_at,
 				last_done_reminder_at = excluded.last_done_reminder_at,
+				resume_generation = excluded.resume_generation,
+				last_resume_dispatched_generation = excluded.last_resume_dispatched_generation,
+				current_task_id = excluded.current_task_id,
 				started_at = excluded.started_at,
 				completed_at = excluded.completed_at,
 				created_at = excluded.created_at,
@@ -1395,7 +1400,6 @@ export default function (pi: ExtensionAPI) {
 
 	function getIterationContent(ctx: ExtensionContext, state: LoopState): { content: string; needsReflection: boolean } | null {
 		const plan = ensurePlan(ctx, state);
-		syncCurrentTask(ctx, state, plan);
 		const content = planToPromptText(state, plan);
 		const needsReflection = state.reflectEvery > 0 && (state.iteration - 1) % state.reflectEvery === 0;
 		return { content, needsReflection };
@@ -1484,16 +1488,6 @@ export default function (pi: ExtensionAPI) {
 			lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration,
 		});
 		return true;
-	}
-
-	function syncCurrentTask(ctx: ExtensionContext, state: LoopState, plan: RalphPlan, preferredTaskId?: string | null): RalphTask | null {
-		const selectedTask = selectNextTask(plan, preferredTaskId ?? null, state.currentTaskId);
-		const nextTaskId = selectedTask?.id ?? null;
-		if (state.currentTaskId !== nextTaskId) {
-			state.currentTaskId = nextTaskId;
-			saveState(ctx, state);
-		}
-		return selectedTask;
 	}
 
 	function pauseLoop(ctx: ExtensionContext, state: LoopState, message?: string): void {
@@ -1648,7 +1642,10 @@ export default function (pi: ExtensionAPI) {
 				saveState(ctx, state);
 				const initialPlan = ensurePlan(ctx, state);
 				savePlanAndSnapshot(ctx, state, initialPlan);
-				syncCurrentTask(ctx, state, initialPlan);
+				if (!state.currentTaskId) {
+					state.currentTaskId = selectNextTask(initialPlan)?.id ?? null;
+					saveState(ctx, state);
+				}
 				currentLoop = loopName;
 			recordLoopEvent(ctx, state.name, "start", "Started Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 			updateUI(ctx);
@@ -1715,7 +1712,6 @@ export default function (pi: ExtensionAPI) {
 				saveState(ctx, state);
 				recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 				const plan = ensurePlan(ctx, state);
-				syncCurrentTask(ctx, state, plan);
 				currentLoop = loopName;
 			updateUI(ctx);
 			ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
@@ -1871,11 +1867,11 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(`Rendered plan snapshot: ${renderedPath}`, "info");
 	});
 
-	registerPlanCommand("task", "Quick task status updates", (rest, ctx) => {
-		const [action, taskId, ...loopParts] = rest.trim().split(/\s+/).filter(Boolean);
-		if (!action || !taskId || (action !== "done" && action !== "block")) {
-			ctx.ui.notify("Usage: /ralph task <done|block> <task-id> [loop]", "warning");
-			return;
+		registerPlanCommand("task", "Quick task status updates", (rest, ctx) => {
+			const [action, taskId, ...loopParts] = rest.trim().split(/\s+/).filter(Boolean);
+			if (!action || !taskId || (action !== "done" && action !== "block")) {
+				ctx.ui.notify("Usage: /ralph task <done|block> <task-id> [loop]", "warning");
+				return;
 		}
 		const loopName = loopParts[0];
 		const result = getPlanState(ctx, loopName);
@@ -1890,9 +1886,31 @@ export default function (pi: ExtensionAPI) {
 		}
 		task.status = action === "done" ? "done" : "blocked";
 		addVerification(result.plan, `Task ${task.id} marked ${task.status} via /ralph task.`);
-		savePlanAndSnapshot(ctx, result.state, result.plan);
-		ctx.ui.notify(`Updated ${task.id}: ${task.title} -> ${task.status}`, "info");
-	});
+			savePlanAndSnapshot(ctx, result.state, result.plan);
+			ctx.ui.notify(`Updated ${task.id}: ${task.title} -> ${task.status}`, "info");
+		});
+
+		registerPlanCommand("set-max-iterations", "Update a loop's max iteration limit", (rest, ctx) => {
+			const [value, ...loopParts] = rest.trim().split(/\s+/).filter(Boolean);
+			const maxIterations = Number.parseInt(value ?? "", 10);
+			if (!value || Number.isNaN(maxIterations) || maxIterations < 0) {
+				ctx.ui.notify("Usage: /ralph set-max-iterations <N> [loop]", "warning");
+				return;
+			}
+			const loopName = loopParts[0];
+			const result = getPlanState(ctx, loopName);
+			if (!result) {
+				ctx.ui.notify(loopName ? `Loop "${loopName}" not found` : "No active Ralph loop", "warning");
+				return;
+			}
+			result.state.maxIterations = maxIterations;
+			saveState(ctx, result.state);
+			recordLoopEvent(ctx, result.state.name, "set_max_iterations", `Set max iterations to ${maxIterations}`, result.state.iteration, {
+				maxIterations,
+			});
+			updateUI(ctx);
+			ctx.ui.notify(`Updated ${result.state.name}: max iterations = ${maxIterations}`, "info");
+		});
 
 	const HELP = `Ralph Wiggum - Long-running development loops
 
@@ -1901,10 +1919,11 @@ Commands:
   /ralph stop                         Pause current loop
   /ralph resume [name]                Resume a paused loop
   /ralph status                       Show all loops
-  /ralph show-plan [loop]             Show structured plan summary
-  /ralph list-tasks [loop] [--status STATUS]  Show structured tasks
-  /ralph task <done|block> <task-id> [loop]   Quick task update
-  /ralph render-plan [loop]           Regenerate markdown snapshot
+	  /ralph show-plan [loop]             Show structured plan summary
+	  /ralph list-tasks [loop] [--status STATUS]  Show structured tasks
+	  /ralph task <done|block> <task-id> [loop]   Quick task update
+	  /ralph set-max-iterations <N> [loop]   Update max iterations for a loop
+	  /ralph render-plan [loop]           Regenerate markdown snapshot
   /ralph cancel <name>                Delete loop state
   /ralph archive <name>               Move loop to archive
   /ralph clean [--all]                Clean completed loops
@@ -2147,7 +2166,12 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 				withoutTask.splice(index, 0, task);
 				result.plan.tasks = withoutTask;
 			}
-			syncCurrentTask(ctx, result.state, result.plan, params.status ? task.id : result.state.currentTaskId);
+			if (params.status === "in_progress") {
+				result.state.currentTaskId = task.id;
+			} else if ((params.status === "done" || params.status === "cancelled") && result.state.currentTaskId === task.id) {
+				result.state.currentTaskId = null;
+			}
+			saveState(ctx, result.state);
 			savePlanAndSnapshot(ctx, result.state, result.plan);
 			return { content: [{ type: "text", text: `Updated ${task.id}: ${task.title} [${task.status}]` }], details: {} };
 		},
