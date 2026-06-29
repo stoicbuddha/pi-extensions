@@ -11,7 +11,6 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "@sinclair/typebox";
 
 const RALPH_DIR = ".ralph";
-const COMPLETE_MARKER = "<promise>COMPLETE</promise>";
 const SESSION_RESET_MARKER = "Previous Ralph loop transcript intentionally discarded. Continue from current task state only.";
 const FAKE_RALPH_DONE_PATTERN = /<(?:invoke|tool_use|tool|function_call)\b[^>]*(?:name=["']ralph_done["']|ralph_done)[\s\S]*?<\/(?:invoke|tool_use|tool|function_call)>|<ralph_done\b[^>]*\/?>/i;
 const PROMPT_PLAN_MAX_CHARS = 5000;
@@ -24,6 +23,7 @@ const GET_PLAN_DEFAULT_MAX_TASKS = 12;
 const GET_PLAN_MAX_NOTES = 3;
 const GET_PLAN_MAX_VERIFICATION = 3;
 const GET_PLAN_MAX_REFLECTIONS = 2;
+const META_CURRENT_LOOP_NAME = "current_loop_name";
 
 const DEFAULT_TEMPLATE = `# Task
 
@@ -226,6 +226,11 @@ export default function (pi: ExtensionAPI) {
 		updated_at: string;
 	};
 
+	type DbMetaRow = {
+		key: string;
+		value: string;
+	};
+
 	function dbPath(ctx: ExtensionContext): string {
 		return path.join(ralphDir(ctx), "ralph.sqlite");
 	}
@@ -348,6 +353,11 @@ export default function (pi: ExtensionAPI) {
 				meta_json TEXT
 			);
 			CREATE INDEX IF NOT EXISTS idx_loop_events_loop_kind ON loop_events(loop_id, kind, created_at);
+
+			CREATE TABLE IF NOT EXISTS ralph_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
 		`);
 		db.exec(`INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');`);
 		ensureLoopSchemaColumns(db);
@@ -366,6 +376,48 @@ export default function (pi: ExtensionAPI) {
 		if (!columns.has("current_task_id")) {
 			db.exec(`ALTER TABLE loops ADD COLUMN current_task_id TEXT;`);
 		}
+	}
+
+	function getMetaValue(db: DatabaseSync, key: string): string | null {
+		const row = db.prepare("SELECT value FROM ralph_meta WHERE key = ?").get(key) as DbMetaRow | undefined;
+		return row?.value ?? null;
+	}
+
+	function setMetaValue(db: DatabaseSync, key: string, value: string): void {
+		db.prepare(`
+			INSERT INTO ralph_meta (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		`).run(key, value);
+	}
+
+	function clearMetaValue(db: DatabaseSync, key: string): void {
+		db.prepare("DELETE FROM ralph_meta WHERE key = ?").run(key);
+	}
+
+	function setSelectedLoopName(ctx: ExtensionContext, loopName: string | null): void {
+		const db = openDb(ctx);
+		withTransaction(db, () => {
+			if (loopName) setMetaValue(db, META_CURRENT_LOOP_NAME, loopName);
+			else clearMetaValue(db, META_CURRENT_LOOP_NAME);
+		});
+		currentLoop = loopName;
+	}
+
+	function loadSelectedLoopName(ctx: ExtensionContext): string | null {
+		const db = openDb(ctx);
+		const selected = getMetaValue(db, META_CURRENT_LOOP_NAME);
+		if (selected) {
+			const state = stateFromDb(db, selected);
+			if (state) return selected;
+			clearMetaValue(db, META_CURRENT_LOOP_NAME);
+		}
+		const activeLoops = listStatesFromDb(db).filter((loop) => loop.status === "active");
+		if (activeLoops.length === 1) {
+			const active = activeLoops[0].name;
+			setMetaValue(db, META_CURRENT_LOOP_NAME, active);
+			return active;
+		}
+		return null;
 	}
 
 	function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
@@ -987,6 +1039,20 @@ export default function (pi: ExtensionAPI) {
 		return `${text.slice(0, PROMPT_PLAN_MAX_CHARS)}\n\n[Prompt plan truncated by ${text.length - PROMPT_PLAN_MAX_CHARS} chars. Use ralph_get_plan, ralph_list_tasks, or the .plan.json state for full history.]`;
 	}
 
+	function selectInitialTask(plan: RalphPlan): RalphTask | null {
+		return plan.tasks.find((task) => task.status === "in_progress") ?? plan.tasks.find((task) => task.status === "todo") ?? plan.tasks.find((task) => task.status === "blocked") ?? null;
+	}
+
+	function inferCurrentTaskId(plan: RalphPlan): string | null {
+		const inProgress = plan.tasks.filter((task) => task.status === "in_progress");
+		if (inProgress.length === 1) return inProgress[0].id;
+		return null;
+	}
+
+	function isPlanComplete(plan: RalphPlan): boolean {
+		return plan.tasks.length > 0 && plan.tasks.every((task) => task.status === "done" || task.status === "cancelled");
+	}
+
 	function selectNextTask(plan: RalphPlan, preferredTaskId?: string | null, currentTaskId?: string | null): RalphTask | null {
 		if (preferredTaskId) {
 			const preferredTask = findTask(plan, preferredTaskId);
@@ -1000,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
 				return currentTask;
 			}
 		}
-		return plan.tasks.find((task) => task.status === "in_progress") ?? plan.tasks.find((task) => task.status === "todo") ?? plan.tasks.find((task) => task.status === "blocked") ?? null;
+		return null;
 	}
 
 	function planToPromptText(state: LoopState, plan: RalphPlan): string {
@@ -1277,29 +1343,30 @@ export default function (pi: ExtensionAPI) {
 		const state = resolveLoopState(ctx, loopName);
 		if (!state) return null;
 		const plan = ensurePlan(ctx, state);
+		if (!state.currentTaskId) {
+			const inferredTaskId = inferCurrentTaskId(plan);
+			if (inferredTaskId) {
+				state.currentTaskId = inferredTaskId;
+				saveState(ctx, state);
+				recordLoopEvent(ctx, state.name, "current_task_backfill", "Backfilled current task from canonical plan state", state.iteration, {
+					currentTaskId: inferredTaskId,
+				});
+			}
+		}
 		return { state, plan };
-	}
-
-	function mostRecentActiveLoop(ctx: ExtensionContext): LoopState | null {
-		const activeLoops = listLoops(ctx).filter((loop) => loop.status === "active");
-		if (activeLoops.length === 0) return null;
-		return activeLoops.reduce((best, candidate) => {
-			const bestUpdated = best.updatedAt ?? best.startedAt;
-			const candidateUpdated = candidate.updatedAt ?? candidate.startedAt;
-			return candidateUpdated > bestUpdated ? candidate : best;
-		});
 	}
 
 	function resolveLoopName(ctx: ExtensionContext, loopName?: string): string | null {
 		if (loopName) return loopName;
 		if (currentLoop) {
 			const current = loadState(ctx, currentLoop);
-			if (current && current.status === "active") return currentLoop;
+			if (current) return currentLoop;
+			currentLoop = null;
 		}
-		const active = mostRecentActiveLoop(ctx);
-		if (!active) return null;
-		currentLoop = active.name;
-		return active.name;
+		const selected = loadSelectedLoopName(ctx);
+		if (!selected) return null;
+		currentLoop = selected;
+		return selected;
 	}
 
 	function resolveLoopState(ctx: ExtensionContext, loopName?: string): LoopState | null {
@@ -1389,8 +1456,7 @@ export default function (pi: ExtensionAPI) {
 		parts.push("6. When a task is complete, call ralph_update_task with status done and concise evidence describing what changed and how you verified it. If blocked, use status blocked with a blocker note. If partially done, leave it in_progress and add a note/evidence.");
 		parts.push("7. Treat Ralph state as canonical: use ralph_update_task, ralph_add_task, ralph_add_note, ralph_record_reflection, and related Ralph tools. Treat generated snapshot files as read-only output; do not edit them directly.");
 		parts.push(`8. Treat ${state.taskFile} as generated output; do not edit it directly.`);
-		parts.push(`9. When FULLY COMPLETE, respond with: ${COMPLETE_MARKER}`);
-		parts.push("10. Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name=\"ralph_done\"></invoke>.");
+		parts.push("9. When the current iteration is complete, call the actual ralph_done tool to proceed to the next iteration. Do not write an XML tag or textual placeholder such as <invoke name=\"ralph_done\"></invoke>.");
 		return parts.join("\n");
 	}
 
@@ -1643,10 +1709,11 @@ export default function (pi: ExtensionAPI) {
 				const initialPlan = ensurePlan(ctx, state);
 				savePlanAndSnapshot(ctx, state, initialPlan);
 				if (!state.currentTaskId) {
-					state.currentTaskId = selectNextTask(initialPlan)?.id ?? null;
-					saveState(ctx, state);
+					state.currentTaskId = inferCurrentTaskId(initialPlan);
+					if (!state.currentTaskId) state.currentTaskId = selectInitialTask(initialPlan)?.id ?? null;
+					if (state.currentTaskId) saveState(ctx, state);
 				}
-				currentLoop = loopName;
+				setSelectedLoopName(ctx, loopName);
 			recordLoopEvent(ctx, state.name, "start", "Started Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 			updateUI(ctx);
 			if (state.sessionStrategy === "newSession") {
@@ -1658,9 +1725,14 @@ export default function (pi: ExtensionAPI) {
 
 		stop(_rest, ctx) {
 			if (!currentLoop) {
-				const active = mostRecentActiveLoop(ctx);
-				if (active) pauseLoop(ctx, active, `Paused Ralph loop: ${active.name} (iteration ${active.iteration})`);
-				else ctx.ui.notify("No active Ralph loop", "warning");
+				const selected = loadSelectedLoopName(ctx);
+				if (!selected) {
+					ctx.ui.notify("No active Ralph loop", "warning");
+					return;
+				}
+				const active = resolveLoopState(ctx, selected);
+				if (active && active.status === "active") pauseLoop(ctx, active, `Paused Ralph loop: ${active.name} (iteration ${active.iteration})`);
+				else ctx.ui.notify(`Loop "${selected}" is not active`, "warning");
 				return;
 			}
 			const state = resolveLoopState(ctx, currentLoop);
@@ -1673,32 +1745,17 @@ export default function (pi: ExtensionAPI) {
 			if (!loopName) {
 				if (currentLoop) {
 					const current = resolveLoopState(ctx, currentLoop);
-					if (current?.status === "paused") loopName = currentLoop;
+					if (current) loopName = currentLoop;
 				}
+				if (!loopName) loopName = loadSelectedLoopName(ctx) ?? "";
 				if (!loopName) {
-					const pausedLoops = listLoops(ctx).filter((loop) => loop.status === "paused");
-					if (pausedLoops.length === 0) {
-						ctx.ui.notify("No paused Ralph loop found. Use /ralph start <name> to create one.", "warning");
-						return;
-					}
-					const mostRecentPaused = pausedLoops.reduce((best, candidate) => {
-						const bestUpdated = best.updatedAt ?? best.startedAt;
-						const candidateUpdated = candidate.updatedAt ?? candidate.startedAt;
-						return candidateUpdated > bestUpdated ? candidate : best;
-					});
-					loopName = mostRecentPaused.name;
-					if (pausedLoops.length > 1 && ctx.hasUI) {
-						ctx.ui.notify(`No name provided. Resuming most recently paused loop "${loopName}". Use /ralph resume [name] to choose a different loop.`, "info");
-					}
+					ctx.ui.notify("No selected Ralph loop found. Use /ralph resume <name>.", "warning");
+					return;
 				}
 			}
 			const state = resolveLoopState(ctx, loopName);
 			if (!state) {
 				ctx.ui.notify(`Loop "${loopName}" not found`, "error");
-				return;
-			}
-			if (state.status === "completed") {
-				ctx.ui.notify(`Loop "${loopName}" is completed. Use /ralph start ${loopName} to restart`, "warning");
 				return;
 			}
 			if (currentLoop && currentLoop !== loopName) {
@@ -1708,11 +1765,17 @@ export default function (pi: ExtensionAPI) {
 
 			state.status = "active";
 			state.active = true;
+			state.completedAt = undefined;
 			state.iteration++;
-				saveState(ctx, state);
-				recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
-				const plan = ensurePlan(ctx, state);
-				currentLoop = loopName;
+			saveState(ctx, state);
+			recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
+			const plan = ensurePlan(ctx, state);
+			if (!state.currentTaskId) {
+				state.currentTaskId = inferCurrentTaskId(plan);
+				if (!state.currentTaskId) state.currentTaskId = selectInitialTask(plan)?.id ?? null;
+				if (state.currentTaskId) saveState(ctx, state);
+			}
+			setSelectedLoopName(ctx, loopName);
 			updateUI(ctx);
 			ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
 
@@ -1959,12 +2022,16 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			}
 			let state = resolveLoopState(ctx, currentLoop ?? undefined);
 			if (!state) {
-				const active = mostRecentActiveLoop(ctx);
-				if (!active) {
+				const selected = loadSelectedLoopName(ctx);
+				if (!selected) {
 					if (ctx.hasUI) ctx.ui.notify("No active Ralph loop", "warning");
 					return;
 				}
-				state = active;
+				state = resolveLoopState(ctx, selected);
+			}
+			if (!state) {
+				if (ctx.hasUI) ctx.ui.notify("No active Ralph loop", "warning");
+				return;
 			}
 			if (state.status !== "active") {
 				if (ctx.hasUI) ctx.ui.notify(`Loop "${state.name}" is not active`, "warning");
@@ -2018,7 +2085,12 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			saveState(ctx, state);
 			const plan = parseLegacyMarkdownPlan(params.taskContent, loopName);
 			savePlanAndSnapshot(ctx, state, plan);
-			currentLoop = loopName;
+			if (!state.currentTaskId) {
+				state.currentTaskId = inferCurrentTaskId(plan);
+				if (!state.currentTaskId) state.currentTaskId = selectInitialTask(plan)?.id ?? null;
+				if (state.currentTaskId) saveState(ctx, state);
+			}
+			setSelectedLoopName(ctx, loopName);
 			updateUI(ctx);
 			if (state.sessionStrategy === "newSession") {
 				state.pendingSessionReset = true;
@@ -2314,8 +2386,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		instructions += `- Start from the Next Task in the runtime prompt; call compact ralph_get_plan or ralph_list_tasks only when you need more task context\n`;
 		instructions += `- Mark active work in_progress, done, blocked, or cancelled with ralph_update_task\n`;
 		instructions += `- Record concise notes/evidence/reflections in structured Ralph state; do not edit generated markdown snapshots directly\n`;
-		instructions += `- When FULLY COMPLETE: ${COMPLETE_MARKER}\n`;
-		instructions += `- Otherwise, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name="ralph_done"></invoke>.`;
+		instructions += `- When the current iteration is complete, call the actual ralph_done tool to proceed to next iteration. Do not write an XML tag or textual placeholder such as <invoke name="ralph_done"></invoke>.`;
 		return {
 			systemPrompt: event.systemPrompt + `\n[RALPH LOOP - ${state.name} - Iteration ${iterStr}]\n\n${instructions}`,
 		};
@@ -2367,7 +2438,8 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			lastResumeDispatchedGeneration: state.lastResumeDispatchedGeneration ?? 0,
 			lastAssistantStopReason: lastAssistant?.stopReason ?? null,
 		});
-		if (naturalStop && text.includes(COMPLETE_MARKER)) {
+		const plan = ensurePlan(ctx, state);
+		if (isPlanComplete(plan)) {
 			completeLoop(
 				ctx,
 				state,
@@ -2402,22 +2474,17 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			const fakeToolCall = FAKE_RALPH_DONE_PATTERN.test(text);
 			pi.sendUserMessage(
 				fakeToolCall
-					? `You wrote text that looks like a ralph_done tool call, but Pi did not execute it. If this iteration is done, call the actual ralph_done tool now using the tool interface. Do not write XML, <invoke>, or placeholder text. If the whole loop is complete, respond with ${COMPLETE_MARKER}.`
-					: `You are still in Ralph loop "${state.name}" at iteration ${state.iteration}. If you are done with the tasks for this iteration, call the actual ralph_done tool now using the tool interface. If the whole loop is complete, respond with ${COMPLETE_MARKER}. Otherwise, continue working on the current iteration and use Ralph tools to update canonical state.`,
+					? `You wrote text that looks like a ralph_done tool call, but Pi did not execute it. If this iteration is done, call the actual ralph_done tool now using the tool interface. Do not write XML, <invoke>, or placeholder text. If the loop is complete, Ralph state will stop it.`
+					: `You are still in Ralph loop "${state.name}" at iteration ${state.iteration}. If you are done with the tasks for this iteration, call the actual ralph_done tool now using the tool interface. If the loop is complete, Ralph state will stop it. Otherwise, continue working on the current iteration and use Ralph tools to update canonical state.`,
 				{ deliverAs: "followUp" },
 			);
 		}
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		const active = listLoops(ctx).filter((l) => l.status === "active");
-		if (!currentLoop && active.length > 0) {
-			const mostRecent = active.reduce((best, candidate) => {
-				const bestUpdated = best.updatedAt ?? best.startedAt;
-				const candidateUpdated = candidate.updatedAt ?? candidate.startedAt;
-				return candidateUpdated > bestUpdated ? candidate : best;
-			});
-			currentLoop = mostRecent.name;
+		if (!currentLoop) {
+			const selected = loadSelectedLoopName(ctx);
+			if (selected) currentLoop = selected;
 		}
 		const state = resolveLoopState(ctx);
 		if (state && state.status === "active" && state.pendingSessionReset) {
@@ -2428,10 +2495,6 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 					await dispatchNextIterationFreshContext(ctx, reloaded);
 				}
 			}
-		}
-		if (active.length > 0 && ctx.hasUI) {
-			const lines = active.map((l) => `  • ${l.name} (iteration ${l.iteration}${l.maxIterations > 0 ? `/${l.maxIterations}` : ""})`);
-			ctx.ui.notify(`Active Ralph loops:\n${lines.join("\n")}\n\nUse /ralph resume [name] to continue`, "info");
 		}
 		updateUI(ctx);
 	});

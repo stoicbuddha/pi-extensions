@@ -53,6 +53,22 @@ interface ToolCallRow {
 	meta?: Record<string, unknown>;
 }
 
+interface ReviewFinding {
+	priority: number;
+	sessionId: string;
+	title: string;
+	evidence: string[];
+	recommendation: string;
+}
+
+interface ReviewReport {
+	scope: string;
+	sessionIds: string[];
+	sessionsReviewed: number;
+	findings: ReviewFinding[];
+	recommendations: string[];
+}
+
 const STATE_DIR = ".pi-transcript-review";
 const DB_FILE = "transcript-review.sqlite";
 
@@ -523,7 +539,191 @@ function listSessions(db: DatabaseSync, limit = 20): string {
 			(row) =>
 				`- ${row.id} | ${row.status} | ${row.title} | messages=${row.message_count} tools=${row.tool_call_count} compactions=${row.compaction_count} | started ${row.started_at} | last ${row.last_seen_at}`,
 		)
-		.join("\n");
+	.join("\n");
+}
+
+function recentCompletedSessionIds(db: DatabaseSync, limit = 5): string[] {
+	const rows = db
+		.prepare("SELECT id FROM sessions WHERE status = 'completed' ORDER BY last_seen_at DESC, started_at DESC LIMIT ?")
+		.all(limit) as Array<{ id: string }>;
+	return rows.map((row) => row.id);
+}
+
+function normalizeSessionIds(db: DatabaseSync, sessionIds?: string[]): string[] {
+	if (!sessionIds || sessionIds.length === 0) return recentCompletedSessionIds(db, 5);
+	const unique = new Set<string>();
+	for (const id of sessionIds.map((item) => item.trim()).filter(Boolean)) unique.add(id);
+	return [...unique].filter((id) => !!getSessionRow(db, id));
+}
+
+function toolCallRows(db: DatabaseSync, sessionId: string): ToolCallRow[] {
+	return db
+		.prepare(
+			"SELECT session_id, call_id, tool_name, status, input_json, output_json, created_at, finished_at, seq, meta_json FROM tool_calls WHERE session_id = ? ORDER BY seq ASC, id ASC",
+		)
+		.all(sessionId) as unknown as ToolCallRow[];
+}
+
+function messageRows(db: DatabaseSync, sessionId: string): MessageRow[] {
+	return db
+		.prepare("SELECT session_id, role, content, created_at, seq, meta_json FROM messages WHERE session_id = ? ORDER BY seq ASC, id ASC")
+		.all(sessionId) as unknown as MessageRow[];
+}
+
+function reviewSession(db: DatabaseSync, sessionId: string): ReviewFinding[] {
+	const session = getSessionRow(db, sessionId);
+	if (!session) return [];
+	const messages = messageRows(db, sessionId);
+	const tools = toolCallRows(db, sessionId);
+	const lifecycle = db
+		.prepare("SELECT kind, body, created_at, meta_json FROM lifecycle_events WHERE session_id = ? ORDER BY created_at ASC, id ASC")
+		.all(sessionId) as Array<{ kind: string; body: string | null; created_at: string; meta_json: string | null }>;
+	const findings: ReviewFinding[] = [];
+
+	const firstTool = tools[0];
+	const messagesBeforeFirstTool = firstTool ? Math.max(0, firstTool.seq - 1) : messages.length;
+	if (messagesBeforeFirstTool >= 20) {
+		findings.push({
+			priority: 1,
+			sessionId,
+			title: `Too much conversation before the first tool call`,
+			evidence: [`${messagesBeforeFirstTool} messages before first tool use${firstTool ? ` (${firstTool.toolName})` : ""}.`],
+			recommendation: "Move the first actionable tool prompt earlier, or make the next step/tool choice explicit sooner.",
+		});
+	} else if (messagesBeforeFirstTool >= 10) {
+		findings.push({
+			priority: 2,
+			sessionId,
+			title: `Moderate delay before the first tool call`,
+			evidence: [`${messagesBeforeFirstTool} messages before first tool use${firstTool ? ` (${firstTool.toolName})` : ""}.`],
+			recommendation: "Tighten the initial prompt so the agent reaches a tool-backed action faster.",
+		});
+	}
+
+	const repeatedTools = db
+		.prepare(
+			`
+			SELECT tool_name, COUNT(*) AS count
+			FROM tool_calls
+			WHERE session_id = ?
+			GROUP BY tool_name
+			HAVING count >= 3
+			ORDER BY count DESC, tool_name ASC
+		`,
+		)
+		.all(sessionId) as Array<{ tool_name: string; count: number }>;
+	for (const row of repeatedTools.slice(0, 3)) {
+		findings.push({
+			priority: row.count >= 5 ? 1 : 2,
+			sessionId,
+			title: `Repeated tool usage: ${row.tool_name}`,
+			evidence: [`Called ${row.tool_name} ${row.count} times.`],
+			recommendation: `Check whether ${row.tool_name} can be made more decisive or whether the prompt is causing unnecessary retry loops.`,
+		});
+	}
+
+	const failedTools = tools.filter((tool) => tool.status === "failed");
+	if (failedTools.length > 0) {
+		findings.push({
+			priority: 1,
+			sessionId,
+			title: `Tool failures occurred`,
+			evidence: failedTools.slice(0, 3).map((tool) => `${tool.toolName} (${tool.callId}) failed.`),
+			recommendation: "Inspect the failure path for missing setup, brittle parameters, or recoverable errors the agent is not handling well.",
+		});
+	}
+
+	if (session.compactionCount > 0) {
+		findings.push({
+			priority: session.compactionCount >= 2 ? 1 : 2,
+			sessionId,
+			title: `Session compaction happened ${session.compactionCount} time(s)`,
+			evidence: lifecycle
+				.filter((entry) => entry.kind === "session_before_compact")
+				.slice(0, 3)
+				.map((entry) => `${entry.created_at}: ${entry.body ?? "compaction"}`),
+			recommendation: "Review whether the prompt or task shape is too long-lived for the current context window and whether restart instructions need to be clearer.",
+		});
+	}
+
+	if (session.toolCallCount === 0 && session.messageCount > 0) {
+		findings.push({
+			priority: 1,
+			sessionId,
+			title: "Session completed without tool use",
+			evidence: [`${session.messageCount} messages, 0 tool calls.`],
+			recommendation: "Adjust the prompt to bias the agent toward using tools earlier when doing work that should be grounded in repository state.",
+		});
+	}
+
+	if (session.messageCount >= 120) {
+		findings.push({
+			priority: 2,
+			sessionId,
+			title: "Very long conversation",
+			evidence: [`${session.messageCount} total messages.`],
+			recommendation: "Reduce unnecessary back-and-forth by making success criteria and tool usage constraints more explicit.",
+		});
+	}
+
+	if (findings.length === 0) {
+		findings.push({
+			priority: 3,
+			sessionId,
+			title: "No obvious process regression detected",
+			evidence: [`${session.messageCount} messages, ${session.toolCallCount} tool calls, ${session.compactionCount} compactions.`],
+			recommendation: "Use this session as a baseline and compare it against runs that feel slower or less reliable.",
+		});
+	}
+
+	return findings;
+}
+
+function buildReviewRecommendations(findings: ReviewFinding[]): string[] {
+	const recommendations = new Set<string>();
+	for (const finding of findings) recommendations.add(finding.recommendation);
+	return [...recommendations].slice(0, 6);
+}
+
+function reviewReport(db: DatabaseSync, sessionIds?: string[]): ReviewReport {
+	const resolved = normalizeSessionIds(db, sessionIds);
+	const findings = resolved.flatMap((sessionId) => reviewSession(db, sessionId)).sort((a, b) => {
+		if (a.priority !== b.priority) return a.priority - b.priority;
+		if (a.sessionId !== b.sessionId) return a.sessionId.localeCompare(b.sessionId);
+		return a.title.localeCompare(b.title);
+	});
+	return {
+		scope: resolved.length > 0 ? `Recent completed sessions: ${resolved.join(", ")}` : "No completed sessions available",
+		sessionIds: resolved,
+		sessionsReviewed: resolved.length,
+		findings,
+		recommendations: buildReviewRecommendations(findings),
+	};
+}
+
+function formatReviewReport(report: ReviewReport): string {
+	const lines = [
+		"Transcript review report",
+		`Scope: ${report.scope}`,
+		`Sessions reviewed: ${report.sessionsReviewed}`,
+		`Findings: ${report.findings.length}`,
+	];
+	if (report.findings.length === 0) {
+		lines.push("", "No completed sessions found to review.");
+		return lines.join("\n");
+	}
+	lines.push("", "Findings:");
+	for (const finding of report.findings.slice(0, 12)) {
+		lines.push(`- [P${finding.priority}] ${finding.title} (${finding.sessionId})`);
+		for (const evidence of finding.evidence.slice(0, 3)) lines.push(`  Evidence: ${evidence}`);
+		lines.push(`  Recommendation: ${finding.recommendation}`);
+	}
+	if (report.findings.length > 12) lines.push(`- ${report.findings.length - 12} additional finding(s) omitted.`);
+	if (report.recommendations.length > 0) {
+		lines.push("", "Top recommendations:");
+		for (const recommendation of report.recommendations) lines.push(`- ${recommendation}`);
+	}
+	return lines.join("\n");
 }
 
 function exportSession(db: DatabaseSync, sessionId: string): string {
@@ -571,60 +771,27 @@ function addAnnotation(
 }
 
 function analyzePatterns(db: DatabaseSync, sessionId?: string): string {
-	const sessions = sessionId
-		? [getSessionRow(db, sessionId)].filter((row): row is ReviewSession => !!row)
-		: (db.prepare("SELECT id FROM sessions ORDER BY last_seen_at DESC LIMIT 10").all() as Array<{ id: string }>).map((row) =>
-				getSessionRow(db, row.id),
-			).filter((row): row is ReviewSession => !!row);
-	if (sessions.length === 0) return "No sessions available for analysis.";
+	const resolved = sessionId ? normalizeSessionIds(db, [sessionId]) : recentCompletedSessionIds(db, 5);
+	if (resolved.length === 0) return "No completed sessions available for analysis.";
+	return formatReviewReport(reviewReport(db, resolved));
+}
 
-	const findings: string[] = [];
-	for (const session of sessions) {
-		const firstTool = db
-			.prepare("SELECT tool_name, seq FROM tool_calls WHERE session_id = ? ORDER BY seq ASC LIMIT 1")
-			.get(session.id) as { tool_name: string; seq: number } | undefined;
-		const repeatedToolRows = db
-			.prepare(
-				`
-				SELECT tool_name, COUNT(*) AS count
-				FROM tool_calls
-				WHERE session_id = ?
-				GROUP BY tool_name
-				HAVING count >= 3
-				ORDER BY count DESC, tool_name ASC
-				LIMIT 5
-			`,
-			)
-			.all(session.id) as Array<{ tool_name: string; count: number }>;
-		const compactions = session.compactionCount;
-		const messageCount = session.messageCount;
-		const toolCount = session.toolCallCount;
-		const beforeToolMessages = firstTool ? firstTool.seq - 1 : messageCount;
-		if (beforeToolMessages > 12) {
-			findings.push(`- ${session.id}: ${beforeToolMessages} messages before first tool call (${firstTool?.tool_name ?? "none"}).`);
-		}
-		if (compactions > 0) {
-			findings.push(`- ${session.id}: ${compactions} compaction event(s).`);
-		}
-		if (repeatedToolRows.length > 0) {
-			findings.push(
-				`- ${session.id}: repeated tools -> ${repeatedToolRows.map((row) => `${row.tool_name} (${row.count})`).join(", ")}`,
-			);
-		}
-		if (toolCount === 0 && messageCount > 0) {
-			findings.push(`- ${session.id}: conversation recorded with no tool calls.`);
-		}
+function parseReviewArgs(rest: string): { limit?: number; sessionIds?: string[] } {
+	const tokens: string[] = rest.trim().match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+	if (tokens.length === 0) return {};
+	const limitFlagIndex = tokens.indexOf("--limit");
+	if (limitFlagIndex >= 0 && tokens[limitFlagIndex + 1]) {
+		const limit = Number.parseInt(tokens[limitFlagIndex + 1].replace(/^"|"$/g, ""), 10);
+		const sessionIds = tokens.filter((token, index) => token !== "--limit" && index !== limitFlagIndex + 1).map((token) => token.replace(/^"|"$/g, ""));
+		return {
+			limit: Number.isFinite(limit) ? limit : undefined,
+			sessionIds: sessionIds.length > 0 ? sessionIds : undefined,
+		};
 	}
-	if (findings.length === 0) return "No obvious transcript anomalies found in the sampled sessions.";
-	return [
-		"Transcript review findings:",
-		...findings,
-		"",
-		"Suggested follow-up actions:",
-		"- Inspect sessions with long pre-tool chat to tighten prompting or tool routing.",
-		"- Review compaction-heavy sessions for restart or context-loss regressions.",
-		"- Look for repeated tool usage to reduce loops or redundant checks.",
-	].join("\n");
+	if (tokens.length === 1 && /^\d+$/.test(tokens[0])) {
+		return { limit: Number.parseInt(tokens[0], 10) };
+	}
+	return { sessionIds: tokens.map((token) => token.replace(/^"|"$/g, "")) };
 }
 
 function sessionFromContext(ctx: ExtensionContext): string {
@@ -743,6 +910,7 @@ export default function (pi: ExtensionAPI) {
 						"  /transcript-review list [limit]",
 						"  /transcript-review show [sessionId]",
 						"  /transcript-review export [sessionId]",
+						"  /transcript-review review [limit|sessionIds...]",
 						"  /transcript-review analyze [sessionId]",
 						"  /transcript-review annotate <sessionId> <label> <body>",
 					].join("\n"),
@@ -779,6 +947,12 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === "analyze") {
 				ctx.ui.notify(analyzePatterns(db, sessionId), "info");
+				return;
+			}
+			if (command === "review") {
+				const args = parseReviewArgs(rest.join(" "));
+				const report = reviewReport(db, args.sessionIds && args.sessionIds.length > 0 ? args.sessionIds : undefined);
+				ctx.ui.notify(formatReviewReport(report), "info");
 				return;
 			}
 			if (command === "annotate") {
@@ -881,6 +1055,30 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
 			const db = openDb(ctx);
 			return { content: [{ type: "text", text: analyzePatterns(db, params.sessionId) }], details: {} };
+		},
+	});
+
+	pi.registerTool({
+		name: "transcript_review_review_sessions",
+		label: "Review Transcript Sessions",
+		description: "Review the most recent completed transcript sessions and return actionable findings.",
+		promptSnippet: "Review recent completed transcript sessions for process improvements.",
+		promptGuidelines: [
+			"Use this on demand when the user explicitly asks for a review.",
+			"Default to the most recent completed sessions unless specific session ids are provided.",
+			"Return actionable findings and concrete next-step recommendations.",
+		],
+		parameters: Type.Object({
+			limit: Type.Optional(Type.Number({ description: "How many recent completed sessions to review", default: 5 })),
+			sessionIds: Type.Optional(Type.Array(Type.String(), { description: "Explicit session ids to review instead of the recent default" })),
+		}),
+		async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
+			const db = openDb(ctx);
+			const sessionIds =
+				Array.isArray(params.sessionIds) && params.sessionIds.length > 0
+					? params.sessionIds.map((item: unknown) => String(item))
+					: recentCompletedSessionIds(db, Math.max(1, Math.min(20, params.limit ?? 5)));
+			return { content: [{ type: "text", text: formatReviewReport(reviewReport(db, sessionIds)) }], details: {} };
 		},
 	});
 }
