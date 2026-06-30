@@ -2,12 +2,14 @@
 
 This repo implements the loop detector plan as a small plugin package plus a reusable runtime core.
 
+Deprecated in favor of the merged `pi-ralph-loop-detector` package at the monorepo root. Keep this around only for compatibility and low-risk reuse.
+
 ## Included
 
 - Rolling event buffer with compact retained state
 - Deterministic heuristics for suspicious repeated behavior
 - Evidence packet generation sized for isolated subagent judge calls
-- Judge bridge with `continue`, `stop`, and `steer` outcomes
+- Judge bridge that offloads loop review to a separate `pi` subprocess and returns `continue`, `stop`, or `steer`
 - Sticky halt handling until reset
 - Node tests covering positive, negative, and recovery paths
 
@@ -39,6 +41,7 @@ if (outcome?.judgeOutcome.action === "steer") {
 
 - The detector uses only stable runtime signals from the plan: messages, tool calls, tool results, failures, and normalized arguments.
 - The judge bridge should be isolated from the parent transcript and should return structured JSON.
+- `steer` is a detector output, not a request to judge the current session in place.
 - `stop` is sticky in the host runtime until an explicit reset.
 
 ## Optional Project Config

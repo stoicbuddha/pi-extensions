@@ -3,6 +3,17 @@ import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import {
+	buildReviewPrompt,
+	formatTranscriptReviewBundle,
+	formatTranscriptReviewSessionBundle,
+	parseReviewArgs,
+} from "./review-helpers.js";
+import {
+	buildTranscriptReviewBundleFromDb,
+	buildTranscriptReviewSessionBundleFromDb,
+	resolveReviewSessionIds,
+} from "./review-store.js";
 
 type SessionStatus = "active" | "completed" | "paused";
 type MessageRole = "user" | "assistant" | "tool" | "system" | "other";
@@ -53,20 +64,35 @@ interface ToolCallRow {
 	meta?: Record<string, unknown>;
 }
 
-interface ReviewFinding {
-	priority: number;
-	sessionId: string;
-	title: string;
-	evidence: string[];
-	recommendation: string;
+interface TranscriptSessionExport {
+	session: ReviewSession;
+	messages: MessageRow[];
+	toolCalls: ToolCallRow[];
+	lifecycleEvents: Array<{ kind: string; body: string | null; createdAt: string; meta: Record<string, unknown> }>;
+	annotations: Array<{ label: string; body: string; createdAt: string; targetKind: string; targetId: string | null; createdBy: string; meta: Record<string, unknown> }>;
+	metrics: Array<{ name: string; value: number; unit: string | null; createdAt: string; meta: Record<string, unknown> }>;
 }
 
-interface ReviewReport {
+type TranscriptReviewSliceKind = "full-session" | "front-of-session" | "around-compaction";
+
+interface TranscriptReviewSelection {
+	sessionIds?: string[];
+	limit?: number;
+	sliceKind?: TranscriptReviewSliceKind;
+	windowSize?: number;
+}
+
+interface TranscriptReviewBundle {
+	instructions: string;
 	scope: string;
 	sessionIds: string[];
-	sessionsReviewed: number;
-	findings: ReviewFinding[];
-	recommendations: string[];
+	slices: Array<{
+		sessionId: string;
+		sliceKind: TranscriptReviewSliceKind;
+		description: string;
+		session: TranscriptSessionExport;
+	}>;
+	sessions: TranscriptSessionExport[];
 }
 
 const STATE_DIR = ".pi-transcript-review";
@@ -542,20 +568,6 @@ function listSessions(db: DatabaseSync, limit = 20): string {
 	.join("\n");
 }
 
-function recentCompletedSessionIds(db: DatabaseSync, limit = 5): string[] {
-	const rows = db
-		.prepare("SELECT id FROM sessions WHERE status = 'completed' ORDER BY last_seen_at DESC, started_at DESC LIMIT ?")
-		.all(limit) as Array<{ id: string }>;
-	return rows.map((row) => row.id);
-}
-
-function normalizeSessionIds(db: DatabaseSync, sessionIds?: string[]): string[] {
-	if (!sessionIds || sessionIds.length === 0) return recentCompletedSessionIds(db, 5);
-	const unique = new Set<string>();
-	for (const id of sessionIds.map((item) => item.trim()).filter(Boolean)) unique.add(id);
-	return [...unique].filter((id) => !!getSessionRow(db, id));
-}
-
 function toolCallRows(db: DatabaseSync, sessionId: string): ToolCallRow[] {
 	return db
 		.prepare(
@@ -570,187 +582,9 @@ function messageRows(db: DatabaseSync, sessionId: string): MessageRow[] {
 		.all(sessionId) as unknown as MessageRow[];
 }
 
-function reviewSession(db: DatabaseSync, sessionId: string): ReviewFinding[] {
-	const session = getSessionRow(db, sessionId);
-	if (!session) return [];
-	const messages = messageRows(db, sessionId);
-	const tools = toolCallRows(db, sessionId);
-	const lifecycle = db
-		.prepare("SELECT kind, body, created_at, meta_json FROM lifecycle_events WHERE session_id = ? ORDER BY created_at ASC, id ASC")
-		.all(sessionId) as Array<{ kind: string; body: string | null; created_at: string; meta_json: string | null }>;
-	const findings: ReviewFinding[] = [];
-
-	const firstTool = tools[0];
-	const messagesBeforeFirstTool = firstTool ? Math.max(0, firstTool.seq - 1) : messages.length;
-	if (messagesBeforeFirstTool >= 20) {
-		findings.push({
-			priority: 1,
-			sessionId,
-			title: `Too much conversation before the first tool call`,
-			evidence: [`${messagesBeforeFirstTool} messages before first tool use${firstTool ? ` (${firstTool.toolName})` : ""}.`],
-			recommendation: "Move the first actionable tool prompt earlier, or make the next step/tool choice explicit sooner.",
-		});
-	} else if (messagesBeforeFirstTool >= 10) {
-		findings.push({
-			priority: 2,
-			sessionId,
-			title: `Moderate delay before the first tool call`,
-			evidence: [`${messagesBeforeFirstTool} messages before first tool use${firstTool ? ` (${firstTool.toolName})` : ""}.`],
-			recommendation: "Tighten the initial prompt so the agent reaches a tool-backed action faster.",
-		});
-	}
-
-	const repeatedTools = db
-		.prepare(
-			`
-			SELECT tool_name, COUNT(*) AS count
-			FROM tool_calls
-			WHERE session_id = ?
-			GROUP BY tool_name
-			HAVING count >= 3
-			ORDER BY count DESC, tool_name ASC
-		`,
-		)
-		.all(sessionId) as Array<{ tool_name: string; count: number }>;
-	for (const row of repeatedTools.slice(0, 3)) {
-		findings.push({
-			priority: row.count >= 5 ? 1 : 2,
-			sessionId,
-			title: `Repeated tool usage: ${row.tool_name}`,
-			evidence: [`Called ${row.tool_name} ${row.count} times.`],
-			recommendation: `Check whether ${row.tool_name} can be made more decisive or whether the prompt is causing unnecessary retry loops.`,
-		});
-	}
-
-	const failedTools = tools.filter((tool) => tool.status === "failed");
-	if (failedTools.length > 0) {
-		findings.push({
-			priority: 1,
-			sessionId,
-			title: `Tool failures occurred`,
-			evidence: failedTools.slice(0, 3).map((tool) => `${tool.toolName} (${tool.callId}) failed.`),
-			recommendation: "Inspect the failure path for missing setup, brittle parameters, or recoverable errors the agent is not handling well.",
-		});
-	}
-
-	if (session.compactionCount > 0) {
-		findings.push({
-			priority: session.compactionCount >= 2 ? 1 : 2,
-			sessionId,
-			title: `Session compaction happened ${session.compactionCount} time(s)`,
-			evidence: lifecycle
-				.filter((entry) => entry.kind === "session_before_compact")
-				.slice(0, 3)
-				.map((entry) => `${entry.created_at}: ${entry.body ?? "compaction"}`),
-			recommendation: "Review whether the prompt or task shape is too long-lived for the current context window and whether restart instructions need to be clearer.",
-		});
-	}
-
-	if (session.toolCallCount === 0 && session.messageCount > 0) {
-		findings.push({
-			priority: 1,
-			sessionId,
-			title: "Session completed without tool use",
-			evidence: [`${session.messageCount} messages, 0 tool calls.`],
-			recommendation: "Adjust the prompt to bias the agent toward using tools earlier when doing work that should be grounded in repository state.",
-		});
-	}
-
-	if (session.messageCount >= 120) {
-		findings.push({
-			priority: 2,
-			sessionId,
-			title: "Very long conversation",
-			evidence: [`${session.messageCount} total messages.`],
-			recommendation: "Reduce unnecessary back-and-forth by making success criteria and tool usage constraints more explicit.",
-		});
-	}
-
-	if (findings.length === 0) {
-		findings.push({
-			priority: 3,
-			sessionId,
-			title: "No obvious process regression detected",
-			evidence: [`${session.messageCount} messages, ${session.toolCallCount} tool calls, ${session.compactionCount} compactions.`],
-			recommendation: "Use this session as a baseline and compare it against runs that feel slower or less reliable.",
-		});
-	}
-
-	return findings;
-}
-
-function buildReviewRecommendations(findings: ReviewFinding[]): string[] {
-	const recommendations = new Set<string>();
-	for (const finding of findings) recommendations.add(finding.recommendation);
-	return [...recommendations].slice(0, 6);
-}
-
-function reviewReport(db: DatabaseSync, sessionIds?: string[]): ReviewReport {
-	const resolved = normalizeSessionIds(db, sessionIds);
-	const findings = resolved.flatMap((sessionId) => reviewSession(db, sessionId)).sort((a, b) => {
-		if (a.priority !== b.priority) return a.priority - b.priority;
-		if (a.sessionId !== b.sessionId) return a.sessionId.localeCompare(b.sessionId);
-		return a.title.localeCompare(b.title);
-	});
-	return {
-		scope: resolved.length > 0 ? `Recent completed sessions: ${resolved.join(", ")}` : "No completed sessions available",
-		sessionIds: resolved,
-		sessionsReviewed: resolved.length,
-		findings,
-		recommendations: buildReviewRecommendations(findings),
-	};
-}
-
-function formatReviewReport(report: ReviewReport): string {
-	const lines = [
-		"Transcript review report",
-		`Scope: ${report.scope}`,
-		`Sessions reviewed: ${report.sessionsReviewed}`,
-		`Findings: ${report.findings.length}`,
-	];
-	if (report.findings.length === 0) {
-		lines.push("", "No completed sessions found to review.");
-		return lines.join("\n");
-	}
-	lines.push("", "Findings:");
-	for (const finding of report.findings.slice(0, 12)) {
-		lines.push(`- [P${finding.priority}] ${finding.title} (${finding.sessionId})`);
-		for (const evidence of finding.evidence.slice(0, 3)) lines.push(`  Evidence: ${evidence}`);
-		lines.push(`  Recommendation: ${finding.recommendation}`);
-	}
-	if (report.findings.length > 12) lines.push(`- ${report.findings.length - 12} additional finding(s) omitted.`);
-	if (report.recommendations.length > 0) {
-		lines.push("", "Top recommendations:");
-		for (const recommendation of report.recommendations) lines.push(`- ${recommendation}`);
-	}
-	return lines.join("\n");
-}
-
 function exportSession(db: DatabaseSync, sessionId: string): string {
-	const session = getSessionRow(db, sessionId);
-	if (!session) return `Session ${sessionId} not found.`;
-	const messages = db
-		.prepare("SELECT role, content, created_at, seq, meta_json FROM messages WHERE session_id = ? ORDER BY seq ASC")
-		.all(sessionId) as Array<{ role: string; content: string; created_at: string; seq: number; meta_json: string | null }>;
-	const tools = db
-		.prepare(
-			"SELECT call_id, tool_name, status, input_json, output_json, created_at, finished_at, seq, meta_json FROM tool_calls WHERE session_id = ? ORDER BY seq ASC, id ASC",
-		)
-		.all(sessionId) as Array<{
-		call_id: string;
-		tool_name: string;
-		status: string;
-		input_json: string | null;
-		output_json: string | null;
-		created_at: string;
-		finished_at: string | null;
-		seq: number;
-		meta_json: string | null;
-	}>;
-	const lifecycle = db
-		.prepare("SELECT kind, body, created_at, meta_json FROM lifecycle_events WHERE session_id = ? ORDER BY created_at ASC, id ASC")
-		.all(sessionId) as Array<{ kind: string; body: string | null; created_at: string; meta_json: string | null }>;
-	return JSON.stringify({ session, messages, tools, lifecycle }, null, 2);
+	const session = getTranscriptSessionExport(db, sessionId);
+	return session ? JSON.stringify(session, null, 2) : `Session ${sessionId} not found.`;
 }
 
 function addAnnotation(
@@ -770,28 +604,70 @@ function addAnnotation(
 	return `${label}: ${body}`;
 }
 
-function analyzePatterns(db: DatabaseSync, sessionId?: string): string {
-	const resolved = sessionId ? normalizeSessionIds(db, [sessionId]) : recentCompletedSessionIds(db, 5);
-	if (resolved.length === 0) return "No completed sessions available for analysis.";
-	return formatReviewReport(reviewReport(db, resolved));
+function parseMetaJson(value: string | null | undefined): Record<string, unknown> {
+	return parseJsonObject(value);
 }
 
-function parseReviewArgs(rest: string): { limit?: number; sessionIds?: string[] } {
-	const tokens: string[] = rest.trim().match(/(?:[^\s"]+|"[^"]*")+/g) || [];
-	if (tokens.length === 0) return {};
-	const limitFlagIndex = tokens.indexOf("--limit");
-	if (limitFlagIndex >= 0 && tokens[limitFlagIndex + 1]) {
-		const limit = Number.parseInt(tokens[limitFlagIndex + 1].replace(/^"|"$/g, ""), 10);
-		const sessionIds = tokens.filter((token, index) => token !== "--limit" && index !== limitFlagIndex + 1).map((token) => token.replace(/^"|"$/g, ""));
-		return {
-			limit: Number.isFinite(limit) ? limit : undefined,
-			sessionIds: sessionIds.length > 0 ? sessionIds : undefined,
-		};
-	}
-	if (tokens.length === 1 && /^\d+$/.test(tokens[0])) {
-		return { limit: Number.parseInt(tokens[0], 10) };
-	}
-	return { sessionIds: tokens.map((token) => token.replace(/^"|"$/g, "")) };
+function getTranscriptSessionExport(db: DatabaseSync, sessionId: string): TranscriptSessionExport | null {
+	const session = getSessionRow(db, sessionId);
+	if (!session) return null;
+	const messages = db
+		.prepare("SELECT session_id, role, content, created_at, seq, meta_json FROM messages WHERE session_id = ? ORDER BY seq ASC, id ASC")
+		.all(sessionId) as unknown as MessageRow[];
+	const toolCalls = db
+		.prepare(
+			"SELECT session_id, call_id, tool_name, status, input_json, output_json, created_at, finished_at, seq, meta_json FROM tool_calls WHERE session_id = ? ORDER BY seq ASC, id ASC",
+		)
+		.all(sessionId) as unknown as ToolCallRow[];
+	const lifecycleEvents = db
+		.prepare("SELECT kind, body, created_at, meta_json FROM lifecycle_events WHERE session_id = ? ORDER BY created_at ASC, id ASC")
+		.all(sessionId) as Array<{ kind: string; body: string | null; created_at: string; meta_json: string | null }>;
+	const annotations = db
+		.prepare("SELECT target_kind, target_id, label, body, created_at, created_by, meta_json FROM annotations WHERE session_id = ? ORDER BY created_at ASC, id ASC")
+		.all(sessionId) as Array<{
+		target_kind: string;
+		target_id: string | null;
+		label: string;
+		body: string;
+		created_at: string;
+		created_by: string;
+		meta_json: string | null;
+	}>;
+	const metrics = db
+		.prepare("SELECT name, value, unit, created_at, meta_json FROM metrics WHERE session_id = ? ORDER BY created_at ASC, id ASC")
+		.all(sessionId) as Array<{ name: string; value: number; unit: string | null; created_at: string; meta_json: string | null }>;
+	return {
+		session,
+		messages,
+		toolCalls,
+		lifecycleEvents: lifecycleEvents.map((row) => ({
+			kind: row.kind,
+			body: row.body,
+			createdAt: row.created_at,
+			meta: parseMetaJson(row.meta_json),
+		})),
+		annotations: annotations.map((row) => ({
+			label: row.label,
+			body: row.body,
+			createdAt: row.created_at,
+			targetKind: row.target_kind,
+			targetId: row.target_id,
+			createdBy: row.created_by,
+			meta: parseMetaJson(row.meta_json),
+		})),
+		metrics: metrics.map((row) => ({
+			name: row.name,
+			value: row.value,
+			unit: row.unit,
+			createdAt: row.created_at,
+			meta: parseMetaJson(row.meta_json),
+		})),
+	};
+}
+
+function analyzePatterns(db: DatabaseSync, sessionId?: string): string {
+	const bundle = buildTranscriptReviewBundleFromDb(db, sessionId ? { sessionIds: [sessionId] } : {});
+	return formatTranscriptReviewBundle(bundle);
 }
 
 function sessionFromContext(ctx: ExtensionContext): string {
@@ -897,7 +773,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("transcript-review", {
-		description: "Inspect transcript review state and reports",
+		description: "Inspect transcript review state and queue transcript reviews",
 		handler: async (args: string, ctx: any) => {
 			const [command, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			const db = openDb(ctx);
@@ -910,7 +786,7 @@ export default function (pi: ExtensionAPI) {
 						"  /transcript-review list [limit]",
 						"  /transcript-review show [sessionId]",
 						"  /transcript-review export [sessionId]",
-						"  /transcript-review review [limit|sessionIds...]",
+						"  /transcript-review review [sessionId] [--slice full-session|front-of-session|around-compaction] [--window N] [--page-chars N]",
 						"  /transcript-review analyze [sessionId]",
 						"  /transcript-review annotate <sessionId> <label> <body>",
 					].join("\n"),
@@ -951,8 +827,27 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (command === "review") {
 				const args = parseReviewArgs(rest.join(" "));
-				const report = reviewReport(db, args.sessionIds && args.sessionIds.length > 0 ? args.sessionIds : undefined);
-				ctx.ui.notify(formatReviewReport(report), "info");
+				const resolvedSessionIds = resolveReviewSessionIds(db, {
+					...args,
+				});
+				const sessionId = resolvedSessionIds[0] ?? currentSessionId(ctx) ?? null;
+				if (!sessionId) {
+					ctx.ui.notify("No completed transcript session found to review.", "warning");
+					return;
+				}
+				const requestedSessionIds = [sessionId];
+				const reviewPrompt = buildReviewPrompt(args, requestedSessionIds);
+				try {
+					if (ctx.isIdle()) await pi.sendUserMessage(reviewPrompt);
+					else await pi.sendUserMessage(reviewPrompt, { deliverAs: "followUp" });
+					ctx.ui.notify(
+						`Queued transcript review for: ${requestedSessionIds[0]}`,
+						"info",
+					);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Failed to queue transcript review: ${message}`, "error");
+				}
 				return;
 			}
 			if (command === "annotate") {
@@ -1045,40 +940,125 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerTool({
 		name: "transcript_review_analyze",
-		label: "Analyze Transcript Patterns",
-		description: "Generate a lightweight review report from captured sessions.",
-		promptSnippet: "Look for transcript review patterns across captured sessions.",
-		promptGuidelines: ["Use this to identify repeated tool calls, compaction pressure, or long pre-tool conversations."],
+		label: "Analyze Transcript Bundle",
+		description: "Return a raw transcript bundle for model-driven review.",
+		promptSnippet: "Load raw transcript bundles for model-driven review.",
+		promptGuidelines: [
+			"Use this when you need real transcript evidence before drawing conclusions.",
+			"Do not rely on deterministic heuristics from the extension; inspect the raw transcript bundle yourself.",
+		],
 		parameters: Type.Object({
 			sessionId: Type.Optional(Type.String({ description: "Optional single session to analyze" })),
+			sliceKind: Type.Optional(Type.Union([
+				Type.Literal("full-session"),
+				Type.Literal("front-of-session"),
+				Type.Literal("around-compaction"),
+			])),
+			windowSize: Type.Optional(Type.Number({ description: "Optional slice window size for front-of-session or around-compaction" })),
 		}),
 		async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
 			const db = openDb(ctx);
-			return { content: [{ type: "text", text: analyzePatterns(db, params.sessionId) }], details: {} };
+			return {
+				content: [
+					{
+						type: "text",
+						text: formatTranscriptReviewBundle(
+							buildTranscriptReviewBundleFromDb(db, {
+								sessionIds: params.sessionId ? [params.sessionId] : undefined,
+								sliceKind: params.sliceKind,
+								windowSize: params.windowSize,
+							}),
+						),
+					},
+				],
+				details: {},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "transcript_review_review_session",
+		label: "Review Single Transcript Session",
+		description: "Load a single transcript session page by page for model-driven review.",
+		promptSnippet: "Review one transcript session a page at a time.",
+		promptGuidelines: [
+			"Use this for single-session reviews when the transcript is too large to fit at once.",
+			"Start at page 0 and continue with nextPage until hasMore is false.",
+			"Do not synthesize the final review until all pages have been read.",
+			"Use the paged bundle as the only source of truth.",
+			"Treat pageChars as a character limit, not a token budget.",
+			"For each finding, cite exact event evidence, distinguish regressions from normal tradeoffs, and include one concrete process change.",
+		],
+		parameters: Type.Object({
+			sessionId: Type.String({ description: "Session identifier" }),
+			page: Type.Optional(Type.Number({ description: "Zero-based page number", default: 0 })),
+			pageChars: Type.Optional(Type.Number({ description: "Maximum serialized characters per page", default: 1000 })),
+			pageBudget: Type.Optional(Type.Number({ description: "Legacy alias for pageChars" })),
+			pageSize: Type.Optional(Type.Number({ description: "Legacy alias for pageChars" })),
+		}),
+		async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
+			const db = openDb(ctx);
+			const bundle = buildTranscriptReviewSessionBundleFromDb(db, {
+				sessionId: params.sessionId,
+				page: params.page,
+				pageChars: params.pageChars,
+				pageBudget: params.pageBudget,
+				pageSize: params.pageSize,
+			});
+			if (!bundle) {
+				return { content: [{ type: "text", text: `Session ${params.sessionId} not found.` }], details: {} };
+			}
+			return {
+				content: [
+						{
+							type: "text",
+							text: formatTranscriptReviewSessionBundle(bundle),
+						},
+				],
+				details: {},
+			};
 		},
 	});
 
 	pi.registerTool({
 		name: "transcript_review_review_sessions",
 		label: "Review Transcript Sessions",
-		description: "Review the most recent completed transcript sessions and return actionable findings.",
-		promptSnippet: "Review recent completed transcript sessions for process improvements.",
+		description: "Load transcript bundles so the agent can review them with a model-driven rubric.",
+		promptSnippet: "Load transcript bundles for a model-driven review turn.",
 		promptGuidelines: [
 			"Use this on demand when the user explicitly asks for a review.",
-			"Default to the most recent completed sessions unless specific session ids are provided.",
-			"Return actionable findings and concrete next-step recommendations.",
+			"Use the returned transcript bundle as the source of truth.",
+			"Return only findings that are supported by the bundle.",
+			"Each finding should cite evidence, distinguish regression from tradeoff, and include one concrete process change.",
 		],
 		parameters: Type.Object({
 			limit: Type.Optional(Type.Number({ description: "How many recent completed sessions to review", default: 5 })),
 			sessionIds: Type.Optional(Type.Array(Type.String(), { description: "Explicit session ids to review instead of the recent default" })),
+			sliceKind: Type.Optional(Type.Union([
+				Type.Literal("full-session"),
+				Type.Literal("front-of-session"),
+				Type.Literal("around-compaction"),
+			])),
+			windowSize: Type.Optional(Type.Number({ description: "Optional slice window size for front-of-session or around-compaction" })),
 		}),
 		async execute(_toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
 			const db = openDb(ctx);
-			const sessionIds =
-				Array.isArray(params.sessionIds) && params.sessionIds.length > 0
-					? params.sessionIds.map((item: unknown) => String(item))
-					: recentCompletedSessionIds(db, Math.max(1, Math.min(20, params.limit ?? 5)));
-			return { content: [{ type: "text", text: formatReviewReport(reviewReport(db, sessionIds)) }], details: {} };
+			return {
+				content: [
+					{
+						type: "text",
+						text: formatTranscriptReviewBundle(
+							buildTranscriptReviewBundleFromDb(db, {
+								limit: params.limit,
+								sessionIds: Array.isArray(params.sessionIds) && params.sessionIds.length > 0 ? params.sessionIds.map((item: unknown) => String(item)) : undefined,
+								sliceKind: params.sliceKind,
+								windowSize: params.windowSize,
+							}),
+						),
+					},
+				],
+				details: {},
+			};
 		},
 	});
 }

@@ -1,14 +1,15 @@
 {
   "name": "@matt/pi-transcript-review",
   "version": "0.1.0",
-  "description": "Capture Pi conversation transcripts into SQLite for later review and analysis.",
+  "description": "Capture Pi conversation transcripts into SQLite for later model-driven review and analysis.",
   "license": "MIT",
   "author": "Matt",
   "keywords": [
     "pi-package"
   ],
   "scripts": {
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.js"
   },
   "pi": {
     "extensions": [

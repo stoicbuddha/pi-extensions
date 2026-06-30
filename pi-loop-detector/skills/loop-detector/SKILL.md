@@ -6,6 +6,8 @@ disable-model-invocation: false
 
 # Loop Detector
 
+Deprecated in favor of the merged Ralph-centric package. This skill remains as a compatibility surface for the underlying detector core.
+
 Use this plugin when an agent runtime needs to detect repeated nonproductive behavior before it burns more turns.
 
 ## What It Implements
@@ -41,7 +43,7 @@ When a trigger fires, `handleEvent()` returns:
 }
 ```
 
-`judgeOutcome.action` is normalized to `continue`, `stop`, or `steer`. Host runtime code should apply `steer_message` directly if present and treat `stop` as sticky until reset.
+`judgeOutcome.action` is normalized to `continue`, `stop`, or `steer`. Host runtime code should treat `steer` as a steer request coming back from the judge, not as permission to re-judge the current session in place. The judge itself should run out-of-process; `stop` remains sticky until reset.
 
 ## Judge Contract
 
@@ -55,4 +57,4 @@ Provide an async `judge(evidence)` callback if you want isolated model review. R
 }
 ```
 
-If no judge is provided, the detector defaults to deterministic `steer` behavior after a heuristic fires.
+If no judge is provided, the detector fails closed rather than inventing a local loop decision.

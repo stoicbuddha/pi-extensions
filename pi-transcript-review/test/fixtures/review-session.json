@@ -1,0 +1,136 @@
+{
+  "session": {
+    "id": "session-alpha",
+    "workspace": "/workspace/demo",
+    "status": "completed",
+    "title": "Alpha session",
+    "startedAt": "2026-06-28T10:00:00.000Z",
+    "endedAt": "2026-06-28T10:25:00.000Z",
+    "lastSeenAt": "2026-06-28T10:25:00.000Z",
+    "messageCount": 5,
+    "toolCallCount": 1,
+    "compactionCount": 1,
+    "meta": {
+      "workspace": "/workspace/demo",
+      "source": "fixture"
+    }
+  },
+  "messages": [
+    {
+      "sessionId": "session-alpha",
+      "role": "user",
+      "content": "Please inspect the build scripts.",
+      "createdAt": "2026-06-28T10:00:00.000Z",
+      "seq": 1,
+      "meta": {
+        "turn": 1
+      }
+    },
+    {
+      "sessionId": "session-alpha",
+      "role": "assistant",
+      "content": "I will inspect the package metadata first.",
+      "createdAt": "2026-06-28T10:02:00.000Z",
+      "seq": 2,
+      "meta": {
+        "turn": 2
+      }
+    },
+    {
+      "sessionId": "session-alpha",
+      "role": "assistant",
+      "content": "I found the relevant script definitions.",
+      "createdAt": "2026-06-28T10:08:00.000Z",
+      "seq": 3,
+      "meta": {
+        "turn": 3
+      }
+    },
+    {
+      "sessionId": "session-alpha",
+      "role": "assistant",
+      "content": "Context was compacted.",
+      "createdAt": "2026-06-28T10:10:00.000Z",
+      "seq": 4,
+      "meta": {
+        "turn": 4
+      }
+    },
+    {
+      "sessionId": "session-alpha",
+      "role": "assistant",
+      "content": "I can now explain the change.",
+      "createdAt": "2026-06-28T10:12:00.000Z",
+      "seq": 5,
+      "meta": {
+        "turn": 5
+      }
+    }
+  ],
+  "toolCalls": [
+    {
+      "sessionId": "session-alpha",
+      "callId": "tool-1",
+      "toolName": "read_file",
+      "status": "completed",
+      "inputJson": "{\"path\":\"package.json\"}",
+      "outputJson": "{\"ok\":true}",
+      "createdAt": "2026-06-28T10:05:00.000Z",
+      "finishedAt": "2026-06-28T10:06:00.000Z",
+      "seq": 1,
+      "meta": {
+        "source": "fixture"
+      }
+    }
+  ],
+  "lifecycleEvents": [
+    {
+      "kind": "session_start",
+      "body": "session opened",
+      "createdAt": "2026-06-28T10:00:00.000Z",
+      "meta": {
+        "source": "fixture"
+      }
+    },
+    {
+      "kind": "session_before_compact",
+      "body": "context pressure rose",
+      "createdAt": "2026-06-28T10:10:00.000Z",
+      "meta": {
+        "source": "fixture"
+      }
+    },
+    {
+      "kind": "session_shutdown",
+      "body": "session closed",
+      "createdAt": "2026-06-28T10:25:00.000Z",
+      "meta": {
+        "source": "fixture"
+      }
+    }
+  ],
+  "annotations": [
+    {
+      "label": "good-recovery",
+      "body": "Recovered after compaction without losing the task.",
+      "createdAt": "2026-06-28T10:15:00.000Z",
+      "targetKind": "session",
+      "targetId": "session-alpha",
+      "createdBy": "agent",
+      "meta": {
+        "source": "fixture"
+      }
+    }
+  ],
+  "metrics": [
+    {
+      "name": "message_count",
+      "value": 5,
+      "unit": "count",
+      "createdAt": "2026-06-28T10:25:00.000Z",
+      "meta": {
+        "source": "fixture"
+      }
+    }
+  ]
+}

@@ -18,6 +18,7 @@
       "./files-widget/index.ts",
       "./raw-paste/index.ts",
       "./pi-ralph-wiggum/index.ts",
+      "./pi-ralph-loop-detector/index.ts",
       "./session-recap/index.ts",
       "./tab-status/tab-status.ts",
       "./usage-extension/index.ts"
@@ -25,7 +26,8 @@
     "skills": [
       "./extending-pi/SKILL.md",
       "./extending-pi/skill-creator/SKILL.md",
-      "./pi-ralph-wiggum/SKILL.md"
+      "./pi-ralph-wiggum/SKILL.md",
+      "./pi-ralph-loop-detector/SKILL.md"
     ]
   },
   "peerDependencies": {

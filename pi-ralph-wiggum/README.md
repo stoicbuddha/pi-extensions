@@ -36,9 +36,8 @@ Then filter to just this extension in `~/.pi/agent/settings.json`:
 
 ## Recommended usage: just ask Pi
 You ask Pi to set up a ralph-wiggum loop.
-- Pi creates `.ralph/ralph.sqlite` as the canonical state store if it does not already exist
-- Pi imports your initial markdown into canonical structured plan state in SQLite
-- Pi renders `.ralph/<name>.md` as a generated snapshot for humans
+- Pi creates the Ralph SQLite database automatically if it does not already exist
+- Pi stores the loop state, tasks, notes, and reflections in that database
 - You let Pi know:
   1. What the task is and completion / tests to run
   2. How many items to process per iteration
@@ -55,12 +54,13 @@ If you hit `esc`, you can run `/ralph-stop` to clear the loop. Alternatively, ju
 
 ### State and migration
 
-Ralph now keeps loop state in `.ralph/ralph.sqlite` and treats the markdown snapshot as derived output.
+Ralph keeps loop state in SQLite and treats the database as the only canonical source of truth.
 
 - The SQLite database and schema are created automatically on first use.
-- Existing projects with legacy `.ralph/<name>.state.json` and `.ralph/<name>.plan.json` files are imported automatically the first time Ralph opens that workspace.
-- If both SQLite state and legacy files exist, SQLite wins.
-- The generated `.md` snapshot remains for human inspection and can be regenerated at any time with `/ralph render-plan` or `ralph_render_plan`.
+- Existing state is read from SQLite only.
+- There are no extra generated files or sidecar files.
+- Use the plan and task tools to inspect and update state.
+- If a workspace-level `RALPH.md` exists, Ralph injects it into the loop prompt as extra top-of-mind guidance.
 
 ## Commands
 
@@ -74,12 +74,13 @@ Ralph now keeps loop state in `.ralph/ralph.sqlite` and treats the markdown snap
 | `/ralph show-plan [loop]` | Show structured plan summary |
 | `/ralph list-tasks [loop] [--status STATUS]` | Show structured tasks |
 | `/ralph task <done\|block> <task-id> [loop]` | Quick task status update |
-| `/ralph render-plan [loop]` | Regenerate markdown snapshot |
+| `/ralph set-iteration <N> [loop]` | Set the current iteration value (0+) |
+| `/ralph set-session-strategy <followUp\|newSession> [loop]` | Update the next-iteration session strategy |
 | `/ralph list --archived` | Show archived loops |
 | `/ralph archive <name>` | Move loop to archive |
 | `/ralph clean [--all]` | Clean completed loops |
 | `/ralph cancel <name>` | Delete a loop |
-| `/ralph nuke [--yes]` | Delete all .ralph data |
+| `/ralph nuke [--yes]` | Delete all Ralph database data |
 
 ### Options for start
 
@@ -96,8 +97,8 @@ Ralph now keeps loop state in `.ralph/ralph.sqlite` and treats the markdown snap
 Session reset is configured per loop, alongside the other Ralph iteration settings.
 
 `newSession` provides a fresh provider context for each Ralph iteration. Pi keeps the visible session
-and transcript intact, but Ralph trims the messages sent to the model so the next iteration starts at
-the current Ralph prompt and task file instead of carrying the prior loop transcript.
+and transcript intact, but Ralph seeds the next iteration from the current database state instead of
+carrying the prior loop transcript.
 
 CLI example:
 
@@ -124,9 +125,9 @@ Options:
 
 ## Runtime Prompt Size
 
-Ralph stores the full canonical loop, plan, task, note, verification, reflection, and event history in `.ralph/ralph.sqlite` and renders the full `.ralph/<name>.md` snapshot for humans. Iteration prompts use a minimal next-task runtime view instead of injecting the entire history every time.
+Ralph stores the full canonical loop, plan, task, note, verification, reflection, and event history in SQLite. Iteration prompts use a minimal next-task runtime view instead of injecting the entire history every time.
 
-The runtime view includes summary counts, a small goals list, one selected next task, and instructions for fetching more context only if that next task is ambiguous. Older history stays available through the compact `ralph_get_plan` summary, `ralph_list_tasks`, and the generated plan files, but it is omitted from the prompt to keep long-running loops within model context limits.
+The runtime view includes summary counts, a small goals list, one selected next task, and instructions for fetching more context only if that next task is ambiguous. Older history stays available through `ralph_get_plan`, `ralph_list_tasks`, and the structured database state, but it is omitted from the prompt to keep long-running loops within model context limits.
 
 Each iteration prompt tells the agent to:
 
@@ -134,12 +135,12 @@ Each iteration prompt tells the agent to:
 - Call compact `ralph_get_plan` or `ralph_list_tasks` only when that task lacks enough context.
 - Mark active work with `ralph_update_task`, usually `in_progress` before work and `done` with evidence after verification.
 - Use `blocked` plus a blocker note when work cannot continue.
-- Treat `.ralph/<name>.md` as generated output and mutate canonical state only through Ralph tools.
+- Treat the database as canonical and mutate state only through Ralph tools.
 - Call the real `ralph_done` tool when the iteration should advance.
 
 ## Agent Tool
 
-The agent can self-start loops using `ralph_start`, then use plan tools such as `ralph_get_plan`, `ralph_list_tasks`, `ralph_update_task`, `ralph_add_task`, `ralph_add_note`, `ralph_record_reflection`, and `ralph_render_plan` to work without editing markdown directly:
+The agent can self-start loops using `ralph_start`, then use plan tools such as `ralph_get_plan`, `ralph_list_tasks`, `ralph_update_task`, `ralph_add_task`, `ralph_add_note`, and `ralph_record_reflection` to work without editing files directly:
 
 ```
 ralph_start({
@@ -153,7 +154,7 @@ ralph_start({
 })
 ```
 
-`taskContent` is still accepted for compatibility, but it is now imported once into structured plan state in SQLite. After that, `.ralph/<name>.md` is generated output only.
+`taskContent` is still accepted for compatibility, but it is only used to seed the initial structured plan state in SQLite.
 
 ## Credits
 

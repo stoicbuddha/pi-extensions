@@ -320,17 +320,15 @@ function getLatestAssistantMessage(event: any): string {
 
 function createJudgeBridge(pi: ExtensionAPI): JudgeBridge {
 	return async (evidence, state) => {
-		const context = state.hostContext;
-		const piAny = pi as any;
 		return evaluateLoopWithSubagent(
-			[context, piAny, context?.subagents, piAny?.subagents, context?.extensions?.["pi-subagents"], piAny?.extensions?.["pi-subagents"]],
+			pi,
 			evidence,
 			{ timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS },
 		);
 	};
 }
 
-function applyJudgeOutcome(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>, sendMessage: (prompt: string, options?: { deliverAs?: "followUp" | "steer" }) => void): void {
+function applyJudgeOutcome(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>): void {
 	if (!outcome?.intervention) return;
 	if (outcome.judgeOutcome.action === "continue") return;
 	if (state.halted) return;
@@ -341,30 +339,33 @@ function applyJudgeOutcome(state: RuntimeState, ctx: any, outcome: NonNullable<L
 		if (ctx.hasUI) {
 			ctx.ui.notify(`Loop detector halted on ${outcome.trigger.kind}; reset required.`, "warning");
 		}
+		if (typeof ctx.abort === "function" && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+			ctx.abort();
+		}
 		return;
 	}
 
-	const steerMessage = outcome.judgeOutcome.steer_message || outcome.review?.message || outcome.judgeOutcome.reason;
-	if (steerMessage) {
-		sendMessage(steerMessage, { deliverAs: "steer" });
-	}
+	state.halted = true;
+	state.haltReason = outcome.judgeOutcome.reason || outcome.trigger.kind;
 	if (ctx.hasUI) {
-		ctx.ui.notify(`Loop detector sent subagent steering for ${outcome.trigger.kind}.`, "warning");
+		const steerMessage = outcome.judgeOutcome.steer_message || outcome.review?.message || outcome.judgeOutcome.reason;
+		const suffix = steerMessage ? ` ${steerMessage}` : "";
+		ctx.ui.notify(`Loop detector requested steer on ${outcome.trigger.kind}; processing paused.${suffix}`, "warning");
+	}
+	if (typeof ctx.abort === "function" && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+		ctx.abort();
 	}
 }
 
 export default function loopDetectorExtension(pi: ExtensionAPI) {
 	let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi));
-	const sendMessage = (prompt: string, options?: { deliverAs?: "followUp" | "steer" }) => {
-		pi.sendUserMessage(prompt, options);
-	};
 
 	async function handleRuntimeEvent(event: LoopEvent, ctx: any): Promise<void> {
 		recordRuntimeEvent(runtime, event);
 		if (runtime.halted) return;
 		const outcome = await runtime.detector.handleEvent(event);
 		runtime.lastOutcome = outcome;
-		applyJudgeOutcome(runtime, ctx, outcome, sendMessage);
+		applyJudgeOutcome(runtime, ctx, outcome);
 	}
 
 	pi.registerCommand("loop-detector", {

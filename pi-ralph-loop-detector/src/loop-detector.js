@@ -1,4 +1,3 @@
-// Test comment for JS file
 const DEFAULTS = {
   bufferSize: 64,
   evidenceWindow: 8,
@@ -149,6 +148,7 @@ const SELF_CORRECTION_PATTERNS = [
 export class LoopDetector {
   constructor(config = {}) {
     this.config = mergeConfig(DEFAULTS, normalizeTopLevelConfig(config));
+    this.debugLogger = typeof this.config.debug === "function" ? this.config.debug : null;
     this.events = [];
     this.cooldownRemaining = 0;
     this.lastInterventionType = null;
@@ -168,13 +168,32 @@ export class LoopDetector {
 
   async handleEvent(event) {
     const normalizedEvent = normalizeEvent(event, this.config);
+    this.#debug("event.normalized", {
+      eventType: normalizedEvent.type,
+      toolName: normalizedEvent.toolName ?? null,
+      toolBaseName: normalizedEvent.toolBaseName ?? null,
+      toolClass: normalizedEvent.toolClass ?? null,
+      ok: normalizedEvent.ok ?? null,
+      progress: normalizedEvent.progress ?? null,
+      progressKind: normalizedEvent.progressKind ?? null,
+      argsSignature: normalizedEvent.argsSignature ?? null,
+    });
     this.#trackIntentState(normalizedEvent);
     this.events.push(normalizedEvent);
     this.#trimEvents();
 
     if (this.cooldownRemaining > 0) {
+      this.#debug("cooldown.active", {
+        remaining: this.cooldownRemaining,
+        eventType: normalizedEvent.type,
+        eventTool: normalizedEvent.toolName ?? null,
+      });
       if (this.#shouldClearCooldownEarly(normalizedEvent)) {
         this.cooldownRemaining = 0;
+        this.#debug("cooldown.cleared", {
+          eventType: normalizedEvent.type,
+          eventTool: normalizedEvent.toolName ?? null,
+        });
         return null;
       } else {
         this.cooldownRemaining -= 1;
@@ -184,15 +203,33 @@ export class LoopDetector {
 
     const trigger = this.#evaluateHeuristics();
     if (!trigger) {
+      this.#debug("heuristics.none", {
+        eventType: normalizedEvent.type,
+        eventTool: normalizedEvent.toolName ?? null,
+      });
       return null;
     }
+    this.#debug("heuristics.trigger", trigger);
 
     const evidence = this.#buildEvidencePacket(trigger);
+    this.#debug("judge.request", {
+      trigger: trigger.kind,
+      offendingTool: trigger.offendingTool ?? null,
+      assistantMessages: evidence.assistantMessages.length,
+      toolCalls: evidence.toolCalls.length,
+      toolResults: evidence.toolResults.length,
+    });
     const judgeOutcome = await this.#runJudge(evidence);
     this.lastJudgeOutcome = judgeOutcome;
+    this.#debug("judge.result", judgeOutcome);
     const review = this.#buildReview(judgeOutcome);
+    this.#debug("review.result", review);
 
     if (!judgeOutcome.is_loop || judgeOutcome.action === "continue") {
+      this.#debug("intervention.skip", {
+        trigger: trigger.kind,
+        reason: judgeOutcome.reason,
+      });
       return {
         trigger,
         evidence,
@@ -221,6 +258,7 @@ export class LoopDetector {
     this.lastInterventionType = intervention.type;
     this.cooldownRemaining = this.config.cooldownEvents;
     this.#resetLoopEvidence();
+    this.#debug("intervention.emit", intervention);
 
     return {
       trigger,
@@ -268,6 +306,7 @@ export class LoopDetector {
     this.pendingIntents = [];
     this.intentMismatches = this.intentMismatches.slice(-10);
   }
+
   #trimEvents() {
     if (this.events.length > this.config.bufferSize) {
       this.events.splice(0, this.events.length - this.config.bufferSize);
@@ -291,14 +330,57 @@ export class LoopDetector {
   }
 
   #evaluateHeuristics() {
-    return (
-      (heuristicEnabled(this.config.sameTool) && this.#checkSameToolRepetition()) ||
-      (heuristicEnabled(this.config.intentMismatch) && this.#checkIntentActionMismatch()) ||
-      (heuristicEnabled(this.config.failureRepetition) && this.#checkFailureRepetition()) ||
-      (heuristicEnabled(this.config.selfCorrection) && this.#checkSelfCorrectionLoop()) ||
-      (heuristicEnabled(this.config.cycleRepetition) && this.#checkRepeatedCycle()) ||
-      (heuristicEnabled(this.config.assistantRepetition) && this.#checkAssistantRepetition())
-    );
+    const checks = [
+      ["exactCallRepetition", heuristicEnabled(this.config.sameTool), () => this.#checkExactCallRepetition()],
+      ["sameTool", heuristicEnabled(this.config.sameTool), () => this.#checkSameToolRepetition()],
+      ["intentMismatch", heuristicEnabled(this.config.intentMismatch), () => this.#checkIntentActionMismatch()],
+      ["failureRepetition", heuristicEnabled(this.config.failureRepetition), () => this.#checkFailureRepetition()],
+      ["selfCorrection", heuristicEnabled(this.config.selfCorrection), () => this.#checkSelfCorrectionLoop()],
+      ["cycleRepetition", heuristicEnabled(this.config.cycleRepetition), () => this.#checkRepeatedCycle()],
+      ["assistantRepetition", heuristicEnabled(this.config.assistantRepetition), () => this.#checkAssistantRepetition()],
+    ];
+
+    for (const [name, enabled, fn] of checks) {
+      if (!enabled) {
+        this.#debug("heuristic.skip", { heuristic: name, enabled: false });
+        continue;
+      }
+      const trigger = fn();
+      this.#debug("heuristic.check", {
+        heuristic: name,
+        enabled: true,
+        matched: Boolean(trigger),
+        trigger,
+      });
+      if (trigger) return trigger;
+    }
+
+    return null;
+  }
+
+  #checkExactCallRepetition() {
+    const recentCalls = this.events
+      .filter((event) => event.type === "tool_call")
+      .slice(-this.config.sameTool.recentActions);
+
+    if (recentCalls.length === 0) {
+      return null;
+    }
+
+    const latest = recentCalls[recentCalls.length - 1];
+    const repeatCount = countTrailingExactCallRepeats(recentCalls, latest.toolName, latest.argsSignature);
+    if (repeatCount < sameToolRepeatThreshold(latest, this.config)) {
+      return null;
+    }
+
+    return {
+      kind: "same_call_repetition",
+      offendingTool: latest.toolName,
+      argsSignature: latest.argsSignature,
+      repeatCount,
+      recentActionCount: recentCalls.length,
+      notes: [`${latest.toolName} repeated ${repeatCount} times with identical arguments.`],
+    };
   }
 
   #checkSameToolRepetition() {
@@ -665,17 +747,16 @@ export class LoopDetector {
 
     return review;
   }
-  #buildIntervention(trigger, judgeOutcome) {
-    const type = judgeOutcome.action;
-    const offendingTool = judgeOutcome.offendingTool ?? trigger.offendingTool ?? null;
-    const message = buildInterventionMessage(type, trigger, offendingTool);
 
-    return {
-      type,
-      offendingTool,
-      message,
-      blockedTools: type === "restrict_tools" && offendingTool ? [offendingTool] : [],
-    };
+  #debug(stage, payload) {
+    if (typeof this.debugLogger !== "function") {
+      return;
+    }
+    try {
+      this.debugLogger({ stage, payload });
+    } catch {
+      /* ignore debug errors */
+    }
   }
 }
 
@@ -784,260 +865,87 @@ function normalizeEvent(event, config = DEFAULTS) {
       toolBaseName: toolInfo.name,
       toolClass: toolInfo.className,
       toolSettings: toolInfo.settings,
-      ok: Boolean(event.ok),
-      progress: event.progress,
-      progressKind,
-      resultSummary: summarizeResult(event.result),
-      resultSignature: normalizeResultSignature(event.result),
+      args,
       argsSignature: stableStringify(args),
-      failureSummarySignature: normalizeFailureSummary(event.result),
+      ok: Boolean(event.ok),
+      progress: event.progress !== undefined ? Boolean(event.progress) : progressKind !== "none",
+      progressKind,
+      result: event.result,
+      resultSummary: summarizeResult(event.result),
+      failureSummarySignature: buildFailureSummarySignature(event),
     };
   }
-  throw new Error(`Unsupported event type: ${event.type}`);
+
+  return {
+    id,
+    type: "unknown",
+    timestamp,
+    original: event,
+  };
 }
 
-function extractExpectedTools(content) {
-  const matches = new Set();
-  for (const pattern of INTENT_PATTERNS) {
-    const scoped = new RegExp(pattern.source, pattern.flags);
-    for (const match of content.matchAll(scoped)) {
-      const candidate = match[1];
-      if (candidate !== candidate.toLowerCase()) continue;
-      matches.add(candidate);
-    }
-  }
-  return [...matches];
+function normalizeTopLevelConfig(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return {};
+  return config;
 }
 
-function summarizeResult(result) {
-  if (result == null) {
-    return "";
+function mergeConfig(base, override) {
+  const merged = JSON.parse(JSON.stringify(base));
+  for (const [key, value] of Object.entries(override)) {
+    if (value && typeof value === "object" && !Array.isArray(value) && merged[key] && typeof merged[key] === "object" && !Array.isArray(merged[key])) {
+      merged[key] = { ...merged[key], ...value };
+    } else {
+      merged[key] = value;
+    }
   }
-  if (typeof result === "string") {
-    return result.slice(0, 160);
-  }
-  return stableStringify(result).slice(0, 160);
-}
-
-function buildActionCycles(events, minAssistantChars) {
-  const cycles = [];
-  let latestAssistant = null;
-  let pendingCall = null;
-
-  for (const event of events) {
-    if (event.type === "assistant_message") {
-      latestAssistant = event;
-      pendingCall = null;
-      continue;
-    }
-    if (event.type === "tool_call") {
-      pendingCall = event;
-      continue;
-    }
-    if (event.type !== "tool_result" || !pendingCall) {
-      continue;
-    }
-    if (event.toolName !== pendingCall.toolName) {
-      pendingCall = null;
-      continue;
-    }
-
-    const assistantFingerprint =
-      latestAssistant?.normalizedContent?.length >= minAssistantChars
-        ? latestAssistant.contentFingerprint
-        : "";
-    const resultSignature = event.resultSignature || event.failureSummarySignature || event.resultSummary || "";
-    if (!assistantFingerprint || !resultSignature) {
-      pendingCall = null;
-      continue;
-    }
-
-    const signature = [
-      assistantFingerprint,
-      pendingCall.toolBaseName ?? pendingCall.toolName,
-      pendingCall.argsSignature,
-      event.ok ? "ok" : "failed",
-      event.progressKind ?? String(event.progress),
-      resultSignature,
-    ].join("|");
-
-    cycles.push({
-      signature,
-      toolName: pendingCall.toolName,
-      toolBaseName: pendingCall.toolBaseName ?? pendingCall.toolName,
-      toolClass: pendingCall.toolClass ?? "unknown",
-      toolSettings: pendingCall.toolSettings ?? {},
-      progressKind: event.progressKind,
-      assistantFingerprint,
-      argsSignature: pendingCall.argsSignature,
-      resultSignature,
-    });
-    pendingCall = null;
-  }
-
-  return cycles;
+  return merged;
 }
 
 function normalizeAssistantContent(content) {
-  const withoutCodeBlocks = content.replace(/```[\s\S]*?```/g, " <code> ");
-  return withoutCodeBlocks
-    .toLowerCase()
-    .replace(/\/(?:[\w.-]+\/)*[\w.-]+/g, "<path>")
-    .replace(/\b[a-z]:\\(?:[^ \n\r\t]+\\?)+/gi, "<path>")
-    .replace(/\b\d+(?:\.\d+)?\b/g, "<num>")
-    .replace(/\b0x[0-9a-f]+\b/g, "<hex>")
-    .replace(/\s+/g, " ")
+  return String(content ?? "")
+    .replace(/\r\n/g, "\n")
     .trim();
 }
 
-function normalizeResultSignature(result) {
-  const summary = summarizeResult(result)
-    .toLowerCase()
-    .replace(/'[^']*'/g, "'<quoted>'")
-    .replace(/"[^"]*"/g, '"<quoted>"')
-    .replace(/\/(?:[\w.-]+\/)*[\w.-]+/g, "<path>")
-    .replace(/\b\d+(?:\.\d+)?\b/g, "<num>")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return summary.length >= 8 ? summary : "";
-}
-
-function fnv1a64Hex(input) {
-  let hash = 0xcbf29ce484222325n;
-  const prime = 0x100000001b3n;
-  const mask = 0xffffffffffffffffn;
-  for (const char of input) {
-    hash ^= BigInt(char.codePointAt(0));
-    hash = (hash * prime) & mask;
+function fnv1a64Hex(value) {
+  let hash = BigInt("0xcbf29ce484222325");
+  const prime = BigInt("0x100000001b3");
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= BigInt(value.charCodeAt(index));
+    hash = BigInt.asUintN(64, hash * prime);
   }
   return hash.toString(16).padStart(16, "0");
 }
 
-function normalizeTopLevelConfig(config) {
-  if (!config || typeof config !== "object") return {};
-  const output = { ...config };
-  if (config.heuristics && typeof config.heuristics === "object") {
-    for (const [key, value] of Object.entries(config.heuristics)) {
-      output[key] = value;
-    }
+function compactArgs(args) {
+  if (args == null || typeof args !== "object") return {};
+  const entries = Object.entries(args);
+  const output = {};
+  for (const [key, value] of entries.slice(0, MAX_OBJECT_KEYS)) {
+    output[key] = compactValue(value, key, 0);
   }
   return output;
 }
 
-function resolveToolInfo(toolName, config) {
-  const name = normalizeToolNameWithAliases(toolName, config.toolAliases ?? []);
-  const exactSettings = config.tools?.[name] ?? config.tools?.[toolName] ?? {};
-  const className = exactSettings.class ?? matchToolClass(name, config.toolClasses ?? []) ?? "unknown";
-  const classSettings = config.classes?.[className] ?? config.classes?.unknown ?? {};
-  return {
-    name,
-    className,
-    settings: {
-      ...classSettings,
-      ...exactSettings,
-      class: className,
-    },
-  };
-}
-
-function normalizeToolNameWithAliases(toolName, aliases) {
-  let output = toolName;
-  for (const alias of aliases) {
-    if (!alias || typeof alias !== "object") continue;
-    if (typeof alias.match !== "string" || typeof alias.replace !== "string") continue;
-    try {
-      output = output.replace(new RegExp(alias.match), alias.replace);
-    } catch {
-      continue;
-    }
+function compactValue(value, key = "", depth = 0) {
+  if (REDACTED_ARG_KEYS.has(key)) return summarizeOmitted(value);
+  if (typeof value === "string") return value.length > MAX_ARG_STRING_CHARS ? `${value.slice(0, MAX_ARG_STRING_CHARS)}\n[truncated ${value.length - MAX_ARG_STRING_CHARS} chars]` : value;
+  if (value == null || typeof value !== "object") return value;
+  if (depth >= 4) return summarizeOmitted(value);
+  if (Array.isArray(value)) {
+    const items = value.slice(0, MAX_ARRAY_ITEMS).map((item) => compactValue(item, "", depth + 1));
+    if (value.length > MAX_ARRAY_ITEMS) items.push(`[truncated ${value.length - MAX_ARRAY_ITEMS} items]`);
+    return items;
+  }
+  const entries = Object.entries(value);
+  const output = {};
+  for (const [entryKey, entryValue] of entries.slice(0, MAX_OBJECT_KEYS)) {
+    output[entryKey] = compactValue(entryValue, entryKey, depth + 1);
+  }
+  if (entries.length > MAX_OBJECT_KEYS) {
+    output.__truncated_keys = entries.length - MAX_OBJECT_KEYS;
   }
   return output;
-}
-
-function matchToolClass(toolName, rules) {
-  for (const rule of rules) {
-    if (!rule || typeof rule !== "object") continue;
-    if (typeof rule.match !== "string" || typeof rule.class !== "string") continue;
-    try {
-      if (new RegExp(rule.match, "i").test(toolName)) {
-        return rule.class;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return null;
-}
-
-function inferProgressKind(event, settings, config) {
-  if (!Boolean(event.ok)) return "failure";
-  const resultText = resultTextForMatching(event.result);
-  if (matchesAnyPattern(resultText, config.resultPatterns?.failure)) return "failure";
-  if (matchesAnyPattern(resultText, settings.noProgressPatterns)) return "no_progress";
-  if (matchesAnyPattern(resultText, config.resultPatterns?.noProgress)) return "no_progress";
-  if (matchesAnyPattern(resultText, settings.progressPatterns)) return "progress";
-  if (matchesAnyPattern(resultText, config.resultPatterns?.progress)) return "progress";
-
-  const setting = settings.successCountsAsProgress;
-  if (setting === true) return "progress";
-  if (setting === false) return "no_progress";
-  return "weak_progress";
-}
-
-function resultTextForMatching(result) {
-  if (result == null) return "";
-  if (typeof result === "string") return result;
-  try {
-    return stableStringify(result);
-  } catch {
-    return String(result);
-  }
-}
-
-function matchesAnyPattern(text, patterns) {
-  if (!Array.isArray(patterns) || !text) return false;
-  for (const pattern of patterns) {
-    if (typeof pattern !== "string" || !pattern) continue;
-    try {
-      if (new RegExp(pattern, "i").test(text)) return true;
-    } catch {
-      continue;
-    }
-  }
-  return false;
-}
-
-function resultIndicatesProgress(event) {
-  if (event.progressKind) return event.progressKind === "progress";
-  return event.ok && event.progress !== false;
-}
-
-function cycleRepeatThreshold(cycle, config) {
-  const explicit = Number(cycle.toolSettings?.sameCycleRepeats);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
-  const classSettings = config.classes?.[cycle.toolClass] ?? config.classes?.unknown ?? {};
-  const classValue = Number(classSettings.sameCycleRepeats);
-  if (Number.isFinite(classValue) && classValue > 0) return classValue;
-  return config.cycleRepetition.minRepeats;
-}
-
-function sameToolRepeatThreshold(event, config) {
-  const explicit = Number(event?.toolSettings?.sameToolRepeats);
-  if (Number.isFinite(explicit) && explicit > 0) return explicit;
-  const classSettings = config.classes?.[event?.toolClass] ?? config.classes?.unknown ?? {};
-  const classValue = Number(classSettings.sameToolRepeats);
-  if (Number.isFinite(classValue) && classValue > 0) return classValue;
-  return config.sameTool.minRepeats;
-}
-
-function heuristicEnabled(config) {
-  return config?.enabled !== false;
-}
-
-function truncateText(text, maxChars) {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}\n[truncated ${text.length - maxChars} chars]`;
 }
 
 function summarizeOmitted(value) {
@@ -1047,111 +955,207 @@ function summarizeOmitted(value) {
   return "[omitted]";
 }
 
-function sanitizeArgsValue(value, key = "", depth = 0) {
-  if (REDACTED_ARG_KEYS.has(key)) return summarizeOmitted(value);
-  if (typeof value === "string") return truncateText(value, MAX_ARG_STRING_CHARS);
-  if (value == null || typeof value !== "object") return value;
-  if (depth >= 4) return summarizeOmitted(value);
-  if (Array.isArray(value)) {
-    const items = value.slice(0, MAX_ARRAY_ITEMS).map((item) => sanitizeArgsValue(item, "", depth + 1));
-    if (value.length > MAX_ARRAY_ITEMS) items.push(`[truncated ${value.length - MAX_ARRAY_ITEMS} items]`);
-    return items;
-  }
-
-  const entries = Object.entries(value);
-  const output = {};
-  for (const [entryKey, entryValue] of entries.slice(0, MAX_OBJECT_KEYS)) {
-    output[entryKey] = sanitizeArgsValue(entryValue, entryKey, depth + 1);
-  }
-  if (entries.length > MAX_OBJECT_KEYS) {
-    output.__truncated_keys = entries.length - MAX_OBJECT_KEYS;
-  }
-  return output;
+function summarizeResult(result) {
+  if (typeof result === "string") return result.length > 1000 ? `${result.slice(0, 1000)}\n[truncated ${result.length - 1000} chars]` : result;
+  if (result == null || typeof result !== "object") return result;
+  const serialized = stableStringify(result);
+  if (serialized.length <= 1000) return result;
+  return `${serialized.slice(0, 1000)}\n[truncated ${serialized.length - 1000} chars]`;
 }
 
-function compactArgs(args) {
-  const sanitized = sanitizeArgsValue(args);
-  const serialized = JSON.stringify(sanitized);
-  if (serialized.length <= MAX_ARGS_JSON_CHARS) return sanitized;
+function buildFailureSummarySignature(event) {
+  return stableStringify({
+    ok: Boolean(event.ok),
+    error: event.error ?? null,
+    result: typeof event.result === "object" ? compactArgs(event.result) : event.result,
+  });
+}
+
+function resolveToolInfo(toolName, config) {
+  const normalizedName = normalizeToolName(toolName, config.toolAliases);
+  const className = classifyTool(normalizedName, config);
   return {
-    _summary: truncateText(serialized, MAX_ARGS_JSON_CHARS),
-    _originalArgKeys: Object.keys(args),
+    name: normalizedName,
+    className,
+    settings: resolveToolSettings(normalizedName, className, config),
   };
 }
 
-function failureGroupingKeys(failure) {
-  const keys = [`${failure.toolName}:args:${failure.argsSignature}`];
-  if (failure.failureSummarySignature) {
-    keys.push(`${failure.toolName}:result:${failure.failureSummarySignature}`);
+function normalizeToolName(toolName, aliases = []) {
+  let normalized = String(toolName ?? "");
+  for (const alias of aliases) {
+    const regex = new RegExp(alias.match, "gi");
+    normalized = normalized.replace(regex, alias.replace ?? "$1");
   }
-  return keys;
+  return normalized;
 }
 
-function normalizeFailureSummary(result) {
-  const summary = summarizeResult(result)
-    .toLowerCase()
-    .replace(/'[^']*'/g, "'<quoted>'")
-    .replace(/"[^"]*"/g, '"<quoted>"')
-    .replace(/\/(?:[\w.-]+\/)*[\w.-]+/g, "<path>")
-    .replace(/\b\d+\b/g, "<num>")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  return summary.length >= 12 ? summary : "";
+function classifyTool(toolName, config) {
+  for (const rule of config.toolClasses ?? []) {
+    const regex = new RegExp(rule.match, "i");
+    if (regex.test(toolName)) return rule.class;
+  }
+  return "unknown";
 }
 
-function isLowInformationTool(toolName, config = DEFAULTS) {
+function resolveToolSettings(toolName, className, config) {
+  return {
+    ...(config.classes?.[className] ?? config.classes?.unknown ?? {}),
+    ...(config.tools?.[toolName] ?? {}),
+  };
+}
+
+function inferProgressKind(event, toolSettings, config) {
+  if (event.progress === true) return "progress";
+  const text = typeof event.result === "string" ? event.result : stableStringify(event.result ?? "");
+  if (!text) return toolSettings.successCountsAsProgress ? "progress" : "none";
+  if (matchesAny(text, config.resultPatterns?.failure ?? [])) return "failure";
+  if (matchesAny(text, config.resultPatterns?.noProgress ?? [])) return "none";
+  if (matchesAny(text, config.resultPatterns?.progress ?? [])) return "progress";
+  if (toolSettings.successCountsAsProgress === true) return "progress";
+  if (toolSettings.successCountsAsProgress === "weak") return event.ok ? "progress" : "none";
+  return "none";
+}
+
+function matchesAny(text, patterns) {
+  return patterns.some((pattern) => new RegExp(pattern, "i").test(text));
+}
+
+function resultIndicatesProgress(event) {
+  return Boolean(event.progress);
+}
+
+function heuristicEnabled(heuristic) {
+  return heuristic && heuristic.enabled !== false;
+}
+
+function sameToolRepeatThreshold(sampleCall, config) {
+  return sampleCall?.toolSettings?.sameToolRepeats ?? config.sameTool.minRepeats;
+}
+
+function isLowInformationTool(toolName, config) {
   const toolInfo = resolveToolInfo(toolName, config);
-  if (toolInfo.settings.successCountsAsProgress === false) return true;
-  return /(?:^|_)(?:status|list|show|inspect|read|view|cat|ls)(?:$|_)/i.test(toolInfo.name);
+  return ["read", "cleanup"].includes(toolInfo.className);
+}
+
+function failureGroupingKeys(failure) {
+  return [stableStringify({
+    toolName: failure.toolName,
+    toolClass: failure.toolClass,
+    argsSignature: failure.argsSignature,
+    failureSummarySignature: failure.failureSummarySignature,
+  })];
+}
+
+function buildActionCycles(events, minAssistantChars) {
+  const cycles = [];
+  const assistantIndexes = [];
+  for (let index = 0; index < events.length; index += 1) {
+    if (events[index].type === "assistant_message") {
+      assistantIndexes.push(index);
+    }
+  }
+
+  let pendingCall = null;
+  let pendingCallIndex = -1;
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index];
+    if (event.type === "assistant_message") {
+      continue;
+    }
+    if (event.type === "tool_call") {
+      pendingCall = event;
+      pendingCallIndex = index;
+      continue;
+    }
+    if (event.type !== "tool_result" || !pendingCall || pendingCall.toolName !== event.toolName) {
+      continue;
+    }
+
+    const assistant = findNearbyAssistantMessage(events, assistantIndexes, pendingCallIndex, index, minAssistantChars);
+    if (!assistant) {
+      pendingCall = null;
+      pendingCallIndex = -1;
+      continue;
+    }
+
+    const assistantText = assistant.content.slice(0, minAssistantChars);
+    cycles.push({
+      signature: stableStringify({
+        assistant: assistantText,
+        toolName: pendingCall.toolName,
+        argsSignature: pendingCall.argsSignature,
+        ok: event.ok,
+        progress: event.progress,
+      }),
+      toolName: pendingCall.toolName,
+    });
+    pendingCall = null;
+    pendingCallIndex = -1;
+  }
+  return cycles;
+}
+
+function findNearbyAssistantMessage(events, assistantIndexes, callIndex, resultIndex, minAssistantChars) {
+  const nearby = [];
+  for (const index of assistantIndexes) {
+    if (index < Math.max(0, callIndex - 4)) continue;
+    if (index > Math.min(events.length - 1, resultIndex + 4)) continue;
+    const assistant = events[index];
+    if (!assistant || assistant.type !== "assistant_message") continue;
+    if (assistant.content.length < minAssistantChars) continue;
+    nearby.push({ index, content: assistant.content });
+  }
+
+  if (nearby.length === 0) {
+    return null;
+  }
+
+  const before = nearby.filter((entry) => entry.index <= resultIndex).sort((a, b) => b.index - a.index)[0];
+  if (before) return before;
+  return nearby.sort((a, b) => a.index - b.index)[0];
+}
+
+function countTrailingExactCallRepeats(recentCalls, toolName, argsSignature) {
+  let count = 0;
+  for (let index = recentCalls.length - 1; index >= 0; index -= 1) {
+    const call = recentCalls[index];
+    if (call.toolName !== toolName || call.argsSignature !== argsSignature) {
+      break;
+    }
+    count += 1;
+  }
+  return count;
+}
+
+function cycleRepeatThreshold(latest, config) {
+  const toolInfo = resolveToolInfo(latest.toolName, config);
+  return toolInfo.settings.sameCycleRepeats ?? config.cycleRepetition.minRepeats;
+}
+
+function extractExpectedTools(content) {
+  const normalized = String(content ?? "");
+  const found = new Set();
+  for (const pattern of INTENT_PATTERNS) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(normalized))) {
+      if (match[1]) found.add(match[1]);
+    }
+  }
+  return [...found];
 }
 
 function normalizeJudgeAction(value) {
-  if (value === "continue" || value === "stop" || value === "steer") {
-    return value;
-  }
-  if (value === "ignore") {
-    return "continue";
-  }
-  if (value === "pause" || value === "restrict_tools") {
-    return "stop";
-  }
+  if (value === "continue" || value === "stop" || value === "steer") return value;
+  if (value === "ignore") return "continue";
+  if (value === "pause" || value === "restrict_tools") return "stop";
   return "stop";
 }
 
 function stableStringify(value) {
-  return JSON.stringify(sortValue(value));
-}
-
-function sortValue(value) {
-  if (Array.isArray(value)) {
-    return value.map(sortValue);
-  }
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.keys(value)
-        .sort()
-        .map((key) => [key, sortValue(value[key])]),
-    );
-  }
-  return value;
-}
-
-function mergeConfig(base, override) {
-  const output = { ...base };
-  for (const [key, value] of Object.entries(override)) {
-    if (
-      value &&
-      typeof value === "object" &&
-      !Array.isArray(value) &&
-      base[key] &&
-      typeof base[key] === "object" &&
-      !Array.isArray(base[key])
-    ) {
-      output[key] = mergeConfig(base[key], value);
-    } else {
-      output[key] = value;
-    }
-  }
-  return output;
+  if (value == null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
 }

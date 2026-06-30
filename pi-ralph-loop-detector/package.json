@@ -1,0 +1,32 @@
+{
+  "name": "@matt/pi-ralph-loop-detector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ralph-centric loop detection and recovery routing for Pi.",
+  "license": "MIT",
+  "author": "Matt",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ],
+    "skills": [
+      "SKILL.md"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.38"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0"
+  }
+}

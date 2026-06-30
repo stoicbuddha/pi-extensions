@@ -29,7 +29,7 @@ test("detects same-tool repetition with no progress", async () => {
   });
 
   assert.equal(outcome.trigger.kind, "same_tool_repetition");
-  assert.equal(outcome.intervention.type, "steer");
+  assert.equal(outcome.intervention.type, "stop");
   assert.equal(outcome.intervention.offendingTool, "rollback_status");
 });
 
@@ -452,7 +452,7 @@ test("cooldown suppresses repeated interventions until behavior changes", async 
     toolName: "rollback_status",
     args: {},
   });
-  assert.equal(first.intervention.type, "steer");
+  assert.equal(first.intervention.type, "stop");
 
   const suppressed = await detector.handleEvent({
     type: "tool_call",
@@ -468,6 +468,53 @@ test("cooldown suppresses repeated interventions until behavior changes", async 
   });
   assert.equal(cleared, null);
   assert.equal(detector.getState().activeCooldown, 0);
+});
+
+test("resets loop evidence after an intervention so a follow-up read does not retrigger the same stale loop", async () => {
+  const detector = new LoopDetector({
+    failureRepetition: { minFailures: 99 },
+    selfCorrection: { minCorrections: 99 },
+  });
+
+  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "rollback_status",
+    args: { id: 1 },
+    ok: false,
+    result: "failed",
+  });
+  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "rollback_status",
+    args: { id: 1 },
+    ok: false,
+    result: "failed",
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_call",
+    toolName: "rollback_status",
+    args: { id: 1 },
+  });
+
+  assert.equal(outcome.trigger.kind, "same_tool_repetition");
+  assert.equal(detector.getState().recentEvents.length, 0);
+
+  await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolKitMCP_cat",
+    args: { path: "src/app.rs" },
+  });
+  const retriggered = await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_cat",
+    args: { path: "src/app.rs" },
+    ok: true,
+    result: "read ok",
+  });
+
+  assert.equal(retriggered, null);
 });
 
 test("uses judge output to choose deterministic intervention", async () => {

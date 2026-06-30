@@ -26,7 +26,7 @@ Do not attempt in-place mutation of the current session history. Use supported s
 
 ## Config Shape
 
-Add a Ralph config file under `.ralph`, for example:
+Store the session strategy directly in loop state or the database, for example:
 
 ```json
 {
@@ -66,7 +66,7 @@ resetMarker?: boolean;
 
 ### Start / Resume
 
-1. Load `.ralph` config.
+1. Load the persisted loop state.
 2. Resolve `sessionStrategy`.
 3. Store it in loop state.
 4. Keep current start / resume behavior for iteration 1 unless the implementation needs immediate session seeding.
@@ -155,7 +155,7 @@ Prefer explicit failure handling over silent fallback.
 
 ## Recommended Implementation Order
 
-1. Add config loading for `.ralph` project settings.
+1. Add config loading for persisted loop settings.
 2. Add `sessionStrategy` to `LoopState`.
 3. Refactor next-iteration dispatch behind one function.
 4. Keep `followUp` path as-is.

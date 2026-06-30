@@ -7,6 +7,8 @@ description: Detect suspicious looping behavior from assistant messages, tool ca
 
 Use this extension when you need to classify whether recent agent behavior looks like a loop.
 
+Deprecated in favor of the merged Ralph-centric `pi-ralph-loop-detector` package. Keep this skill only for compatibility and direct detector reuse.
+
 ## Available Tool
 
 - which heuristic fired
@@ -27,4 +29,4 @@ Host runtime code should apply the judge result deterministically:
 
 - `continue`: let the parent session proceed
 - `stop`: enter a sticky halted state until reset
-- `steer`: inject the returned `steer_message` directly into the parent session
+- `steer`: return a steer request to the host runtime without re-judging the current session in place
