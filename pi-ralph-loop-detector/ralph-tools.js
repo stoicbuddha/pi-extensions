@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Type } from "@sinclair/typebox";
@@ -420,6 +421,90 @@ function addVerification(loop, text) {
   loop.verification.push({ at: nowIso(), text });
 }
 
+function runGitCommand(ctx, args) {
+  const result = spawnSync("git", args, {
+    cwd: ctx.cwd,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  return {
+    ok: result.status === 0,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+    status: result.status,
+  };
+}
+
+function isNothingToCommit(output) {
+  return /nothing to commit|working tree clean/i.test(output);
+}
+
+function buildGitCheckpointMessage(loop) {
+  const completedIteration = Math.max(1, loop.iteration - 1);
+  return `ralph: ${loop.name} iteration ${completedIteration} checkpoint`;
+}
+
+function checkpointLoopState(ctx, loop) {
+  const addResult = runGitCommand(ctx, ["add", "."]);
+  if (!addResult.ok) {
+    return {
+      ok: false,
+      skipped: false,
+      message: `git add . failed: ${[addResult.stderr, addResult.stdout].filter(Boolean).join("\n").trim() || `exit ${addResult.status ?? "unknown"}`}`,
+    };
+  }
+
+  const commitMessage = buildGitCheckpointMessage(loop);
+  const commitResult = runGitCommand(ctx, ["commit", "-m", commitMessage]);
+  if (!commitResult.ok) {
+    if (isNothingToCommit(`${commitResult.stdout}\n${commitResult.stderr}`)) {
+      return {
+        ok: true,
+        skipped: true,
+        message: "No git changes to commit; checkpoint skipped.",
+      };
+    }
+    return {
+      ok: false,
+      skipped: false,
+      message: `git commit failed: ${[commitResult.stderr, commitResult.stdout].filter(Boolean).join("\n").trim() || `exit ${commitResult.status ?? "unknown"}`}`,
+    };
+  }
+
+  const pushResult = runGitCommand(ctx, ["push"]);
+  if (!pushResult.ok) {
+    return {
+      ok: false,
+      skipped: false,
+      message: `git push failed: ${[pushResult.stderr, pushResult.stdout].filter(Boolean).join("\n").trim() || `exit ${pushResult.status ?? "unknown"}`}`,
+    };
+  }
+
+  return {
+    ok: true,
+    skipped: false,
+    message: `Created git checkpoint: ${commitMessage}`,
+  };
+}
+
+function runGraphifyUpdate(ctx) {
+  const result = spawnSync("graphify", ["update", "."], {
+    cwd: ctx.cwd,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status === 0) {
+    return { ok: true };
+  }
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const message = [stderr, stdout].filter(Boolean).join("\n").trim() || `exit ${result.status ?? "unknown"}`;
+  if (/ENOENT|not found|command not found/i.test(message)) {
+    return { ok: false, message: "graphify not available; skipped graph update." };
+  }
+  return { ok: false, message: `graphify update failed: ${message}` };
+}
+
 function summarizeLoop(loop) {
   const status = loop.status === "active" ? "▶" : loop.status === "paused" ? "⏸" : "✓";
   const taskCount = Array.isArray(loop.tasks) ? loop.tasks.length : 0;
@@ -580,7 +665,8 @@ function buildIterationPrompt(loop) {
     "- Aim for the smallest useful step that reduces uncertainty.",
     "- If you already know the next concrete action, take it now.",
     "- If you need more context, fetch only the missing detail that blocks progress.",
-    "- Use Graphify first for repo navigation and exact file/symbol lookup when you need broader context.",
+    "- The Graphify graph is already built. Start with Graphify query or explain tools to understand project structure, relevant files, symbols, and current architecture before broad manual exploration.",
+    "- Leverage the available subagents whenever they are a good fit for the task instead of doing all work in the main session.",
     "- Prefer delegation for broad research, uncertain code paths, and validation-heavy work.",
     "- Use scout for quick repo scanning, researcher for deeper investigation, and reviewer for validation or sanity checks.",
     "- Keep planning brief, then switch back to tools.",
@@ -590,12 +676,12 @@ function buildIterationPrompt(loop) {
     loop.itemsPerIteration > 0
       ? `THIS ITERATION: Process approximately ${loop.itemsPerIteration} task item(s), then call the actual ralph_done tool.`
       : "1. Start from the single Next Task in the runtime view.",
-    "2. Use Graphify first for repo navigation and file/symbol lookup when you need broader context.",
-    "3. Delegate broad research, uncertain code paths, and validation-heavy work to subagents instead of doing everything in the main session.",
+    "2. Use Graphify query or explain first to understand where the current project stands from the existing graph, then use Graphify for exact repo navigation and file/symbol lookup.",
+    "3. Leverage the available subagents wherever they fit: scout for quick repo scanning, researcher for deeper investigation, and reviewer for validation or sanity checks.",
     "4. Use Ralph plan tools when you need more than the compact runtime view.",
     "5. Move straight to the next concrete step instead of recapping the plan.",
     "6. Update Ralph task state and evidence as you go.",
-    "7. When the current iteration is complete, call the actual ralph_done tool to proceed to the next iteration.",
+    "7. When the current iteration is complete, call the actual ralph_done tool; it will refresh Graphify and create a git checkpoint push before queuing the next iteration.",
   );
 
   return lines.join("\n");
@@ -611,7 +697,7 @@ async function deliverIterationPrompt(target, prompt) {
       {
         customType: "ralph-iteration",
         content: prompt,
-        display: false,
+        display: true,
       },
       { deliverAs: "followUp", triggerTurn: true },
     );
@@ -1213,6 +1299,20 @@ export function registerRalphSurface(pi) {
         return { content: [{ type: "text", text: "Max iterations reached. Loop stopped." }], details: { loop } };
       }
       persistLoop(ctx, store, loop);
+      const checkpointResult = checkpointLoopState(ctx, loop);
+      if (!checkpointResult.ok) {
+        setStatus(loop, "paused");
+        persistLoop(ctx, store, loop);
+        if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}. ${checkpointResult.message}`, "warning");
+        return { content: [{ type: "text", text: `Error: ${checkpointResult.message}` }], details: { loop } };
+      }
+      if (checkpointResult.skipped && ctx.hasUI) {
+        ctx.ui.notify(checkpointResult.message, "info");
+      }
+      const graphifyResult = runGraphifyUpdate(ctx);
+      if (!graphifyResult.ok && graphifyResult.message && ctx.hasUI) {
+        ctx.ui.notify(graphifyResult.message, graphifyResult.message.includes("skipped") ? "info" : "warning");
+      }
       if (loop.sessionStrategy === "newSession") {
         await dispatchFreshIteration(pi, ctx, loop);
         return {
