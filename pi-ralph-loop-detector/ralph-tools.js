@@ -27,6 +27,14 @@ function storePath(ctx) {
   return path.join(ctx.cwd, STORE_DIR, STORE_FILE);
 }
 
+function loadRalphOverlay(ctx) {
+  const overlayPath = path.resolve(ctx.cwd, "RALPH.md");
+  if (!fs.existsSync(overlayPath)) return null;
+  const content = fs.readFileSync(overlayPath, "utf-8");
+  const trimmed = content.trim();
+  return trimmed || null;
+}
+
 function ensureStoreDir(ctx) {
   fs.mkdirSync(path.dirname(storePath(ctx)), { recursive: true });
 }
@@ -618,7 +626,7 @@ function buildTaskWindow(loop, maxTasks = 6) {
   return ordered.slice(0, maxTasks);
 }
 
-function buildIterationPrompt(loop) {
+function buildIterationPrompt(loop, overlay = null) {
   const nextTask = selectNextTask(loop);
   const maxStr = loop.maxIterations > 0 ? `/${loop.maxIterations}` : "";
   const currentTaskCount = Array.isArray(loop.tasks) ? loop.tasks.length : 0;
@@ -684,11 +692,15 @@ function buildIterationPrompt(loop) {
     "7. When the current iteration is complete, call the actual ralph_done tool; it will refresh Graphify and create a git checkpoint push before queuing the next iteration.",
   );
 
+  if (overlay) {
+    lines.push("", "## RALPH.md", overlay);
+  }
+
   return lines.join("\n");
 }
 
-function buildResetPrompt(loop) {
-  return buildIterationPrompt(loop);
+function buildResetPrompt(loop, overlay = null) {
+  return buildIterationPrompt(loop, overlay);
 }
 
 async function deliverIterationPrompt(target, prompt) {
@@ -713,7 +725,7 @@ async function deliverIterationPrompt(target, prompt) {
 }
 
 async function dispatchNextIteration(pi, ctx, loop) {
-  const prompt = buildIterationPrompt(loop);
+  const prompt = buildIterationPrompt(loop, loadRalphOverlay(ctx));
 
   if (loop.sessionStrategy === "newSession" && typeof ctx.newSession === "function") {
     try {
@@ -744,7 +756,7 @@ async function dispatchNextIteration(pi, ctx, loop) {
 }
 
 async function dispatchFreshIteration(pi, ctx, loop) {
-  const prompt = buildResetPrompt(loop);
+  const prompt = buildResetPrompt(loop, loadRalphOverlay(ctx));
 
   if (typeof ctx.newSession !== "function") {
     return dispatchNextIteration(pi, ctx, loop);
@@ -1331,8 +1343,10 @@ export function registerRalphSurface(pi) {
     if (!loop || loop.status !== "active") return;
     const iterStr = `${loop.iteration}${loop.maxIterations > 0 ? `/${loop.maxIterations}` : ""}`;
     const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
+    const overlay = loadRalphOverlay(ctx);
     const instructions = [
       `You are in a Ralph loop named "${loop.name}" at iteration ${iterStr}.`,
+      ...(overlay ? ["", "## RALPH.md", overlay] : []),
       "Use /ralph tools to inspect and update canonical loop state.",
       "After making progress, call ralph_done to queue the next iteration.",
     ].join("\n");

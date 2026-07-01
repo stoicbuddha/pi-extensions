@@ -6,6 +6,8 @@ const DEFAULT_TIMEOUT_MS = null;
 const JUDGE_SYSTEM_PROMPT = [
   "You are an isolated loop judge running in a separate Pi subprocess.",
   "Analyze only the supplied evidence.",
+  "Recommend only actions that are possible with the tools and constraints explicitly provided to you.",
+  "Do not suggest restoring git branches, checking out branches, resetting git state, or any other action outside the documented tool contract.",
   'Return exactly one JSON object with: confidence (0 to 1), action ("continue" | "stop" | "steer"), reason (string), offendingTool (string or null), and optional steer_message when action is "steer".',
   "Do not include markdown, code fences, or any extra text.",
 ].join(" ");
@@ -65,7 +67,11 @@ async function runLoopJudgeProcess(pi, payload, options, timeoutMs) {
   const taskPath = path.join(tempDir, "judge-task.json");
 
   try {
-    await fs.writeFile(promptPath, JUDGE_SYSTEM_PROMPT, { encoding: "utf-8" });
+    const toolkitPrompt = await loadToolkitInstructions();
+    const systemPrompt = toolkitPrompt
+      ? `${JUDGE_SYSTEM_PROMPT}\n\n## Available Tool Contract\n${toolkitPrompt}`
+      : JUDGE_SYSTEM_PROMPT;
+    await fs.writeFile(promptPath, systemPrompt, { encoding: "utf-8" });
     await fs.writeFile(taskPath, JSON.stringify(payload, null, 2), { encoding: "utf-8" });
 
     const args = [
@@ -111,6 +117,17 @@ function normalizeTimeoutMs(value) {
     return null;
   }
   return timeoutMs;
+}
+
+async function loadToolkitInstructions() {
+  const toolkitPath = path.join(os.homedir(), ".pi", "agent", "prompts", "TOOLKIT_INSTRUCTIONS.md");
+  try {
+    const content = await fs.readFile(toolkitPath, "utf-8");
+    const trimmed = content.trim();
+    return trimmed || null;
+  } catch {
+    return null;
+  }
 }
 
 export function buildLoopJudgePayload(evidence, options = {}) {
@@ -242,6 +259,15 @@ export function normalizeLoopJudgeResponse(raw, evidence) {
     };
   }
 
+  if (action === "steer" && referencesForbiddenRecovery(steerMessage || reason)) {
+    return {
+      confidence: 0,
+      action: "stop",
+      reason: "subagent response recommended an unavailable recovery action",
+      offendingTool,
+    };
+  }
+
   return {
     confidence,
     action,
@@ -249,6 +275,11 @@ export function normalizeLoopJudgeResponse(raw, evidence) {
     reason,
     offendingTool,
   };
+}
+
+function referencesForbiddenRecovery(text) {
+  if (typeof text !== "string") return false;
+  return /\b(git\s+checkout|checkout\s+(?:a\s+)?branch|switch\s+(?:to\s+)?branch|restore\s+(?:the\s+)?branch|git\s+reset|reset\s+the\s+branch|rewind\s+the\s+branch)\b/i.test(text);
 }
 
 function parseJsonLike(raw) {

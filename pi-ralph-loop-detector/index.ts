@@ -48,6 +48,7 @@ interface RuntimeState {
 	events: LoopEvent[];
 	inputHistory: string[];
 	debugEvents: Array<{ at: string; stage: string; payload: unknown }>;
+	enabled: boolean;
 	debugEnabled: boolean;
 	lastDebugFlushedIndex: number;
 	hostContext: any | null;
@@ -68,6 +69,9 @@ const DEFAULT_JUDGE_CONFIDENCE_THRESHOLD = 0.7;
 const MAX_INPUT_CHARS = 2000;
 const MAX_DEBUG_EVENTS = 120;
 const MAX_DEBUG_TEXT = 600;
+const MAX_JUDGE_REASONING_MESSAGES = 6;
+const MAX_JUDGE_REASONING_CHARS = 1200;
+const MAX_JUDGE_TEXT_MESSAGES = 4;
 const RALPH_DETECTOR_CONFIG = {
 	sameTool: {
 		minRepeats: 3,
@@ -115,6 +119,7 @@ function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: 
 		events: [],
 		inputHistory: [],
 		debugEvents: [],
+		enabled: config.enabled !== false,
 		debugEnabled: Boolean(config.debug),
 		lastDebugFlushedIndex: 0,
 		hostContext: null,
@@ -380,9 +385,89 @@ function getLatestAssistantMessage(event: any): string {
 	return "";
 }
 
-function createJudgeBridge(pi: ExtensionAPI): JudgeBridge {
+function collectJudgeSessionContext(ctx: any): {
+	recentAssistantThinking: Array<{ timestamp?: string; thinking: string }>;
+	recentAssistantText: Array<{ timestamp?: string; text: string }>;
+	recentUserText: Array<{ timestamp?: string; text: string }>;
+} {
+	const branch = Array.isArray(ctx?.sessionManager?.getBranch?.()) ? ctx.sessionManager.getBranch() : [];
+	const recentAssistantThinking: Array<{ timestamp?: string; thinking: string }> = [];
+	const recentAssistantText: Array<{ timestamp?: string; text: string }> = [];
+	const recentUserText: Array<{ timestamp?: string; text: string }> = [];
+
+	for (let i = branch.length - 1; i >= 0; i -= 1) {
+		const entry = branch[i];
+		if (entry?.type !== "message" || !entry.message) continue;
+		const message = entry.message;
+		const timestamp = typeof entry.timestamp === "string" ? entry.timestamp : undefined;
+
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			for (const block of message.content) {
+				if (
+					block?.type === "thinking" &&
+					typeof block.thinking === "string" &&
+					block.thinking.trim() &&
+					recentAssistantThinking.length < MAX_JUDGE_REASONING_MESSAGES
+				) {
+					recentAssistantThinking.push({
+						timestamp,
+						thinking: truncateText(block.thinking.trim(), MAX_JUDGE_REASONING_CHARS),
+					});
+				}
+				if (
+					block?.type === "text" &&
+					typeof block.text === "string" &&
+					block.text.trim() &&
+					recentAssistantText.length < MAX_JUDGE_TEXT_MESSAGES
+				) {
+					recentAssistantText.push({
+						timestamp,
+						text: truncateText(block.text.trim(), MAX_JUDGE_REASONING_CHARS),
+					});
+				}
+			}
+		}
+
+		if (message.role === "user") {
+			const text = extractText(message.content).trim();
+			if (text && recentUserText.length < MAX_JUDGE_TEXT_MESSAGES) {
+				recentUserText.push({
+					timestamp,
+					text: truncateText(text, MAX_JUDGE_REASONING_CHARS),
+				});
+			}
+		}
+
+		if (
+			recentAssistantThinking.length >= MAX_JUDGE_REASONING_MESSAGES &&
+			recentAssistantText.length >= MAX_JUDGE_TEXT_MESSAGES &&
+			recentUserText.length >= MAX_JUDGE_TEXT_MESSAGES
+		) {
+			break;
+		}
+	}
+
+	return {
+		recentAssistantThinking: recentAssistantThinking.reverse(),
+		recentAssistantText: recentAssistantText.reverse(),
+		recentUserText: recentUserText.reverse(),
+	};
+}
+
+function enrichJudgeEvidence(evidence: unknown, ctx: any): unknown {
+	if (!ctx?.sessionManager) return evidence;
+	const sessionContext = collectJudgeSessionContext(ctx);
+	return {
+		...(evidence && typeof evidence === "object" ? evidence : {}),
+		sessionContext,
+	};
+}
+
+function createJudgeBridge(pi: ExtensionAPI, getContext?: () => any): JudgeBridge {
 	return async (evidence) => {
-		return evaluateLoopWithSubagent(pi, evidence, { timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS });
+		const ctx = typeof getContext === "function" ? getContext() : null;
+		const enrichedEvidence = enrichJudgeEvidence(evidence, ctx);
+		return evaluateLoopWithSubagent(pi, enrichedEvidence, { timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS });
 	};
 }
 
@@ -463,14 +548,14 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 }
 
 export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
-	let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi));
+	let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi, () => runtime.hostContext));
 
 	function syncActiveLoop(ctx: any): string | null {
 		const activeLoop = getActiveRalphLoop(ctx);
 		const activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 		if (!activeLoopName) {
 			if (runtime.activeLoopName !== null || runtime.events.length > 0 || runtime.halted || runtime.lastOutcome) {
-				runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+				runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 				runtime.hostContext = ctx;
 			}
 			runtime.activeLoopName = null;
@@ -478,7 +563,7 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 		}
 
 		if (runtime.activeLoopName !== activeLoopName) {
-			runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+			runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 			runtime.hostContext = ctx;
 			runtime.activeLoopName = activeLoopName;
 			return activeLoopName;
@@ -490,6 +575,7 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 	}
 
 	async function handleRuntimeEvent(event: LoopEvent, ctx: any): Promise<void> {
+		if (!runtime.enabled) return;
 		if (!syncActiveLoop(ctx)) return;
 		recordRuntimeEvent(runtime, event);
 		if (runtime.halted) return;
@@ -503,9 +589,11 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 
 	function resetRuntime(ctx: any): void {
 		const activeLoop = getActiveRalphLoop(ctx);
-		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+		const wasEnabled = runtime.enabled;
+		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 		runtime.hostContext = ctx;
 		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
+		runtime.enabled = wasEnabled;
 		if (ctx.hasUI) ctx.ui.notify("Ralph loop detector runtime state reset.", "info");
 	}
 
@@ -515,10 +603,22 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 			handler: async (args, ctx) => {
 				const [command] = args.trim().split(/\s+/);
 
-				if (command === "reset") {
-					resetRuntime(ctx);
-					return;
-				}
+					if (command === "reset") {
+						resetRuntime(ctx);
+						return;
+					}
+
+					if (command === "on") {
+						runtime.enabled = true;
+						if (ctx.hasUI) ctx.ui.notify("Ralph loop detector enabled.", "info");
+						return;
+					}
+
+					if (command === "off") {
+						runtime.enabled = false;
+						if (ctx.hasUI) ctx.ui.notify("Ralph loop detector disabled.", "info");
+						return;
+					}
 
 				if (command === "debug") {
 					const [, mode] = args.trim().split(/\s+/);
@@ -556,11 +656,12 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 
 					if (command === "status") {
 						const summary = runtime.lastOutcome ? summarizeOutcome(runtime.lastOutcome) : "No loop detected in this session.";
+						const enabled = `Enabled: ${runtime.enabled ? "yes" : "no"}`;
 						const halted = runtime.halted ? `Halted: yes (${runtime.haltReason ?? "unknown"})` : "Halted: no";
 						const recovery = runtime.lastRecoveryPrompt ? "Last recovery prompt: present" : "Last recovery prompt: none";
 						const debug = `Debug: ${runtime.debugEnabled ? "on" : "off"} (${runtime.debugEvents.length} buffered)`;
 						if (ctx.hasUI) {
-							ctx.ui.notify(`${summary}\n${halted}\n${recovery}\n${debug}\nCaptured events: ${runtime.events.length}`, "info");
+							ctx.ui.notify(`${summary}\n${enabled}\n${halted}\n${recovery}\n${debug}\nCaptured events: ${runtime.events.length}`, "info");
 						}
 					return;
 				}
@@ -570,6 +671,8 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 						[
 							"Ralph Loop Detector",
 							`  /${commandName} status   Show runtime detector state`,
+							`  /${commandName} on       Enable the detector`,
+							`  /${commandName} off      Disable the detector`,
 							`  /${commandName} reset    Clear captured detector state`,
 						].join("\n"),
 						"info",
@@ -659,9 +762,11 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const activeLoop = getActiveRalphLoop(ctx);
-		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+		const wasEnabled = runtime.enabled;
+		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 		runtime.hostContext = ctx;
 		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
+		runtime.enabled = wasEnabled;
 		if (ctx.hasUI) {
 			ctx.ui.notify("Ralph loop detector loaded for this session.", "info");
 		}
