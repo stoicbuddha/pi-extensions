@@ -1569,8 +1569,52 @@ export default function (pi: ExtensionAPI) {
 		return result;
 	}
 
+	function applyLoopArgs(state: LoopState, args: ReturnType<typeof parseArgs>): void {
+		state.maxIterations = args.maxIterations;
+		state.itemsPerIteration = args.itemsPerIteration;
+		state.reflectEvery = args.reflectEvery;
+		state.reflectInstructions = args.reflectInstructions;
+		state.sessionStrategy = args.sessionStrategy;
+		state.sessionStrategyFailure = args.sessionStrategyFailure;
+	}
+
 	function registerPlanCommand(name: string, _description: string, handler: (rest: string, ctx: any) => void | Promise<void>): void {
 		commands[name] = handler;
+	}
+
+	async function resumeLoopByName(ctx: any, loopName: string): Promise<void> {
+		const state = resolveLoopState(ctx, loopName);
+		if (!state) {
+			ctx.ui.notify(`Loop "${loopName}" not found`, "error");
+			return;
+		}
+		if (currentLoop && currentLoop !== loopName) {
+			const curr = resolveLoopState(ctx, currentLoop);
+			if (curr) pauseLoop(ctx, curr);
+		}
+
+		state.status = "active";
+		state.active = true;
+		state.completedAt = undefined;
+		state.iteration++;
+		saveState(ctx, state);
+		recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
+		const plan = ensurePlan(ctx, state);
+		if (!state.currentTaskId) {
+			state.currentTaskId = inferCurrentTaskId(plan);
+			if (!state.currentTaskId) state.currentTaskId = selectInitialTask(plan)?.id ?? null;
+			if (state.currentTaskId) saveState(ctx, state);
+		}
+		setSelectedLoopName(ctx, loopName);
+		updateUI(ctx);
+		ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
+
+		const needsReflection = state.reflectEvery > 0 && state.iteration > 1 && (state.iteration - 1) % state.reflectEvery === 0;
+		if (state.sessionStrategy === "newSession") {
+			await dispatchNextIterationFreshContext(ctx, state);
+			return;
+		}
+		dispatchNextIterationFollowUp(ctx, state, planToPromptText(state, plan), needsReflection);
 	}
 
 	const commands: Record<string, (rest: string, ctx: any) => void | Promise<void>> = {
@@ -1587,8 +1631,10 @@ export default function (pi: ExtensionAPI) {
 			const isPath = args.name.includes("/") || args.name.includes("\\");
 			const loopName = isPath ? sanitize(path.basename(args.name, path.extname(args.name))) : args.name;
 			const existing = loadState(ctx, loopName);
-			if (existing?.status === "active") {
-				ctx.ui.notify(`Loop "${loopName}" is already active. Use /ralph resume ${loopName}`, "warning");
+			if (existing) {
+				applyLoopArgs(existing, args);
+				saveState(ctx, existing);
+				await resumeLoopByName(ctx, loopName);
 				return;
 			}
 
@@ -1660,38 +1706,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 			}
-			const state = resolveLoopState(ctx, loopName);
-			if (!state) {
-				ctx.ui.notify(`Loop "${loopName}" not found`, "error");
-				return;
-			}
-			if (currentLoop && currentLoop !== loopName) {
-				const curr = resolveLoopState(ctx, currentLoop);
-				if (curr) pauseLoop(ctx, curr);
-			}
-
-			state.status = "active";
-			state.active = true;
-			state.completedAt = undefined;
-			state.iteration++;
-			saveState(ctx, state);
-			recordLoopEvent(ctx, state.name, "resume", "Resumed Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
-			const plan = ensurePlan(ctx, state);
-			if (!state.currentTaskId) {
-				state.currentTaskId = inferCurrentTaskId(plan);
-				if (!state.currentTaskId) state.currentTaskId = selectInitialTask(plan)?.id ?? null;
-				if (state.currentTaskId) saveState(ctx, state);
-			}
-			setSelectedLoopName(ctx, loopName);
-			updateUI(ctx);
-			ctx.ui.notify(`Resumed: ${loopName} (iteration ${state.iteration})`, "info");
-
-			const needsReflection = state.reflectEvery > 0 && state.iteration > 1 && (state.iteration - 1) % state.reflectEvery === 0;
-			if (state.sessionStrategy === "newSession") {
-				await dispatchNextIterationFreshContext(ctx, state);
-				return;
-			}
-			dispatchNextIterationFollowUp(ctx, state, planToPromptText(state, plan), needsReflection);
+			await resumeLoopByName(ctx, loopName);
 		},
 
 		status(_rest, ctx) {
@@ -1979,77 +1994,6 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 				return;
 			}
 			stopLoop(ctx, state, `Stopped Ralph loop: ${state.name} (iteration ${state.iteration})`);
-		},
-	});
-
-	pi.registerTool({
-		name: "ralph_start",
-		label: "Start Ralph Loop",
-		description: "Start a long-running development loop backed by structured Ralph database state.",
-		promptSnippet: "Start a persistent multi-iteration development loop with structured task state.",
-		promptGuidelines: [
-			"Use this tool when the user explicitly wants an iterative loop, autonomous repeated passes, or paced multi-step execution.",
-			"After starting a loop, use Ralph plan tools to inspect and update progress; keep all canonical state in the Ralph database.",
-		],
-		parameters: Type.Object({
-			name: Type.String({ description: "Loop name (e.g., 'refactor-auth')" }),
-			taskContent: Type.String({ description: "Initial task content to import into structured plan state" }),
-			itemsPerIteration: Type.Optional(Type.Number({ description: "Suggest N items per turn (0 = no limit)" })),
-			reflectEvery: Type.Optional(Type.Number({ description: "Reflect every N iterations" })),
-			maxIterations: Type.Optional(Type.Number({ description: "Max iterations (default: 50)", default: 50 })),
-			sessionStrategy: Type.Optional(Type.String({ description: "How to dispatch the next iteration: followUp or newSession" })),
-			sessionStrategyFailure: Type.Optional(Type.String({ description: "Compatibility-only; currently unused" })),
-		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const loopName = sanitize(params.name);
-			if (loadState(ctx, loopName)?.status === "active") {
-				return { content: [{ type: "text", text: `Loop "${loopName}" already active.` }], details: {} };
-			}
-			const state: LoopState = {
-				name: loopName,
-				taskFile: "",
-				iteration: 1,
-				maxIterations: params.maxIterations ?? 50,
-				itemsPerIteration: params.itemsPerIteration ?? 0,
-				reflectEvery: params.reflectEvery ?? 0,
-				reflectInstructions: DEFAULT_REFLECT_INSTRUCTIONS,
-				active: true,
-				status: "active",
-				startedAt: nowIso(),
-				lastReflectionAt: 0,
-				lastDoneReminderAt: 0,
-				sessionStrategy: parseSessionStrategy(params.sessionStrategy),
-				sessionStrategyFailure: parseSessionStrategyFailure(params.sessionStrategyFailure),
-				pendingSessionReset: false,
-			};
-			saveState(ctx, state);
-			const plan = parseLegacyMarkdownPlan(params.taskContent, loopName);
-			savePlan(ctx, plan, !!state.archivedAt);
-			if (!state.currentTaskId) {
-				state.currentTaskId = inferCurrentTaskId(plan);
-				if (!state.currentTaskId) state.currentTaskId = selectInitialTask(plan)?.id ?? null;
-				if (state.currentTaskId) saveState(ctx, state);
-			}
-			setSelectedLoopName(ctx, loopName);
-			updateUI(ctx);
-			if (state.sessionStrategy === "newSession") {
-				state.pendingSessionReset = true;
-				saveState(ctx, state);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Started loop "${loopName}" with ${plan.tasks.length} structured task(s). First iteration queued with fresh provider context.`,
-						},
-					],
-					details: {},
-				};
-			}
-			dispatchNextIterationFollowUp(ctx, state, planToPromptText(state, plan), false);
-			return {
-				content: [{ type: "text", text: `Started loop "${loopName}" with ${plan.tasks.length} structured task(s).` }],
-				details: {},
-			};
 		},
 	});
 

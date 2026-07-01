@@ -38,14 +38,22 @@ export function buildRecoveryPrompt(outcome, options = {}) {
   const trigger = outcome?.trigger?.kind ?? outcome?.trigger ?? "unknown";
   const action = outcome?.review?.action ?? outcome?.judgeOutcome?.action ?? "steer";
   const reason = outcome?.review?.message ?? outcome?.judgeOutcome?.reason ?? "";
-  const offendingTool = outcome?.trigger?.offendingTool ?? outcome?.judgeOutcome?.offendingTool ?? null;
-  const steerMessage = outcome?.judgeOutcome?.steer_message ?? outcome?.review?.message ?? "";
+  const offendingTool =
+    options.analysis?.offendingTool
+    ?? outcome?.trigger?.offendingTool
+    ?? outcome?.judgeOutcome?.offendingTool
+    ?? null;
+  const analysisSummary = options.analysis?.summary?.trim?.() ?? "";
+  const rationale = options.analysis?.rationale?.trim?.() ?? "";
+  const suspectedGoal = options.analysis?.suspectedGoal?.trim?.() ?? "";
+  const nextSteps = Array.isArray(options.analysis?.nextSteps) ? options.analysis.nextSteps.filter(Boolean) : [];
   const lines = [
     options.title ?? "Ralph recovery session",
     "",
     `Likely loop trigger: ${trigger}.`,
     `Suggested action: ${action}.`,
-    "Stay in the current session and steer the active agent directly.",
+    "A fresh recovery context has been created for this Ralph loop.",
+    "Do not rely on the prior transcript being present; use the analysis below as your handoff.",
   ];
 
   if (offendingTool) {
@@ -54,17 +62,29 @@ export function buildRecoveryPrompt(outcome, options = {}) {
   if (reason) {
     lines.push(`Reason: ${reason}.`);
   }
-  if (steerMessage && steerMessage !== reason) {
-    lines.push(`Steer guidance: ${steerMessage}.`);
+  if (suspectedGoal) {
+    lines.push(`Suspected goal: ${suspectedGoal}.`);
+  }
+  if (analysisSummary) {
+    lines.push("", "## Recovery Summary", analysisSummary);
+  }
+  if (rationale && rationale !== reason) {
+    lines.push("", "## Why It Got Stuck", rationale);
+  }
+  if (nextSteps.length > 0) {
+    lines.push("", "## Next Steps");
+    for (const step of nextSteps) {
+      lines.push(`- ${step}`);
+    }
   }
 
   lines.push(
     "",
-    "Do not fork a fresh recovery context for this loop.",
-    "Use the smallest correction that breaks the loop, or stop if the loop is unbreakable.",
-    "If the active loop should advance rather than repeat, prefer invoking ralph_done from the same session.",
+    "Continue from this fresh context rather than steering the old one.",
     "Take the smallest useful recovery step and do not repeat the same failed action.",
-    "If the current session can continue safely, let it continue.",
+    "If you need to inspect state again, start with the narrowest check that can confirm the next move.",
+    "Use Ralph tools to update task state and evidence as you recover.",
+    "Invoke subagents again if they can reduce uncertainty faster than continuing solo.",
   );
 
   return lines.join("\n");

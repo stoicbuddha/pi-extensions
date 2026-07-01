@@ -5,21 +5,12 @@ description: Long-running iterative development loops with pacing control and ve
 
 # Ralph Wiggum - Long-Running Development Loops
 
-Use the `ralph_start` tool to begin a loop:
-
-```
-ralph_start({
-  name: "loop-name",
-  taskContent: "# Task\n\n## Goals\n- Goal 1\n\n## Checklist\n- [ ] Item 1\n- [ ] Item 2",
-  maxIterations: 50,        // Default: 50
-  itemsPerIteration: 3,     // Optional: suggest N items per turn
-  reflectEvery: 10          // Optional: reflect every N iterations
-})
-```
+The user starts a loop with `/ralph start <name|path> [options]`.
+If `/ralph start` is called for an existing loop name, Ralph treats it as `/ralph resume`.
 
 ## Loop Behavior
 
-1. `ralph_start` stores the initial task content in the Ralph SQLite database.
+1. `/ralph start` stores the initial task content in the Ralph SQLite database.
 2. Use Ralph plan tools to inspect and update tasks, notes, evidence, and reflections.
 3. Call `ralph_done` to proceed to the next iteration.
 4. Output `<promise>COMPLETE</promise>` when finished.
@@ -43,7 +34,7 @@ ralph_start({
 
 ## User Commands
 
-- `/ralph start <name|path>` - Start a new loop.
+- `/ralph start <name|path>` - Start a new loop, or resume it if that loop already exists.
 - `/ralph resume [name]` - Resume loop.
 - `/ralph stop` - Pause loop (when agent idle).
 - `/ralph-stop` - Stop active loop (idle only).

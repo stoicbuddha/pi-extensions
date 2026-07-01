@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
   buildRecoveryPrompt,
@@ -9,6 +11,8 @@ import {
   selectRecoveryChildren,
   summarizeRecovery,
 } from "../routing.js";
+
+const indexSource = fs.readFileSync(path.join(import.meta.dirname, "..", "index.ts"), "utf8");
 
 test("uses the fixed child-agent priority order", () => {
   assert.deepEqual(selectRecoveryChildren(), RECOVERY_CHILD_PRIORITY);
@@ -21,12 +25,21 @@ test("builds a recovery prompt that references the prioritized agents", () => {
       judgeOutcome: { action: "steer", reason: "repeated tool call", steer_message: "switch approach" },
       review: { action: "steer", message: "switch approach" },
     },
-    { title: "Ralph recovery after loop" },
+    {
+      title: "Ralph recovery after loop",
+      analysis: {
+        summary: "The agent was trying to validate repo state before continuing work.",
+        nextSteps: ["Check the current task state.", "Use a different validation step than rollback_status."],
+        rationale: "It kept reusing the same validation tool without learning anything new.",
+        suspectedGoal: "Verify the workspace before editing files.",
+      },
+    },
   );
 
   assert.match(prompt, /Ralph recovery after loop/);
-  assert.match(prompt, /Stay in the current session and steer the active agent directly\./);
-  assert.match(prompt, /Do not fork a fresh recovery context for this loop\./);
+  assert.match(prompt, /A fresh recovery context has been created for this Ralph loop\./);
+  assert.match(prompt, /## Recovery Summary/);
+  assert.match(prompt, /## Next Steps/);
   assert.match(prompt, /rollback_status/);
 });
 
@@ -62,4 +75,10 @@ test("resolveJudgeDisposition preserves high-confidence steer decisions", () => 
 
   assert.equal(disposition.action, "steer");
   assert.equal(disposition.reason, "redirect");
+});
+
+test("agent_end wires natural assistant stops into Ralph stop steering", () => {
+  assert.match(indexSource, /const lastAssistant = getLatestAssistantEntry\(event\);/);
+  assert.match(indexSource, /await maybeDispatchStoppedLoopSteering\(ctx, pi, \{/);
+  assert.match(indexSource, /stopReason: typeof lastAssistant\?\.stopReason === "string" \? lastAssistant\.stopReason : ""/);
 });

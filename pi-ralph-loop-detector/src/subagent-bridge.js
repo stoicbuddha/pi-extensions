@@ -11,19 +11,108 @@ const JUDGE_SYSTEM_PROMPT = [
   'Return exactly one JSON object with: confidence (0 to 1), action ("continue" | "stop" | "steer"), reason (string), offendingTool (string or null), and optional steer_message when action is "steer".',
   "Do not include markdown, code fences, or any extra text.",
 ].join(" ");
+const RECOVERY_SUMMARY_SYSTEM_PROMPT = [
+  "You are an isolated Ralph loop recovery analyst running in a separate Pi subprocess.",
+  "Analyze only the supplied evidence.",
+  "Summarize what the agent appears to be trying to do, why it got stuck, and what the next fresh-context steps should be.",
+  "Do not suggest restoring git branches, checking out branches, resetting git state, or any other action outside the documented tool contract.",
+  'Return exactly one JSON object with: summary (string), next_steps (array of short strings), rationale (string), suspected_goal (string), and offendingTool (string or null).',
+  "Do not include markdown, code fences, or any extra text.",
+].join(" ");
 
 export async function evaluateLoopWithSubagent(target, evidence, options = {}) {
   const payload = buildLoopJudgePayload(evidence, options);
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const rawResult = await invokeSubagentTask(
+    target,
+    payload,
+    options,
+    timeoutMs,
+    {
+      runProcess: runLoopJudgeProcess,
+      adapterOptions: {
+        invokeNames: [
+          "judgeLoop",
+          "evaluateLoop",
+          "invokeLoopJudge",
+          "runLoopJudge",
+          "requestLoopJudge",
+          "judge",
+        ],
+        spawnNames: [
+          "spawnLoopJudge",
+          "spawnJudge",
+          "spawnSubagent",
+          "spawn",
+        ],
+        waitNames: [
+          "waitForLoopJudgeCompletion",
+          "waitForJudgeCompletion",
+          "waitForSubagentCompletion",
+          "waitForCompletion",
+          "awaitCompletion",
+        ],
+      },
+      timeoutMessages: {
+        invoke: "subagent judge timed out",
+        spawn: "subagent spawn timed out",
+        completion: "subagent completion timed out",
+      },
+    },
+  );
+  return normalizeLoopJudgeResponse(rawResult, evidence);
+}
 
+export async function evaluateRecoverySummaryWithSubagent(target, evidence, options = {}) {
+  const payload = buildRecoverySummaryPayload(evidence, options);
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const rawResult = await invokeSubagentTask(
+    target,
+    payload,
+    options,
+    timeoutMs,
+    {
+      runProcess: runRecoverySummaryProcess,
+      adapterOptions: {
+        invokeNames: [
+          "summarizeLoopRecovery",
+          "analyzeLoopRecovery",
+          "summarizeRecovery",
+          "invokeSubagent",
+          "invoke",
+        ],
+        spawnNames: [
+          "spawnLoopRecovery",
+          "spawnRecoverySummary",
+          "spawnSubagent",
+          "spawn",
+        ],
+        waitNames: [
+          "waitForLoopRecoveryCompletion",
+          "waitForRecoverySummaryCompletion",
+          "waitForSubagentCompletion",
+          "waitForCompletion",
+          "awaitCompletion",
+        ],
+      },
+      timeoutMessages: {
+        invoke: "subagent recovery analysis timed out",
+        spawn: "subagent recovery spawn timed out",
+        completion: "subagent recovery completion timed out",
+      },
+    },
+  );
+  return normalizeRecoverySummaryResponse(rawResult, evidence);
+}
+
+async function invokeSubagentTask(target, payload, options, timeoutMs, config) {
   const roots = Array.isArray(target) ? target : [target];
   const processRunner = roots.find((root) => typeof root?.exec === "function");
   if (processRunner) {
-    const rawResult = await runLoopJudgeProcess(processRunner, payload, options, timeoutMs);
-    return normalizeLoopJudgeResponse(rawResult, evidence);
+    return config.runProcess(processRunner, payload, options, timeoutMs);
   }
 
-  const adapter = resolveSubagentAdapter(roots);
+  const adapter = resolveSubagentAdapter(roots, config.adapterOptions);
   if (!adapter) {
     throw new Error("subagent RPC unavailable");
   }
@@ -35,7 +124,7 @@ export async function evaluateLoopWithSubagent(target, evidence, options = {}) {
       : await withTimeout(
           Promise.resolve(adapter.invoke(payload, options)),
           timeoutMs,
-          "subagent judge timed out",
+          config.timeoutMessages.invoke,
         );
   } else {
     if (typeof adapter.spawn !== "function" || typeof adapter.waitForCompletion !== "function") {
@@ -47,30 +136,64 @@ export async function evaluateLoopWithSubagent(target, evidence, options = {}) {
       : await withTimeout(
           Promise.resolve(adapter.spawn(payload, options)),
           timeoutMs,
-          "subagent spawn timed out",
+          config.timeoutMessages.spawn,
         );
     rawResult = timeoutMs == null
       ? await Promise.resolve(adapter.waitForCompletion(run, options))
       : await withTimeout(
           Promise.resolve(adapter.waitForCompletion(run, options)),
           timeoutMs,
-          "subagent completion timed out",
+          config.timeoutMessages.completion,
         );
   }
 
-  return normalizeLoopJudgeResponse(rawResult, evidence);
+  return rawResult;
 }
 
 async function runLoopJudgeProcess(pi, payload, options, timeoutMs) {
-  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-loop-judge-"));
-  const promptPath = path.join(tempDir, "judge-prompt.md");
-  const taskPath = path.join(tempDir, "judge-task.json");
+  return runPiSubagentProcess(
+    pi,
+    payload,
+    options,
+    timeoutMs,
+    {
+      tempPrefix: "pi-loop-judge-",
+      promptFilename: "judge-prompt.md",
+      taskFilename: "judge-task.json",
+      baseSystemPrompt: JUDGE_SYSTEM_PROMPT,
+      requestText: "Judge this loop evidence and return JSON only:",
+      timeoutMessage: "subagent judge timed out",
+    },
+  );
+}
+
+async function runRecoverySummaryProcess(pi, payload, options, timeoutMs) {
+  return runPiSubagentProcess(
+    pi,
+    payload,
+    options,
+    timeoutMs,
+    {
+      tempPrefix: "pi-loop-recovery-",
+      promptFilename: "recovery-prompt.md",
+      taskFilename: "recovery-task.json",
+      baseSystemPrompt: RECOVERY_SUMMARY_SYSTEM_PROMPT,
+      requestText: "Analyze this Ralph loop evidence and return JSON only:",
+      timeoutMessage: "subagent recovery analysis timed out",
+    },
+  );
+}
+
+async function runPiSubagentProcess(pi, payload, options, timeoutMs, config) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), config.tempPrefix));
+  const promptPath = path.join(tempDir, config.promptFilename);
+  const taskPath = path.join(tempDir, config.taskFilename);
 
   try {
     const toolkitPrompt = await loadToolkitInstructions();
     const systemPrompt = toolkitPrompt
-      ? `${JUDGE_SYSTEM_PROMPT}\n\n## Available Tool Contract\n${toolkitPrompt}`
-      : JUDGE_SYSTEM_PROMPT;
+      ? `${config.baseSystemPrompt}\n\n## Available Tool Contract\n${toolkitPrompt}`
+      : config.baseSystemPrompt;
     await fs.writeFile(promptPath, systemPrompt, { encoding: "utf-8" });
     await fs.writeFile(taskPath, JSON.stringify(payload, null, 2), { encoding: "utf-8" });
 
@@ -82,7 +205,7 @@ async function runLoopJudgeProcess(pi, payload, options, timeoutMs) {
       "--no-tools",
       "--append-system-prompt",
       promptPath,
-      `Judge this loop evidence and return JSON only:\n\n${await fs.readFile(taskPath, "utf-8")}`,
+      `${config.requestText}\n\n${await fs.readFile(taskPath, "utf-8")}`,
     ];
 
     const execOptions = { signal: options.signal };
@@ -94,7 +217,7 @@ async function runLoopJudgeProcess(pi, payload, options, timeoutMs) {
       : await withTimeout(
           Promise.resolve(pi.exec("pi", args, execOptions)),
           timeoutMs,
-          "subagent judge timed out",
+          config.timeoutMessage,
         );
 
     const stdout =
@@ -105,7 +228,7 @@ async function runLoopJudgeProcess(pi, payload, options, timeoutMs) {
           : typeof result?.output === "string"
             ? result.output
             : "";
-    return parseJudgeOutput(stdout);
+    return parseSubagentOutput(stdout);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -139,8 +262,38 @@ export function buildLoopJudgePayload(evidence, options = {}) {
   };
 }
 
-export function resolveSubagentAdapter(target) {
+export function buildRecoverySummaryPayload(evidence, options = {}) {
+  return {
+    task: "loop_recovery_summary",
+    version: 1,
+    evidence,
+    requestId: options.requestId ?? undefined,
+  };
+}
+
+export function resolveSubagentAdapter(target, options = {}) {
   const roots = Array.isArray(target) ? target : [target];
+  const invokeNames = options.invokeNames ?? [
+    "judgeLoop",
+    "evaluateLoop",
+    "invokeLoopJudge",
+    "runLoopJudge",
+    "requestLoopJudge",
+    "judge",
+  ];
+  const spawnNames = options.spawnNames ?? [
+    "spawnLoopJudge",
+    "spawnJudge",
+    "spawnSubagent",
+    "spawn",
+  ];
+  const waitNames = options.waitNames ?? [
+    "waitForLoopJudgeCompletion",
+    "waitForJudgeCompletion",
+    "waitForSubagentCompletion",
+    "waitForCompletion",
+    "awaitCompletion",
+  ];
 
   for (const root of roots) {
     if (!root) continue;
@@ -157,34 +310,13 @@ export function resolveSubagentAdapter(target) {
       continue;
     }
 
-    const invoke =
-      firstFunction(root, [
-        "judgeLoop",
-        "evaluateLoop",
-        "invokeLoopJudge",
-        "runLoopJudge",
-        "requestLoopJudge",
-        "judge",
-      ]) ?? null;
+    const invoke = firstFunction(root, invokeNames) ?? null;
     if (invoke) {
       return { invoke };
     }
 
-    const spawn =
-      firstFunction(root, [
-        "spawnLoopJudge",
-        "spawnJudge",
-        "spawnSubagent",
-        "spawn",
-      ]) ?? null;
-    const waitForCompletion =
-      firstFunction(root, [
-        "waitForLoopJudgeCompletion",
-        "waitForJudgeCompletion",
-        "waitForSubagentCompletion",
-        "waitForCompletion",
-        "awaitCompletion",
-      ]) ?? null;
+    const spawn = firstFunction(root, spawnNames) ?? null;
+    const waitForCompletion = firstFunction(root, waitNames) ?? null;
 
     if (spawn && waitForCompletion) {
       return {
@@ -277,6 +409,34 @@ export function normalizeLoopJudgeResponse(raw, evidence) {
   };
 }
 
+export function normalizeRecoverySummaryResponse(raw, evidence) {
+  const parsed = parseJsonLike(raw);
+  const fallback = buildFallbackRecoverySummary(evidence);
+  if (!parsed || typeof parsed !== "object") {
+    return fallback;
+  }
+
+  const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+  const nextSteps = normalizeStringArray(parsed.next_steps ?? parsed.nextSteps);
+  const rationale = typeof parsed.rationale === "string" ? parsed.rationale.trim() : "";
+  const suspectedGoal = typeof parsed.suspected_goal === "string"
+    ? parsed.suspected_goal.trim()
+    : typeof parsed.suspectedGoal === "string"
+      ? parsed.suspectedGoal.trim()
+      : "";
+  const offendingTool = typeof parsed.offendingTool === "string"
+    ? parsed.offendingTool
+    : evidence?.trigger?.offendingTool ?? evidence?.normalizedSummary?.offendingTool ?? null;
+
+  return {
+    summary: summary || fallback.summary,
+    nextSteps: nextSteps.length > 0 ? nextSteps : fallback.nextSteps,
+    rationale: rationale || fallback.rationale,
+    suspectedGoal: suspectedGoal || fallback.suspectedGoal,
+    offendingTool,
+  };
+}
+
 function referencesForbiddenRecovery(text) {
   if (typeof text !== "string") return false;
   return /\b(git\s+checkout|checkout\s+(?:a\s+)?branch|switch\s+(?:to\s+)?branch|restore\s+(?:the\s+)?branch|git\s+reset|reset\s+the\s+branch|rewind\s+the\s+branch)\b/i.test(text);
@@ -312,7 +472,7 @@ function parseJsonLike(raw) {
   return null;
 }
 
-function parseJudgeOutput(stdout) {
+function parseSubagentOutput(stdout) {
   if (typeof stdout !== "string" || !stdout.trim()) {
     return null;
   }
@@ -333,6 +493,31 @@ function parseJudgeOutput(stdout) {
   }
 
   return lastJson;
+}
+
+function buildFallbackRecoverySummary(evidence) {
+  const trigger = evidence?.trigger?.kind ?? evidence?.trigger ?? "loop";
+  const reason = evidence?.review?.message ?? evidence?.judgeOutcome?.reason ?? "Repeated behavior was detected.";
+  const offendingTool = evidence?.trigger?.offendingTool ?? evidence?.normalizedSummary?.offendingTool ?? null;
+  return {
+    summary: `The agent was trying to continue the current Ralph task but got stuck in a ${trigger} loop.`,
+    nextSteps: [
+      "Re-state the immediate goal in one sentence before taking another tool action.",
+      "Pick a different first verification or inspection step than the one that repeated.",
+      "Avoid repeating the same failed action without new evidence.",
+    ],
+    rationale: reason,
+    suspectedGoal: "",
+    offendingTool,
+  };
+}
+
+function normalizeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean)
+    .slice(0, 6);
 }
 
 function extractTextFromMessage(message) {

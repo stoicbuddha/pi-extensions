@@ -4,9 +4,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { LoopDetector } from "./src/index.js";
-import { evaluateLoopWithSubagent } from "./src/subagent-bridge.js";
+import { evaluateLoopWithSubagent, evaluateRecoverySummaryWithSubagent } from "./src/subagent-bridge.js";
 import { buildRecoveryPrompt, summarizeRecovery } from "./routing.js";
-import { getActiveRalphLoop, registerRalphSurface } from "./ralph-tools.js";
+import { getActiveRalphLoop, maybeDispatchStoppedLoopSteering, registerRalphSurface } from "./ralph-tools.js";
 
 type LoopEvent =
 	| {
@@ -56,10 +56,20 @@ interface RuntimeState {
 	haltReason: string | null;
 	lastOutcome: LoopOutcome;
 	lastRecoveryPrompt: string | null;
+	lastRecoveryAnalysis: RecoveryAnalysis | null;
 	lastRecoveryAgents: string[];
 	judgeConfidenceThreshold: number;
 	activeLoopName: string | null;
 	lastResetAt: string;
+	pendingRecoveryOutcome: NonNullable<LoopOutcome> | null;
+}
+
+interface RecoveryAnalysis {
+	summary: string;
+	nextSteps: string[];
+	rationale?: string;
+	suspectedGoal?: string;
+	offendingTool?: string | null;
 }
 
 const MAX_RUNTIME_EVENTS = 64;
@@ -127,10 +137,12 @@ function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: 
 		haltReason: null,
 		lastOutcome: null,
 		lastRecoveryPrompt: null,
+		lastRecoveryAnalysis: null,
 		lastRecoveryAgents: [],
 		judgeConfidenceThreshold: normalizeJudgeConfidenceThreshold(config.judgeConfidenceThreshold) ?? DEFAULT_JUDGE_CONFIDENCE_THRESHOLD,
 		activeLoopName: null,
 		lastResetAt: new Date().toISOString(),
+		pendingRecoveryOutcome: null,
 	} as RuntimeState;
 
 	const judge = typeof judgeBridge === "function" ? (evidence: unknown) => judgeBridge(evidence) : undefined;
@@ -385,6 +397,15 @@ function getLatestAssistantMessage(event: any): string {
 	return "";
 }
 
+function getLatestAssistantEntry(event: any): any | null {
+	const messages = Array.isArray(event?.messages) ? event.messages : [];
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message?.role === "assistant") return message;
+	}
+	return null;
+}
+
 function collectJudgeSessionContext(ctx: any): {
 	recentAssistantThinking: Array<{ timestamp?: string; thinking: string }>;
 	recentAssistantText: Array<{ timestamp?: string; text: string }>;
@@ -477,35 +498,89 @@ async function deliverRecoveryPrompt(target: any, prompt: string): Promise<boole
 			{
 				customType: "ralph-recovery",
 				content: prompt,
-				display: false,
+				display: true,
 			},
-			{ deliverAs: "steer", triggerTurn: true },
+			{ deliverAs: "followUp", triggerTurn: true },
 		);
+		return true;
+	}
+
+	if (target && typeof target.sendUserMessage === "function") {
+		await target.sendUserMessage(prompt, { deliverAs: "followUp" });
 		return true;
 	}
 
 	return false;
 }
 
-function buildRecoveryContext(state: RuntimeState, outcome: NonNullable<LoopOutcome>): { prompt: string } {
-	const prompt = buildRecoveryPrompt(outcome, { title: `Ralph recovery after ${outcome?.trigger?.kind ?? "loop"}` });
+async function analyzeRecovery(pi: ExtensionAPI, state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>): Promise<RecoveryAnalysis | null> {
+	try {
+		const analysis = await evaluateRecoverySummaryWithSubagent(
+			pi,
+			enrichJudgeEvidence(outcome, ctx),
+			{ timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS },
+		);
+		state.lastRecoveryAnalysis = analysis;
+		return analysis;
+	} catch (error) {
+		state.lastRecoveryAnalysis = null;
+		if (ctx.hasUI) {
+			const detail = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Ralph recovery analysis unavailable; using fallback handoff. ${detail}`, "warning");
+		}
+		return null;
+	}
+}
+
+async function dispatchFreshRecoveryPrompt(ctx: any, pi: ExtensionAPI, prompt: string): Promise<boolean> {
+	if (typeof ctx?.newSession === "function") {
+		try {
+			const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
+			const result = await ctx.newSession({
+				parentSession,
+				withSession: async (replacementCtx: any) => {
+					await deliverRecoveryPrompt(replacementCtx, prompt);
+				},
+			});
+			if (!result?.cancelled) {
+				return true;
+			}
+		} catch {
+			// Fall through to the supported follow-up path.
+		}
+	}
+
+	if (await deliverRecoveryPrompt(ctx, prompt)) {
+		return true;
+	}
+
+	if (await deliverRecoveryPrompt(pi, prompt)) {
+		return true;
+	}
+
+	return false;
+}
+
+async function buildRecoveryContext(state: RuntimeState, outcome: NonNullable<LoopOutcome>, ctx: any, pi: ExtensionAPI): Promise<{ prompt: string }> {
+	const analysis = await analyzeRecovery(pi, state, ctx, outcome);
+	const prompt = buildRecoveryPrompt(outcome, {
+		title: `Ralph recovery after ${outcome?.trigger?.kind ?? "loop"}`,
+		analysis: analysis ?? undefined,
+	});
 	state.lastRecoveryPrompt = prompt;
 	state.lastRecoveryAgents = [];
+	state.lastRecoveryAnalysis = analysis;
 	return { prompt };
 }
 
 async function dispatchRecovery(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>, pi: ExtensionAPI): Promise<void> {
-	if (state.halted) return;
+	if (state.halted && state.pendingRecoveryOutcome == null) return;
 	state.halted = true;
+	state.pendingRecoveryOutcome = null;
 	state.haltReason = outcome.review?.message || outcome.judgeOutcome?.reason || outcome.trigger?.kind || "loop detected";
 
-	const { prompt } = buildRecoveryContext(state, outcome);
-	let dispatched = false;
-	if (typeof ctx.sendMessage === "function") {
-		dispatched = await deliverRecoveryPrompt(ctx, prompt);
-	} else if (typeof pi.sendMessage === "function") {
-		dispatched = await deliverRecoveryPrompt(pi, prompt);
-	}
+	const { prompt } = await buildRecoveryContext(state, outcome, ctx, pi);
+	const dispatched = await dispatchFreshRecoveryPrompt(ctx, pi, prompt);
 
 	if (!dispatched && ctx.hasUI) {
 		ctx.ui.notify("Ralph recovery prompt could not be dispatched automatically.", "warning");
@@ -514,6 +589,23 @@ async function dispatchRecovery(state: RuntimeState, ctx: any, outcome: NonNulla
 	// if (typeof ctx.abort === "function" && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
 	// 	ctx.abort();
 	// }
+}
+
+function queueRecovery(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>): void {
+	if (state.halted) return;
+	state.halted = true;
+	state.pendingRecoveryOutcome = outcome;
+	state.haltReason = outcome.review?.message || outcome.judgeOutcome?.reason || outcome.trigger?.kind || "loop detected";
+	if (ctx.hasUI) {
+		ctx.ui.notify("Ralph recovery queued; fresh context will start after the current turn settles.", "warning");
+	}
+}
+
+async function flushPendingRecovery(state: RuntimeState, ctx: any, pi: ExtensionAPI): Promise<void> {
+	if (!state.pendingRecoveryOutcome) return;
+	if (typeof ctx?.isIdle === "function" && !ctx.isIdle()) return;
+	const outcome = state.pendingRecoveryOutcome;
+	await dispatchRecovery(state, ctx, outcome, pi);
 }
 
 async function haltWithoutRecovery(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>): Promise<void> {
@@ -541,6 +633,10 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 	}
 	if (disposition.action === "continue") return;
 	if (disposition.action === "steer") {
+		if (typeof ctx?.isIdle === "function" && !ctx.isIdle()) {
+			queueRecovery(state, ctx, outcome);
+			return;
+		}
 		await dispatchRecovery(state, ctx, outcome, pi);
 		return;
 	}
@@ -785,16 +881,19 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 		const normalized = normalizeToolCallEvent(event);
 		if (!normalized) return;
 		await handleRuntimeEvent(normalized, ctx);
+		await flushPendingRecovery(runtime, ctx, pi);
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
 		const normalized = normalizeToolResultEvent(event);
 		if (!normalized) return;
 		await handleRuntimeEvent(normalized, ctx);
+		await flushPendingRecovery(runtime, ctx, pi);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
-		const assistantText = getLatestAssistantMessage(event);
+		const lastAssistant = getLatestAssistantEntry(event);
+		const assistantText = lastAssistant ? extractText(lastAssistant.content).trim() : "";
 		if (assistantText) {
 			const timestamp = typeof (event as any)?.timestamp === "string" ? (event as any).timestamp : undefined;
 			await handleRuntimeEvent(
@@ -805,6 +904,13 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 				},
 				ctx,
 			);
+		}
+		await flushPendingRecovery(runtime, ctx, pi);
+		if (!runtime.halted) {
+			await maybeDispatchStoppedLoopSteering(ctx, pi, {
+				stopReason: typeof lastAssistant?.stopReason === "string" ? lastAssistant.stopReason : "",
+				assistantText,
+			});
 		}
 	});
 

@@ -43,7 +43,7 @@ You ask Pi to set up a ralph-wiggum loop.
   2. How many items to process per iteration
   3. How often to commit
   4. (optionally) After how many items it should take a step back and self-reflect
-- Pi runs `ralph_start`, beginning iteration 1.
+- The user starts the loop with `/ralph start`, beginning iteration 1.
   - It gets a prompt telling it to inspect and update task state via Ralph tools, then call `ralph_done` when it finishes that iteration
   - When the iteration is done, it calls `ralph_done`, resending the same prompt*
 - Pi runs until either:
@@ -66,7 +66,7 @@ Ralph keeps loop state in SQLite and treats the database as the only canonical s
 
 | Command | Description |
 |---------|-------------|
-| `/ralph start <name\|path>` | Start a new loop |
+| `/ralph start <name\|path>` | Start a new loop, or resume it if that loop already exists |
 | `/ralph resume [name]` | Resume a paused loop |
 | `/ralph stop` | Pause current loop |
 | `/ralph-stop` | Stop active loop (idle only) |
@@ -106,16 +106,6 @@ CLI example:
 /ralph start clean-slate --session-strategy newSession
 ```
 
-Agent tool example:
-
-```ts
-ralph_start({
-  name: "clean-slate",
-  taskContent: "# Task\n\n## Checklist\n- [ ] Item 1",
-  sessionStrategy: "newSession"
-})
-```
-
 Options:
 
 - `sessionStrategy`: `newSession` (default) or `followUp`
@@ -138,23 +128,9 @@ Each iteration prompt tells the agent to:
 - Treat the database as canonical and mutate state only through Ralph tools.
 - Call the real `ralph_done` tool when the iteration should advance.
 
-## Agent Tool
+## Agent Tools
 
-The agent can self-start loops using `ralph_start`, then use plan tools such as `ralph_get_plan`, `ralph_list_tasks`, `ralph_update_task`, `ralph_add_task`, `ralph_add_note`, and `ralph_record_reflection` to work without editing files directly:
-
-```
-ralph_start({
-  name: "refactor-auth",
-  taskContent: "# Task\n\n## Checklist\n- [ ] Item 1",
-  maxIterations: 50,
-  itemsPerIteration: 3,
-  reflectEvery: 10,
-  sessionStrategy: "newSession",
-  sessionStrategyFailure: "followUp"
-})
-```
-
-`taskContent` is still accepted for compatibility, but it is only used to seed the initial structured plan state in SQLite.
+Agents cannot self-start Ralph loops anymore. Start or resume them with `/ralph start`, then the agent can use plan tools such as `ralph_get_plan`, `ralph_list_tasks`, `ralph_update_task`, `ralph_add_task`, `ralph_add_note`, and `ralph_record_reflection` to work without editing files directly.
 
 ## Credits
 

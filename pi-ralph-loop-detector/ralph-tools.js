@@ -7,6 +7,7 @@ import { Type } from "@sinclair/typebox";
 const STORE_DIR = ".ralph";
 const STORE_FILE = "ralph.sqlite";
 const META_CURRENT_LOOP_NAME = "current_loop_name";
+const FAKE_RALPH_DONE_PATTERN = /<(?:invoke|tool_use|tool|function_call)\b[^>]*(?:name=["']ralph_done["']|ralph_done)[\s\S]*?<\/(?:invoke|tool_use|tool|function_call)>|<ralph_done\b[^>]*\/?>/i;
 
 const DEFAULT_REFLECT_INSTRUCTIONS = `REFLECTION CHECKPOINT
 
@@ -909,6 +910,43 @@ export function getActiveRalphLoop(ctx) {
   return loop;
 }
 
+export async function maybeDispatchStoppedLoopSteering(ctx, pi, options = {}) {
+  const stopReason = typeof options.stopReason === "string" ? options.stopReason : "";
+  if (stopReason !== "stop") return false;
+
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store);
+  if (!loop || loop.status !== "active") return false;
+
+  if (typeof ctx?.hasPendingMessages === "function" && ctx.hasPendingMessages()) {
+    return false;
+  }
+
+  if (loop.lastDoneReminderAt === loop.iteration) {
+    return false;
+  }
+
+  loop.lastDoneReminderAt = loop.iteration;
+  persistLoop(ctx, store, loop);
+
+  const assistantText = typeof options.assistantText === "string" ? options.assistantText : "";
+  const message = FAKE_RALPH_DONE_PATTERN.test(assistantText)
+    ? "You wrote text that looks like a ralph_done tool call, but Pi did not execute it. If this iteration is done, call the actual ralph_done tool now using the tool interface. Do not write XML, <invoke>, or placeholder text. If the loop is complete, Ralph state will stop it."
+    : `You are still in Ralph loop "${loop.name}" at iteration ${loop.iteration}. If you are done with the tasks for this iteration, call the actual ralph_done tool now using the tool interface. If the loop is complete, Ralph state will stop it. Otherwise, continue working on the current iteration and use Ralph tools to update canonical state.`;
+
+  if (typeof pi?.sendUserMessage === "function") {
+    await pi.sendUserMessage(message, { deliverAs: "followUp" });
+    return true;
+  }
+
+  if (typeof ctx?.sendUserMessage === "function") {
+    await ctx.sendUserMessage(message, { deliverAs: "followUp" });
+    return true;
+  }
+
+  return false;
+}
+
 function setStatus(loop, status) {
   loop.status = status;
   if (status === "completed") loop.completedAt = nowIso();
@@ -923,6 +961,14 @@ function registerCommand(pi, name, handler) {
 
 function registerTool(pi, spec) {
   pi.registerTool(spec);
+}
+
+async function resumeLoop(pi, ctx, store, loop) {
+  setStatus(loop, "active");
+  loop.iteration += 1;
+  persistLoop(ctx, store, loop);
+  if (ctx.hasUI) ctx.ui.notify(`Resumed: ${summarizeLoop(loop)}`, "info");
+  await dispatchNextIteration(pi, ctx, loop);
 }
 
 export function registerRalphSurface(pi) {
@@ -942,6 +988,12 @@ export function registerRalphSurface(pi) {
       const parsed = parseStartArgs(rest);
       if (!parsed.name) {
         if (ctx.hasUI) ctx.ui.notify("Usage: /ralph start <name> [--max-iterations N] [--items-per-iteration N] [--reflect-every N] [--session-strategy MODE]", "warning");
+        return;
+      }
+      const existing = getCurrentLoop(store, parsed.name);
+      if (existing) {
+        updateLoopFromArgs(existing, parsed);
+        await resumeLoop(pi, ctx, store, existing);
         return;
       }
       const loop = createLoop(parsed.name, parsed);
@@ -970,11 +1022,7 @@ export function registerRalphSurface(pi) {
         if (ctx.hasUI) ctx.ui.notify(name ? `Loop "${name}" not found` : "No selected Ralph loop found. Use /ralph resume <name>.", "warning");
         return;
       }
-      setStatus(loop, "active");
-      loop.iteration += 1;
-      persistLoop(ctx, store, loop);
-      if (ctx.hasUI) ctx.ui.notify(`Resumed: ${summarizeLoop(loop)}`, "info");
-      await dispatchNextIteration(pi, ctx, loop);
+      await resumeLoop(pi, ctx, store, loop);
       return;
     }
 
@@ -1105,32 +1153,6 @@ export function registerRalphSurface(pi) {
     loop.completedAt = nowIso();
     persistLoop(ctx, store, loop);
     if (ctx.hasUI) ctx.ui.notify(`Stopped Ralph loop: ${loop.name}`, "info");
-  });
-
-  registerTool(pi, {
-    name: "ralph_start",
-    label: "Start Ralph Loop",
-    description: "Start a long-running Ralph loop backed by structured local state.",
-    promptSnippet: "Start a persistent multi-iteration development loop with structured task state.",
-    promptGuidelines: [
-      "Use this tool when the user explicitly wants an iterative loop, autonomous repeated passes, or paced multi-step execution.",
-      "After starting a loop, use Ralph plan tools to inspect and update progress; keep canonical state in the local Ralph store.",
-    ],
-    parameters: Type.Object({
-      name: Type.String(),
-      taskContent: Type.String(),
-      itemsPerIteration: Type.Optional(Type.Number()),
-      reflectEvery: Type.Optional(Type.Number()),
-      maxIterations: Type.Optional(Type.Number()),
-      sessionStrategy: Type.Optional(Type.String()),
-      sessionStrategyFailure: Type.Optional(Type.String()),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const store = loadStore(ctx);
-      const loop = createLoop(String(params.name).trim(), params);
-      persistLoop(ctx, store, loop);
-      return { content: [{ type: "text", text: `Started loop "${loop.name}" with ${loop.tasks.length} task(s).` }], details: { loop } };
-    },
   });
 
   registerTool(pi, {

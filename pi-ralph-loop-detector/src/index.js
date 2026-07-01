@@ -7,6 +7,9 @@ export {
 export {
   buildLoopJudgePayload,
   evaluateLoopWithSubagent,
+  evaluateRecoverySummaryWithSubagent,
+  buildRecoverySummaryPayload,
   normalizeLoopJudgeResponse,
+  normalizeRecoverySummaryResponse,
   resolveSubagentAdapter,
 } from "./subagent-bridge.js";
