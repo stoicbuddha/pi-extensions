@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = null;
 const JUDGE_SYSTEM_PROMPT = [
   "You are an isolated loop judge running in a separate Pi subprocess.",
   "Analyze only the supplied evidence.",
@@ -12,11 +12,12 @@ const JUDGE_SYSTEM_PROMPT = [
 
 export async function evaluateLoopWithSubagent(target, evidence, options = {}) {
   const payload = buildLoopJudgePayload(evidence, options);
+  const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   const roots = Array.isArray(target) ? target : [target];
   const processRunner = roots.find((root) => typeof root?.exec === "function");
   if (processRunner) {
-    const rawResult = await runLoopJudgeProcess(processRunner, payload, options);
+    const rawResult = await runLoopJudgeProcess(processRunner, payload, options, timeoutMs);
     return normalizeLoopJudgeResponse(rawResult, evidence);
   }
 
@@ -27,32 +28,38 @@ export async function evaluateLoopWithSubagent(target, evidence, options = {}) {
 
   let rawResult;
   if (typeof adapter.invoke === "function") {
-    rawResult = await withTimeout(
-      Promise.resolve(adapter.invoke(payload, options)),
-      options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      "subagent judge timed out",
-    );
+    rawResult = timeoutMs == null
+      ? await Promise.resolve(adapter.invoke(payload, options))
+      : await withTimeout(
+          Promise.resolve(adapter.invoke(payload, options)),
+          timeoutMs,
+          "subagent judge timed out",
+        );
   } else {
     if (typeof adapter.spawn !== "function" || typeof adapter.waitForCompletion !== "function") {
       throw new Error("subagent RPC unavailable");
     }
 
-    const run = await withTimeout(
-      Promise.resolve(adapter.spawn(payload, options)),
-      options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      "subagent spawn timed out",
-    );
-    rawResult = await withTimeout(
-      Promise.resolve(adapter.waitForCompletion(run, options)),
-      options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      "subagent completion timed out",
-    );
+    const run = timeoutMs == null
+      ? await Promise.resolve(adapter.spawn(payload, options))
+      : await withTimeout(
+          Promise.resolve(adapter.spawn(payload, options)),
+          timeoutMs,
+          "subagent spawn timed out",
+        );
+    rawResult = timeoutMs == null
+      ? await Promise.resolve(adapter.waitForCompletion(run, options))
+      : await withTimeout(
+          Promise.resolve(adapter.waitForCompletion(run, options)),
+          timeoutMs,
+          "subagent completion timed out",
+        );
   }
 
   return normalizeLoopJudgeResponse(rawResult, evidence);
 }
 
-async function runLoopJudgeProcess(pi, payload, options) {
+async function runLoopJudgeProcess(pi, payload, options, timeoutMs) {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-loop-judge-"));
   const promptPath = path.join(tempDir, "judge-prompt.md");
   const taskPath = path.join(tempDir, "judge-task.json");
@@ -66,21 +73,23 @@ async function runLoopJudgeProcess(pi, payload, options) {
       "json",
       "-p",
       "--no-session",
+      "--no-tools",
       "--append-system-prompt",
       promptPath,
       `Judge this loop evidence and return JSON only:\n\n${await fs.readFile(taskPath, "utf-8")}`,
     ];
 
-    const result = await withTimeout(
-      Promise.resolve(
-        pi.exec("pi", args, {
-          signal: options.signal,
-          timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        }),
-      ),
-      options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-      "subagent judge timed out",
-    );
+    const execOptions = { signal: options.signal };
+    if (timeoutMs != null) {
+      execOptions.timeout = timeoutMs;
+    }
+    const result = timeoutMs == null
+      ? await Promise.resolve(pi.exec("pi", args, execOptions))
+      : await withTimeout(
+          Promise.resolve(pi.exec("pi", args, execOptions)),
+          timeoutMs,
+          "subagent judge timed out",
+        );
 
     const stdout =
       typeof result === "string"
@@ -94,6 +103,14 @@ async function runLoopJudgeProcess(pi, payload, options) {
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
+}
+
+function normalizeTimeoutMs(value) {
+  const timeoutMs = Number(value);
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return null;
+  }
+  return timeoutMs;
 }
 
 export function buildLoopJudgePayload(evidence, options = {}) {

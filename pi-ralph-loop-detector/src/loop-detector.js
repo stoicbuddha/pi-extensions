@@ -406,39 +406,23 @@ export class LoopDetector {
     }
 
     const [toolName, count] = offender;
-    const offendingCalls = recentCalls.filter((event) => event.toolName === toolName);
-    const distinctArgs = new Set(offendingCalls.map((event) => event.argsSignature));
-    if (distinctArgs.size > this.config.sameTool.maxDistinctArgs) {
+    const latestCall = [...recentCalls].reverse().find((event) => event.toolName === toolName);
+    if (!latestCall) return null;
+
+    const recentExactCalls = recentCalls.filter(
+      (event) => event.toolName === toolName && event.argsSignature === latestCall.argsSignature,
+    );
+    if (recentExactCalls.length < count) {
       return null;
-    }
-
-    const relatedResults = this.events
-      .filter((event) => event.type === "tool_result" && event.toolName === toolName)
-      .slice(-count);
-
-    if (relatedResults.length < Math.max(1, count - 1)) {
-      return null;
-    }
-
-    const hasProgress = relatedResults.some((event) => resultIndicatesProgress(event));
-    if (hasProgress) {
-      const isLowInformationSelfCorrection =
-        isLowInformationTool(toolName, this.config) &&
-        this.#recentSelfCorrectionMessages().length >= this.config.selfCorrection.minCorrections;
-      if (!isLowInformationSelfCorrection) {
-        return null;
-      }
     }
 
     return {
       kind: "same_tool_repetition",
       offendingTool: toolName,
-      repeatCount: count,
+      repeatCount: recentExactCalls.length,
       recentActionCount: recentCalls.length,
       notes: [
-        hasProgress
-          ? `${toolName} repeated ${count} times during self-correction without changing strategy.`
-          : `${toolName} repeated ${count} times with no successful progress signal.`,
+        `${toolName} repeated ${recentExactCalls.length} times with identical arguments.`,
       ],
     };
   }

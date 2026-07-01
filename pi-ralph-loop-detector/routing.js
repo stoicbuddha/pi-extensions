@@ -1,11 +1,40 @@
 export const RECOVERY_CHILD_PRIORITY = ["scout", "researcher", "reviewer"];
+export const DEFAULT_JUDGE_CONFIDENCE_THRESHOLD = 0.7;
 
 export function selectRecoveryChildren() {
   return [...RECOVERY_CHILD_PRIORITY];
 }
 
+export function resolveJudgeDisposition(outcome, options = {}) {
+  const confidenceThreshold = normalizeConfidenceThreshold(options.confidenceThreshold ?? DEFAULT_JUDGE_CONFIDENCE_THRESHOLD);
+  const action = outcome?.review?.action ?? outcome?.judgeOutcome?.action ?? "continue";
+  const confidence = normalizeConfidence(outcome?.review?.confidence ?? outcome?.judgeOutcome?.confidence);
+  const reason = outcome?.review?.message ?? outcome?.judgeOutcome?.reason ?? "";
+
+  if (action === "continue") {
+    return { action: "continue", confidence, reason };
+  }
+
+  if (isJudgeFallbackReason(reason)) {
+    return { action: action === "steer" ? "steer" : "stop", confidence, reason };
+  }
+
+  if (confidence < confidenceThreshold) {
+    return {
+      action: "continue",
+      confidence,
+      reason: reason || "judge confidence below threshold",
+    };
+  }
+
+  return {
+    action: action === "steer" ? "steer" : "stop",
+    confidence,
+    reason,
+  };
+}
+
 export function buildRecoveryPrompt(outcome, options = {}) {
-  const childAgents = Array.isArray(options.childAgents) && options.childAgents.length > 0 ? options.childAgents : RECOVERY_CHILD_PRIORITY;
   const trigger = outcome?.trigger?.kind ?? outcome?.trigger ?? "unknown";
   const action = outcome?.review?.action ?? outcome?.judgeOutcome?.action ?? "steer";
   const reason = outcome?.review?.message ?? outcome?.judgeOutcome?.reason ?? "";
@@ -16,6 +45,7 @@ export function buildRecoveryPrompt(outcome, options = {}) {
     "",
     `Likely loop trigger: ${trigger}.`,
     `Suggested action: ${action}.`,
+    "Stay in the current session and steer the active agent directly.",
   ];
 
   if (offendingTool) {
@@ -30,10 +60,11 @@ export function buildRecoveryPrompt(outcome, options = {}) {
 
   lines.push(
     "",
-    "Pause the current turn and move the next step into a fresh recovery context when supported.",
-    `Preferred child-agent order: ${childAgents.join(" -> ")}.`,
+    "Do not fork a fresh recovery context for this loop.",
+    "Use the smallest correction that breaks the loop, or stop if the loop is unbreakable.",
+    "If the active loop should advance rather than repeat, prefer invoking ralph_done from the same session.",
     "Take the smallest useful recovery step and do not repeat the same failed action.",
-    "If a fresh session is available, prefer it; otherwise use the supported fallback path.",
+    "If the current session can continue safely, let it continue.",
   );
 
   return lines.join("\n");
@@ -47,4 +78,24 @@ export function summarizeRecovery(outcome) {
   const action = outcome.review?.action ?? outcome.judgeOutcome?.action ?? outcome.intervention?.type ?? "continue";
   const reason = outcome.review?.message ?? outcome.judgeOutcome?.reason ?? outcome.trigger?.kind ?? "unknown";
   return `Loop detected via ${outcome.trigger?.kind ?? outcome.trigger}. Action: ${action}. Reason: ${reason}`;
+}
+
+function normalizeConfidence(value) {
+  const confidence = Number(value);
+  if (!Number.isFinite(confidence)) return 0;
+  if (confidence < 0) return 0;
+  if (confidence > 1) return 1;
+  return confidence;
+}
+
+function normalizeConfidenceThreshold(value) {
+  const threshold = Number(value);
+  if (!Number.isFinite(threshold)) return DEFAULT_JUDGE_CONFIDENCE_THRESHOLD;
+  if (threshold < 0) return 0;
+  if (threshold > 1) return 1;
+  return threshold;
+}
+
+function isJudgeFallbackReason(reason) {
+  return typeof reason === "string" && /^(subagent response|loop judge unavailable)/i.test(reason.trim());
 }

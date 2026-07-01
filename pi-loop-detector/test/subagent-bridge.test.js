@@ -54,7 +54,7 @@ test("bridge offloads to a separate pi subprocess when exec is available", async
     exec: async (command, args) => {
       called = true;
       assert.equal(command, "pi");
-      assert.deepEqual(args.slice(0, 5), ["--mode", "json", "-p", "--no-session", "--append-system-prompt"]);
+      assert.deepEqual(args.slice(0, 6), ["--mode", "json", "-p", "--no-session", "--no-tools", "--append-system-prompt"]);
       return {
         stdout: JSON.stringify({
           confidence: 0.88,

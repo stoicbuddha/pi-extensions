@@ -605,6 +605,27 @@ function buildResetPrompt(loop) {
   return buildIterationPrompt(loop);
 }
 
+async function deliverIterationPrompt(target, prompt) {
+  if (target && typeof target.sendMessage === "function") {
+    await target.sendMessage(
+      {
+        customType: "ralph-iteration",
+        content: prompt,
+        display: false,
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+    return true;
+  }
+
+  if (target && typeof target.sendUserMessage === "function") {
+    await target.sendUserMessage(prompt, { deliverAs: "followUp" });
+    return true;
+  }
+
+  return false;
+}
+
 async function dispatchNextIteration(pi, ctx, loop) {
   const prompt = buildIterationPrompt(loop);
 
@@ -614,11 +635,7 @@ async function dispatchNextIteration(pi, ctx, loop) {
       const result = await ctx.newSession({
         parentSession,
         withSession: async (replacementCtx) => {
-          if (typeof replacementCtx.sendUserMessage === "function") {
-            await replacementCtx.sendUserMessage(prompt);
-          } else if (typeof replacementCtx.sendMessage === "function") {
-            await replacementCtx.sendMessage(prompt);
-          }
+          await deliverIterationPrompt(replacementCtx, prompt);
         },
       });
       if (!result?.cancelled) {
@@ -629,13 +646,11 @@ async function dispatchNextIteration(pi, ctx, loop) {
     }
   }
 
-  if (typeof ctx.sendUserMessage === "function") {
-    await ctx.sendUserMessage(prompt, { deliverAs: "followUp" });
+  if (await deliverIterationPrompt(ctx, prompt)) {
     return true;
   }
 
-  if (typeof pi.sendUserMessage === "function") {
-    pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  if (await deliverIterationPrompt(pi, prompt)) {
     return true;
   }
 
@@ -654,11 +669,7 @@ async function dispatchFreshIteration(pi, ctx, loop) {
     const result = await ctx.newSession({
       parentSession,
       withSession: async (replacementCtx) => {
-        if (typeof replacementCtx.sendUserMessage === "function") {
-          await replacementCtx.sendUserMessage(prompt);
-        } else if (typeof replacementCtx.sendMessage === "function") {
-          await replacementCtx.sendMessage(prompt);
-        }
+        await deliverIterationPrompt(replacementCtx, prompt);
       },
     });
     if (!result?.cancelled) {
@@ -668,13 +679,11 @@ async function dispatchFreshIteration(pi, ctx, loop) {
     // Fall through to follow-up.
   }
 
-  if (typeof ctx.sendUserMessage === "function") {
-    await ctx.sendUserMessage(prompt, { deliverAs: "followUp" });
+  if (await deliverIterationPrompt(ctx, prompt)) {
     return true;
   }
 
-  if (typeof pi.sendUserMessage === "function") {
-    pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+  if (await deliverIterationPrompt(pi, prompt)) {
     return true;
   }
 
@@ -793,6 +802,13 @@ function formatHelp() {
 function getCurrentLoop(store, loopName) {
   const loop = getLoop(store, loopName);
   return loop ?? null;
+}
+
+export function getActiveRalphLoop(ctx) {
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store);
+  if (!loop || loop.status !== "active") return null;
+  return loop;
 }
 
 function setStatus(loop, status) {

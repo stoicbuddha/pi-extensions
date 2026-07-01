@@ -149,12 +149,28 @@ const SELF_CORRECTION_PATTERNS = [
 export class LoopDetector {
   constructor(config = {}) {
     this.config = mergeConfig(DEFAULTS, normalizeTopLevelConfig(config));
+    this.debugLogger = typeof config.debugLogger === "function" ? config.debugLogger : null;
     this.events = [];
     this.cooldownRemaining = 0;
     this.lastInterventionType = null;
     this.lastJudgeOutcome = null;
     this.pendingIntents = [];
     this.intentMismatches = [];
+  }
+
+  #debug(stage, details = {}) {
+    if (typeof this.debugLogger !== "function") {
+      return;
+    }
+
+    try {
+      this.debugLogger({
+        stage,
+        ...details,
+      });
+    } catch {
+      // Debug logging must never interfere with loop detection.
+    }
   }
 
   getState() {
@@ -168,12 +184,18 @@ export class LoopDetector {
 
   async handleEvent(event) {
     const normalizedEvent = normalizeEvent(event, this.config);
+    this.#debug("event.normalized", summarizeDebugEvent(normalizedEvent));
     this.#trackIntentState(normalizedEvent);
     this.events.push(normalizedEvent);
     this.#trimEvents();
 
     if (this.cooldownRemaining > 0) {
+      this.#debug("cooldown.active", {
+        remaining: this.cooldownRemaining,
+        event: summarizeDebugEvent(normalizedEvent),
+      });
       if (this.#shouldClearCooldownEarly(normalizedEvent)) {
+        this.#debug("cooldown.cleared", { event: summarizeDebugEvent(normalizedEvent) });
         this.cooldownRemaining = 0;
         return null;
       } else {
@@ -184,11 +206,38 @@ export class LoopDetector {
 
     const trigger = this.#evaluateHeuristics();
     if (!trigger) {
+      this.#debug("heuristic.none", {
+        recentEvents: this.events.length,
+      });
       return null;
     }
-
+    this.#debug("heuristic.trigger", trigger);
     const evidence = this.#buildEvidencePacket(trigger);
+    if (
+      isDeterministicRepeatTrigger(trigger) &&
+      typeof this.config.onDeterministicRepeat === "function"
+    ) {
+      this.#debug("trigger.pause_parent", { trigger: trigger.kind, offendingTool: trigger.offendingTool ?? null });
+      try {
+        this.config.onDeterministicRepeat({
+          trigger,
+          evidence,
+        });
+      } catch {
+        // Parent pause is best-effort; judge evaluation still continues.
+      }
+    }
+    this.#debug("judge.request", {
+      trigger: trigger.kind,
+      evidence: {
+        assistantMessages: evidence.assistantMessages.length,
+        toolCalls: evidence.toolCalls.length,
+        toolResults: evidence.toolResults.length,
+        notes: evidence.normalizedSummary?.notes ?? [],
+      },
+    });
     const judgeOutcome = await this.#runJudge(evidence);
+    this.#debug("judge.result", judgeOutcome);
     this.lastJudgeOutcome = judgeOutcome;
     const review = this.#buildReview(judgeOutcome);
 
@@ -217,6 +266,7 @@ export class LoopDetector {
           ? [trigger.offendingTool]
           : [],
     };
+    this.#debug("intervention.emit", intervention);
 
     this.lastInterventionType = intervention.type;
     this.cooldownRemaining = this.config.cooldownEvents;
@@ -302,61 +352,45 @@ export class LoopDetector {
   }
 
   #checkSameToolRepetition() {
-    const recentCalls = this.events
-      .filter((event) => event.type === "tool_call")
+    const recentEvents = this.events
+      .filter((event) => event.type === "tool_call" || event.type === "tool_result")
       .slice(-this.config.sameTool.recentActions);
 
-    if (recentCalls.length === 0) {
+    if (recentEvents.length === 0) {
+      this.#debug("heuristic.same_tool", { recentEvents: 0 });
       return null;
     }
 
-    const counts = new Map();
-    for (const call of recentCalls) {
-      counts.set(call.toolName, (counts.get(call.toolName) ?? 0) + 1);
+    const latestCall = recentEvents[recentEvents.length - 1];
+    let repeatCount = 0;
+    for (let index = recentEvents.length - 1; index >= 0; index -= 1) {
+      const call = recentEvents[index];
+      if (call.toolName !== latestCall.toolName) break;
+      if (call.argsSignature !== latestCall.argsSignature) break;
+      repeatCount += 1;
     }
 
-    const offender = [...counts.entries()].find(([toolName, count]) => {
-      const sampleCall = recentCalls.find((event) => event.toolName === toolName);
-      return count >= sameToolRepeatThreshold(sampleCall, this.config);
+    const threshold = sameToolRepeatThreshold(latestCall, this.config);
+    this.#debug("heuristic.same_tool", {
+      toolName: latestCall.toolName,
+      argsSignature: latestCall.argsSignature,
+      repeatCount,
+      threshold,
+      recentEvents: recentEvents.length,
+      eventType: latestCall.type,
     });
-    if (!offender) {
+
+    if (repeatCount < threshold) {
       return null;
-    }
-
-    const [toolName, count] = offender;
-    const offendingCalls = recentCalls.filter((event) => event.toolName === toolName);
-    const distinctArgs = new Set(offendingCalls.map((event) => event.argsSignature));
-    if (distinctArgs.size > this.config.sameTool.maxDistinctArgs) {
-      return null;
-    }
-
-    const relatedResults = this.events
-      .filter((event) => event.type === "tool_result" && event.toolName === toolName)
-      .slice(-count);
-
-    if (relatedResults.length < Math.max(1, count - 1)) {
-      return null;
-    }
-
-    const hasProgress = relatedResults.some((event) => resultIndicatesProgress(event));
-    if (hasProgress) {
-      const isLowInformationSelfCorrection =
-        isLowInformationTool(toolName, this.config) &&
-        this.#recentSelfCorrectionMessages().length >= this.config.selfCorrection.minCorrections;
-      if (!isLowInformationSelfCorrection) {
-        return null;
-      }
     }
 
     return {
       kind: "same_tool_repetition",
-      offendingTool: toolName,
-      repeatCount: count,
-      recentActionCount: recentCalls.length,
+      offendingTool: latestCall.toolName,
+      repeatCount,
+      recentActionCount: recentEvents.length,
       notes: [
-        hasProgress
-          ? `${toolName} repeated ${count} times during self-correction without changing strategy.`
-          : `${toolName} repeated ${count} times with no successful progress signal.`,
+        `${latestCall.toolName} repeated ${repeatCount} times with identical arguments.`,
       ],
     };
   }
@@ -410,6 +444,10 @@ export class LoopDetector {
       .slice(-this.config.failureRepetition.lookbackResults);
 
     const failures = recentResults.filter((event) => !event.ok);
+    this.#debug("heuristic.failure", {
+      recentResults: recentResults.length,
+      failures: failures.length,
+    });
     if (failures.length < this.config.failureRepetition.minFailures) {
       return null;
     }
@@ -428,6 +466,11 @@ export class LoopDetector {
         continue;
       }
       const toolName = bucket[0].toolName;
+      this.#debug("heuristic.failure.trigger", {
+        toolName,
+        failureCount: bucket.length,
+        failureSignature: key,
+      });
       return {
         kind: "failure_repetition",
         offendingTool: toolName,
@@ -443,6 +486,10 @@ export class LoopDetector {
 
   #checkSelfCorrectionLoop() {
     const correctionMessages = this.#recentSelfCorrectionMessages();
+    this.#debug("heuristic.self_correction", {
+      correctionMessages: correctionMessages.length,
+      minCorrections: this.config.selfCorrection.minCorrections,
+    });
 
     if (correctionMessages.length < this.config.selfCorrection.minCorrections) {
       return null;
@@ -488,6 +535,10 @@ export class LoopDetector {
     const recentMessages = this.events
       .filter((event) => event.type === "assistant_message" && event.contentFingerprint)
       .slice(-this.config.assistantRepetition.recentMessages);
+    this.#debug("heuristic.assistant_repetition", {
+      recentMessages: recentMessages.length,
+      minRepeats: this.config.assistantRepetition.minRepeats,
+    });
 
     const grouped = new Map();
     for (const message of recentMessages) {
@@ -503,6 +554,10 @@ export class LoopDetector {
       if (bucket.length < this.config.assistantRepetition.minRepeats) {
         continue;
       }
+      this.#debug("heuristic.assistant_repetition.trigger", {
+        fingerprint,
+        repeatCount: bucket.length,
+      });
       return {
         kind: "assistant_repetition",
         assistantFingerprint: fingerprint,
@@ -520,6 +575,12 @@ export class LoopDetector {
   #checkRepeatedCycle() {
     const recentEvents = this.events.slice(-this.config.cycleRepetition.recentEvents);
     const cycles = buildActionCycles(recentEvents, this.config.cycleRepetition.minAssistantChars);
+    const callCycles = buildToolCallCycles(recentEvents);
+    this.#debug("heuristic.cycle", {
+      recentEvents: recentEvents.length,
+      cycles: cycles.length,
+      callCycles: callCycles.length,
+    });
     const grouped = new Map();
 
     for (const cycle of cycles) {
@@ -533,6 +594,11 @@ export class LoopDetector {
       if (bucket.length < cycleRepeatThreshold(latest, this.config)) {
         continue;
       }
+      this.#debug("heuristic.cycle.trigger", {
+        signature,
+        repeatCount: bucket.length,
+        toolName: latest.toolName,
+      });
       return {
         kind: "cycle_repetition",
         cycleSignature: signature,
@@ -540,6 +606,35 @@ export class LoopDetector {
         repeatCount: bucket.length,
         notes: [
           `Repeated assistant/tool/result cycle ${bucket.length} times: ${latest.toolName} with materially similar context and outcome.`,
+        ],
+      };
+    }
+
+    const groupedCalls = new Map();
+    for (const cycle of callCycles) {
+      const bucket = groupedCalls.get(cycle.signature) ?? [];
+      bucket.push(cycle);
+      groupedCalls.set(cycle.signature, bucket);
+    }
+
+    for (const [signature, bucket] of groupedCalls.entries()) {
+      const latest = bucket[bucket.length - 1];
+      if (bucket.length < cycleRepeatThreshold(latest, this.config)) {
+        continue;
+      }
+      this.#debug("heuristic.cycle.trigger", {
+        signature,
+        repeatCount: bucket.length,
+        toolName: latest.toolName,
+        mode: "tool_calls_only",
+      });
+      return {
+        kind: "cycle_repetition",
+        cycleSignature: signature,
+        offendingTool: latest.toolName,
+        repeatCount: bucket.length,
+        notes: [
+          `Repeated tool call sequence ${bucket.length} times: ${latest.toolName} with identical call ordering and arguments.`,
         ],
       };
     }
@@ -878,6 +973,41 @@ function buildActionCycles(events, minAssistantChars) {
   return cycles;
 }
 
+function buildToolCallCycles(events) {
+  const toolCalls = events.filter((event) => event.type === "tool_call");
+  const cycles = [];
+  let window = [];
+
+  for (const call of toolCalls) {
+    window.push(call);
+    if (window.length < 2) {
+      continue;
+    }
+
+    const latest = window[window.length - 1];
+    const previous = window[window.length - 2];
+    if (latest.toolName !== previous.toolName || latest.argsSignature !== previous.argsSignature) {
+      window = [latest];
+      continue;
+    }
+
+    const signature = window
+      .map((item) => `${item.toolBaseName ?? item.toolName}:${item.argsSignature}`)
+      .join("->");
+
+    cycles.push({
+      signature,
+      toolName: latest.toolName,
+      toolBaseName: latest.toolBaseName ?? latest.toolName,
+      toolClass: latest.toolClass ?? "unknown",
+      toolSettings: latest.toolSettings ?? {},
+      argsSignature: latest.argsSignature,
+    });
+  }
+
+  return cycles;
+}
+
 function normalizeAssistantContent(content) {
   const withoutCodeBlocks = content.replace(/```[\s\S]*?```/g, " <code> ");
   return withoutCodeBlocks
@@ -1117,6 +1247,55 @@ function normalizeJudgeAction(value) {
     return "stop";
   }
   return "stop";
+}
+
+function isDeterministicRepeatTrigger(trigger) {
+  if (!trigger || typeof trigger !== "object") return false;
+  return trigger.kind === "same_tool_repetition" || trigger.kind === "same_call_repetition";
+}
+
+function summarizeDebugEvent(event) {
+  if (!event || typeof event !== "object") {
+    return { eventType: typeof event };
+  }
+
+  if (event.type === "assistant_message") {
+    return {
+      type: event.type,
+      id: event.id,
+      timestamp: event.timestamp,
+      contentPreview: typeof event.content === "string" ? truncateText(event.content, 180) : "",
+      contentFingerprint: event.contentFingerprint ?? "",
+    };
+  }
+
+  if (event.type === "tool_call") {
+    return {
+      type: event.type,
+      id: event.id,
+      timestamp: event.timestamp,
+      toolName: event.toolName,
+      toolClass: event.toolClass,
+      argsSignature: event.argsSignature ?? "",
+    };
+  }
+
+  if (event.type === "tool_result") {
+    return {
+      type: event.type,
+      id: event.id,
+      timestamp: event.timestamp,
+      toolName: event.toolName,
+      toolClass: event.toolClass,
+      ok: event.ok,
+      progressKind: event.progressKind,
+      argsSignature: event.argsSignature ?? "",
+      resultSignature: event.resultSignature ?? "",
+      failureSummarySignature: event.failureSummarySignature ?? "",
+    };
+  }
+
+  return { type: event.type ?? "unknown" };
 }
 
 function stableStringify(value) {

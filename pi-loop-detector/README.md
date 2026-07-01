@@ -93,7 +93,8 @@ Create `.pi-loop-detector.json` in a project root to tune generic detection for 
     "selfCorrection": { "enabled": true, "minCorrections": 3, "minRepeatedCalls": 3 },
     "sameTool": { "recentActions": 5, "minRepeats": 3, "maxDistinctArgs": 1 },
     "failureRepetition": { "minFailures": 3, "lookbackResults": 6 }
-  }
+  },
+  "debug": true
 }
 ```
 
@@ -105,6 +106,7 @@ Create `.pi-loop-detector.json` in a project root to tune generic detection for 
 - `tools`: exact per-tool overrides after alias normalization.
 - `resultPatterns`: regexes for interpreting tool output as progress, no progress, or failure.
 - `heuristics`: threshold overrides. These map onto the detector's built-in heuristic config.
+- `debug`: when `true`, emit loop detector debug logs into the session transcript or terminal output.
 
 Exact `tools` entries win over `toolClasses`. Result patterns can override class defaults: failure beats no-progress, no-progress beats success, and explicit progress beats weak success.
 
@@ -140,6 +142,8 @@ Tune looser when the model should get more room to recover on its own:
 ```
 
 This is useful when the model is often able to talk itself out of a bad approach after one or two failed attempts.
+
+When `debug` is enabled, use `/loop-detector debug on` or set `"debug": true` in `.pi-loop-detector.json` to see heuristic checks, trigger decisions, judge requests, and interventions.
 
 Mark successful tools as non-progress when `ok: true` only means "the command ran":
 

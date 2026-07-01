@@ -6,35 +6,188 @@ import { LoopDetector, createEvidencePacket } from "../src/index.js";
 test("detects same-tool repetition with no progress", async () => {
   const detector = new LoopDetector();
 
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } });
-  await detector.handleEvent({
+  let outcome = null;
+  outcome = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_result",
     toolName: "rollback_status",
     args: { id: 1 },
     ok: false,
     result: "failed",
-  });
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } });
-  await detector.handleEvent({
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_result",
     toolName: "rollback_status",
     args: { id: 1 },
     ok: false,
     result: "failed",
-  });
-  const outcome = await detector.handleEvent({
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_call",
     toolName: "rollback_status",
     args: { id: 1 },
-  });
+  })) ?? outcome;
 
   assert.equal(outcome.trigger.kind, "same_tool_repetition");
   assert.equal(outcome.intervention.type, "stop");
   assert.equal(outcome.intervention.offendingTool, "rollback_status");
 });
 
-test("detects repeated intent/action mismatch", async () => {
+test("detects repeated identical call payloads even when results are errors", async () => {
   const detector = new LoopDetector();
+
+  let outcome = null;
+  outcome = (await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolKitMCP_read_file",
+    args: { path: "src/app.rs", start_line: 51, end_line: 213 },
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_read_file",
+    args: { path: "src/app.rs", start_line: 51, end_line: 213 },
+    ok: false,
+    result: {
+      ok: false,
+      error: {
+        code: "missing_cwd",
+        message: "DO THIS FIRST: call set_project_cwd with the project root path before using this tool",
+      },
+    },
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolKitMCP_read_file",
+    args: { path: "src/app.rs", start_line: 51, end_line: 213 },
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_read_file",
+    args: { path: "src/app.rs", start_line: 51, end_line: 213 },
+    ok: false,
+    result: {
+      ok: false,
+      error: {
+        code: "missing_cwd",
+        message: "DO THIS FIRST: call set_project_cwd with the project root path before using this tool",
+      },
+    },
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
+    type: "tool_call",
+    toolName: "ToolKitMCP_read_file",
+    args: { path: "src/app.rs", start_line: 51, end_line: 213 },
+  })) ?? outcome;
+
+  assert.equal(outcome.trigger.kind, "same_tool_repetition");
+  assert.equal(outcome.intervention.offendingTool, "ToolKitMCP_read_file");
+});
+
+test("detects repeated identical tool results with the same payload", async () => {
+  const detector = new LoopDetector();
+
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_list_dir",
+    args: { path: "." },
+    ok: true,
+    result: { entries: [] },
+  });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_list_dir",
+    args: { path: "." },
+    ok: true,
+    result: { entries: [] },
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_list_dir",
+    args: { path: "." },
+    ok: true,
+    result: { entries: [] },
+  });
+
+  assert.equal(outcome.trigger.kind, "same_tool_repetition");
+  assert.equal(outcome.intervention.offendingTool, "ToolKitMCP_list_dir");
+});
+
+test("emits debug logs when enabled", async () => {
+  const logs = [];
+  const detector = new LoopDetector({
+    debugLogger: (entry) => logs.push(entry),
+  });
+
+  await detector.handleEvent({
+    type: "tool_call",
+    toolName: "search_query",
+    args: { q: "a" },
+  });
+  await detector.handleEvent({
+    type: "tool_call",
+    toolName: "search_query",
+    args: { q: "a" },
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_call",
+    toolName: "search_query",
+    args: { q: "a" },
+  });
+
+  assert.equal(outcome.trigger.kind, "same_tool_repetition");
+  assert.ok(logs.some((entry) => entry.stage === "heuristic.same_tool"));
+  assert.ok(logs.some((entry) => entry.stage === "heuristic.trigger"));
+  assert.ok(logs.some((entry) => entry.stage === "judge.request"));
+});
+
+test("pauses the parent before judging exact repeat loops", async () => {
+  const events = [];
+  const detector = new LoopDetector({
+    onDeterministicRepeat: ({ trigger }) => {
+      events.push(`pause:${trigger.kind}`);
+    },
+    judge: async () => {
+      events.push("judge");
+      return {
+        confidence: 1,
+        action: "stop",
+        reason: "ok",
+      };
+    },
+  });
+
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_list_dir",
+    args: { path: "." },
+    ok: true,
+    result: { entries: [] },
+  });
+  await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_list_dir",
+    args: { path: "." },
+    ok: true,
+    result: { entries: [] },
+  });
+  const outcome = await detector.handleEvent({
+    type: "tool_result",
+    toolName: "ToolKitMCP_list_dir",
+    args: { path: "." },
+    ok: true,
+    result: { entries: [] },
+  });
+
+  assert.equal(outcome.trigger.kind, "same_tool_repetition");
+  assert.equal(outcome.judgeOutcome.action, "stop");
+  assert.deepEqual(events, ["pause:same_tool_repetition", "judge"]);
+});
+
+test("detects repeated intent/action mismatch", async () => {
+  const detector = new LoopDetector({
+    sameTool: { enabled: false },
+  });
 
   await detector.handleEvent({
     type: "assistant_message",
@@ -65,7 +218,9 @@ test("detects repeated intent/action mismatch", async () => {
 });
 
 test("does not treat ordinary prose as a tool declaration", async () => {
-  const detector = new LoopDetector();
+  const detector = new LoopDetector({
+    sameTool: { enabled: false },
+  });
 
   await detector.handleEvent({
     type: "assistant_message",
@@ -98,7 +253,9 @@ test("does not treat ordinary prose as a tool declaration", async () => {
 });
 
 test("does not trigger intent mismatch when the alternate tool makes progress", async () => {
-  const detector = new LoopDetector();
+  const detector = new LoopDetector({
+    sameTool: { enabled: false },
+  });
 
   await detector.handleEvent({
     type: "assistant_message",
@@ -290,7 +447,7 @@ test("does not trigger same-tool repetition when arguments materially change", a
 
 test("detects repeated failures with similar inputs", async () => {
   const detector = new LoopDetector({
-    sameTool: { minRepeats: 99 },
+    sameTool: { enabled: false },
     selfCorrection: { minCorrections: 99 },
     tools: {
       ToolKitMCP_apply_edit_plan: { sameToolRepeats: 99 },
@@ -325,7 +482,7 @@ test("detects repeated failures with similar inputs", async () => {
 
 test("detects repeated edit-plan path failures with self-correction narration", async () => {
   const detector = new LoopDetector({
-    sameTool: { minRepeats: 99 },
+    sameTool: { enabled: false },
     selfCorrection: { minCorrections: 99 },
     tools: {
       ToolKitMCP_apply_edit_plan: { sameToolRepeats: 99 },
@@ -376,7 +533,7 @@ test("detects repeated edit-plan path failures with self-correction narration", 
 
 test("detects self-correction loop", async () => {
   const detector = new LoopDetector({
-    sameTool: { minRepeats: 99 },
+    sameTool: { enabled: false },
     failureRepetition: { minFailures: 99 },
     selfCorrection: { minCorrections: 2, minRepeatedCalls: 2 },
   });
@@ -415,7 +572,7 @@ test("detects self-correction loop", async () => {
 
 test("does not trigger while assistant is still attempting a short self-correction recovery", async () => {
   const detector = new LoopDetector({
-    sameTool: { minRepeats: 99 },
+    sameTool: { enabled: false },
     failureRepetition: { minFailures: 99 },
   });
 
@@ -443,15 +600,16 @@ test("does not trigger while assistant is still attempting a short self-correcti
 test("cooldown suppresses repeated interventions until behavior changes", async () => {
   const detector = new LoopDetector();
 
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
-  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
-  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
-  const first = await detector.handleEvent({
+  let first = null;
+  first = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} })) ?? first;
+  first = (await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" })) ?? first;
+  first = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} })) ?? first;
+  first = (await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" })) ?? first;
+  first = (await detector.handleEvent({
     type: "tool_call",
     toolName: "rollback_status",
     args: {},
-  });
+  })) ?? first;
   assert.equal(first.intervention.type, "stop");
 
   const suppressed = await detector.handleEvent({
@@ -476,27 +634,20 @@ test("resets loop evidence after an intervention so a follow-up read does not re
     selfCorrection: { minCorrections: 99 },
   });
 
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } });
-  await detector.handleEvent({
+  let outcome = null;
+  outcome = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_result",
     toolName: "rollback_status",
     args: { id: 1 },
     ok: false,
     result: "failed",
-  });
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: { id: 1 } });
-  await detector.handleEvent({
-    type: "tool_result",
-    toolName: "rollback_status",
-    args: { id: 1 },
-    ok: false,
-    result: "failed",
-  });
-  const outcome = await detector.handleEvent({
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_call",
     toolName: "rollback_status",
     args: { id: 1 },
-  });
+  })) ?? outcome;
 
   assert.equal(outcome.trigger.kind, "same_tool_repetition");
   assert.equal(detector.getState().recentEvents.length, 0);
@@ -528,15 +679,16 @@ test("uses judge output to choose deterministic intervention", async () => {
     }),
   });
 
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
-  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
-  await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} });
-  await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" });
-  const outcome = await detector.handleEvent({
+  let outcome = null;
+  outcome = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} })) ?? outcome;
+  outcome = (await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" })) ?? outcome;
+  outcome = (await detector.handleEvent({ type: "tool_call", toolName: "rollback_status", args: {} })) ?? outcome;
+  outcome = (await detector.handleEvent({ type: "tool_result", toolName: "rollback_status", args: {}, ok: false, result: "failed" })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_call",
     toolName: "rollback_status",
     args: {},
-  });
+  })) ?? outcome;
 
   assert.equal(outcome.intervention.type, "stop");
   assert.deepEqual(outcome.intervention.blockedTools, ["rollback_status"]);
@@ -612,19 +764,19 @@ test("uses configured no-progress result patterns", async () => {
     },
   });
 
-  await detector.handleEvent({ type: "tool_call", toolName: "inspect_state", args: { id: 1 } });
-  await detector.handleEvent({
+  let outcome = await detector.handleEvent({ type: "tool_call", toolName: "inspect_state", args: { id: 1 } });
+  outcome = (await detector.handleEvent({
     type: "tool_result",
     toolName: "inspect_state",
     args: { id: 1 },
     ok: true,
     result: "dry run only; no update applied",
-  });
-  const outcome = await detector.handleEvent({
+  })) ?? outcome;
+  outcome = (await detector.handleEvent({
     type: "tool_call",
     toolName: "inspect_state",
     args: { id: 1 },
-  });
+  })) ?? outcome;
 
   assert.equal(outcome.trigger.kind, "same_tool_repetition");
 });

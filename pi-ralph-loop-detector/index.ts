@@ -5,33 +5,33 @@ import * as path from "node:path";
 
 import { LoopDetector } from "./src/index.js";
 import { evaluateLoopWithSubagent } from "./src/subagent-bridge.js";
-import { buildRecoveryPrompt, selectRecoveryChildren, summarizeRecovery } from "./routing.js";
-import { registerRalphSurface } from "./ralph-tools.js";
+import { buildRecoveryPrompt, summarizeRecovery } from "./routing.js";
+import { getActiveRalphLoop, registerRalphSurface } from "./ralph-tools.js";
 
 type LoopEvent =
 	| {
-			type: "assistant_message";
-			content: string;
-			timestamp?: string;
-			id?: string;
-	  }
+		type: "assistant_message";
+		content: string;
+		timestamp?: string;
+		id?: string;
+	}
 	| {
-			type: "tool_call";
-			toolName: string;
-			args?: Record<string, unknown>;
-			timestamp?: string;
-			id?: string;
-	  }
+		type: "tool_call";
+		toolName: string;
+		args?: Record<string, unknown>;
+		timestamp?: string;
+		id?: string;
+	}
 	| {
-			type: "tool_result";
-			toolName: string;
-			args?: Record<string, unknown>;
-			ok: boolean;
-			progress?: boolean;
-			result?: unknown;
-			timestamp?: string;
-			id?: string;
-	  };
+		type: "tool_result";
+		toolName: string;
+		args?: Record<string, unknown>;
+		ok: boolean;
+		progress?: boolean;
+		result?: unknown;
+		timestamp?: string;
+		id?: string;
+	};
 
 type LoopOutcome = Awaited<ReturnType<LoopDetector["handleEvent"]>>;
 type JudgeAction = "continue" | "stop" | "steer";
@@ -56,12 +56,15 @@ interface RuntimeState {
 	lastOutcome: LoopOutcome;
 	lastRecoveryPrompt: string | null;
 	lastRecoveryAgents: string[];
+	judgeConfidenceThreshold: number;
+	activeLoopName: string | null;
 	lastResetAt: string;
 }
 
 const MAX_RUNTIME_EVENTS = 64;
 const MAX_INPUT_HISTORY = 6;
-const DEFAULT_JUDGE_TIMEOUT_MS = 15_000;
+const DEFAULT_JUDGE_TIMEOUT_MS = null;
+const DEFAULT_JUDGE_CONFIDENCE_THRESHOLD = 0.7;
 const MAX_INPUT_CHARS = 2000;
 const MAX_DEBUG_EVENTS = 120;
 const MAX_DEBUG_TEXT = 600;
@@ -120,6 +123,8 @@ function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: 
 		lastOutcome: null,
 		lastRecoveryPrompt: null,
 		lastRecoveryAgents: [],
+		judgeConfidenceThreshold: normalizeJudgeConfidenceThreshold(config.judgeConfidenceThreshold) ?? DEFAULT_JUDGE_CONFIDENCE_THRESHOLD,
+		activeLoopName: null,
 		lastResetAt: new Date().toISOString(),
 	} as RuntimeState;
 
@@ -143,6 +148,58 @@ function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: 
 	});
 
 	return state;
+}
+
+function normalizeJudgeConfidenceThreshold(value: unknown): number | null {
+	const threshold = Number(value);
+	if (!Number.isFinite(threshold)) return null;
+	if (threshold < 0) return 0;
+	if (threshold > 1) return 1;
+	return threshold;
+}
+
+function resolveJudgeDisposition(outcome: NonNullable<LoopOutcome>, confidenceThreshold: number): {
+	action: "continue" | "stop" | "steer";
+	confidence: number;
+	reason: string;
+} {
+	const action = outcome.review?.action ?? outcome.judgeOutcome?.action ?? "continue";
+	const confidence = normalizeJudgeConfidence(outcome.review?.confidence ?? outcome.judgeOutcome?.confidence);
+	const reason = outcome.review?.message ?? outcome.judgeOutcome?.reason ?? "";
+
+	if (action === "continue") {
+		return { action: "continue", confidence, reason };
+	}
+
+	if (isJudgeFallbackReason(reason)) {
+		return { action: action === "steer" ? "steer" : "stop", confidence, reason };
+	}
+
+	if (confidence < confidenceThreshold) {
+		return {
+			action: "continue",
+			confidence,
+			reason: reason || "judge confidence below threshold",
+		};
+	}
+
+	return {
+		action: action === "steer" ? "steer" : "stop",
+		confidence,
+		reason,
+	};
+}
+
+function normalizeJudgeConfidence(value: unknown): number {
+	const confidence = Number(value);
+	if (!Number.isFinite(confidence)) return 0;
+	if (confidence < 0) return 0;
+	if (confidence > 1) return 1;
+	return confidence;
+}
+
+function isJudgeFallbackReason(reason: string): boolean {
+	return /^(subagent response|loop judge unavailable)/i.test(reason.trim());
 }
 
 function loadProjectConfig(ctx: any): Record<string, unknown> {
@@ -253,16 +310,28 @@ function inferResultPayload(event: any): unknown {
 
 function inferToolResultStatus(event: any): { ok: boolean; progress: boolean | undefined } {
 	const payload = inferResultPayload(event);
-	const explicitOk = typeof event?.ok === "boolean" ? event.ok : typeof event?.success === "boolean" ? event.success : undefined;
+	const payloadText = extractText(payload);
+	const explicitOk =
+		typeof event?.ok === "boolean"
+			? event.ok
+			: typeof event?.success === "boolean"
+				? event.success
+				: typeof event?.isError === "boolean"
+					? !event.isError
+					: undefined;
 	const exitCode = typeof event?.exit_code === "number" ? event.exit_code : typeof event?.exitCode === "number" ? event.exitCode : undefined;
 	const explicitProgress = typeof event?.progress === "boolean" ? event.progress : undefined;
+	const textualError = typeof payloadText === "string" && /"ok"\s*:\s*false|\bmissing_cwd\b|\binvalid_arguments\b|\berror\b|DO THIS FIRST/i.test(payloadText);
 
 	let ok: boolean;
 	if (explicitOk !== undefined) {
 		ok = explicitOk;
 	} else if (typeof exitCode === "number") {
 		ok = exitCode === 0;
-	} else if (payload && typeof payload === "object" && ((payload as Record<string, unknown>).error != null || (payload as Record<string, unknown>).errors != null)) {
+	} else if (
+		(payload && typeof payload === "object" && ((payload as Record<string, unknown>).error != null || (payload as Record<string, unknown>).errors != null)) ||
+		textualError
+	) {
 		ok = false;
 	} else {
 		ok = true;
@@ -317,12 +386,27 @@ function createJudgeBridge(pi: ExtensionAPI): JudgeBridge {
 	};
 }
 
-function buildRecoveryContext(state: RuntimeState, outcome: NonNullable<LoopOutcome>): { prompt: string; agents: string[] } {
-	const agents = selectRecoveryChildren();
-	const prompt = buildRecoveryPrompt(outcome, { childAgents: agents, title: `Ralph recovery after ${outcome?.trigger?.kind ?? "loop"}` });
+async function deliverRecoveryPrompt(target: any, prompt: string): Promise<boolean> {
+	if (target && typeof target.sendMessage === "function") {
+		await target.sendMessage(
+			{
+				customType: "ralph-recovery",
+				content: prompt,
+				display: false,
+			},
+			{ deliverAs: "steer", triggerTurn: true },
+		);
+		return true;
+	}
+
+	return false;
+}
+
+function buildRecoveryContext(state: RuntimeState, outcome: NonNullable<LoopOutcome>): { prompt: string } {
+	const prompt = buildRecoveryPrompt(outcome, { title: `Ralph recovery after ${outcome?.trigger?.kind ?? "loop"}` });
 	state.lastRecoveryPrompt = prompt;
-	state.lastRecoveryAgents = agents;
-	return { prompt, agents };
+	state.lastRecoveryAgents = [];
+	return { prompt };
 }
 
 async function dispatchRecovery(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>, pi: ExtensionAPI): Promise<void> {
@@ -331,42 +415,29 @@ async function dispatchRecovery(state: RuntimeState, ctx: any, outcome: NonNulla
 	state.haltReason = outcome.review?.message || outcome.judgeOutcome?.reason || outcome.trigger?.kind || "loop detected";
 
 	const { prompt } = buildRecoveryContext(state, outcome);
-	if (ctx.hasUI) {
-		ctx.ui.notify(`Ralph loop recovery requested for ${outcome.trigger?.kind ?? "loop"}; routing to child work.${state.lastRecoveryAgents.length ? ` Preferred order: ${state.lastRecoveryAgents.join(" -> ")}.` : ""}`, "warning");
-	}
-
 	let dispatched = false;
-	if (typeof ctx.newSession === "function") {
-		try {
-			const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
-			const result = await ctx.newSession({
-				parentSession,
-				withSession: async (replacementCtx: any) => {
-					if (typeof replacementCtx.sendUserMessage === "function") {
-						await replacementCtx.sendUserMessage(prompt);
-					} else if (typeof replacementCtx.sendMessage === "function") {
-						await replacementCtx.sendMessage(prompt);
-					}
-				},
-			});
-			dispatched = !result?.cancelled;
-		} catch {
-			dispatched = false;
-		}
-	}
-
-	if (!dispatched) {
-		if (typeof ctx.sendUserMessage === "function") {
-			await ctx.sendUserMessage(prompt, { deliverAs: "followUp" });
-			dispatched = true;
-		} else if (typeof pi.sendUserMessage === "function") {
-			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-			dispatched = true;
-		}
+	if (typeof ctx.sendMessage === "function") {
+		dispatched = await deliverRecoveryPrompt(ctx, prompt);
+	} else if (typeof pi.sendMessage === "function") {
+		dispatched = await deliverRecoveryPrompt(pi, prompt);
 	}
 
 	if (!dispatched && ctx.hasUI) {
-		ctx.ui.notify(`Ralph recovery prompt could not be dispatched automatically.\n${prompt}`, "warning");
+		ctx.ui.notify("Ralph recovery prompt could not be dispatched automatically.", "warning");
+	}
+
+	// if (typeof ctx.abort === "function" && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+	// 	ctx.abort();
+	// }
+}
+
+async function haltWithoutRecovery(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>): Promise<void> {
+	if (state.halted) return;
+	state.halted = true;
+	state.haltReason = outcome.review?.message || outcome.judgeOutcome?.reason || outcome.trigger?.kind || "loop detected";
+
+	if (ctx.hasUI) {
+		ctx.ui.notify(`Ralph loop detector halted on ${outcome.trigger?.kind ?? "loop"}; reset required.`, "warning");
 	}
 
 	if (typeof ctx.abort === "function" && typeof ctx.isIdle === "function" && !ctx.isIdle()) {
@@ -375,15 +446,51 @@ async function dispatchRecovery(state: RuntimeState, ctx: any, outcome: NonNulla
 }
 
 async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAPI, outcome: NonNullable<LoopOutcome>): Promise<void> {
-	const action = outcome.review?.action ?? outcome.judgeOutcome?.action;
-	if (!action || action === "continue") return;
-	await dispatchRecovery(state, ctx, outcome, pi);
+	const disposition = resolveJudgeDisposition(outcome, { confidenceThreshold: state.judgeConfidenceThreshold });
+	if (ctx.hasUI) {
+		const confidenceLabel = Number.isFinite(disposition.confidence) ? disposition.confidence.toFixed(2) : "0.00";
+		const reason = disposition.reason?.trim() || "no reason provided";
+		const trigger = outcome.trigger?.kind ?? "loop";
+		const level = disposition.action === "continue" ? "info" : "warning";
+		ctx.ui.notify(`Ralph judge: ${disposition.action} on ${trigger} (confidence ${confidenceLabel}). ${reason}`, level);
+	}
+	if (disposition.action === "continue") return;
+	if (disposition.action === "steer") {
+		await dispatchRecovery(state, ctx, outcome, pi);
+		return;
+	}
+	await haltWithoutRecovery(state, ctx, outcome);
 }
 
 export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 	let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi));
 
+	function syncActiveLoop(ctx: any): string | null {
+		const activeLoop = getActiveRalphLoop(ctx);
+		const activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
+		if (!activeLoopName) {
+			if (runtime.activeLoopName !== null || runtime.events.length > 0 || runtime.halted || runtime.lastOutcome) {
+				runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+				runtime.hostContext = ctx;
+			}
+			runtime.activeLoopName = null;
+			return null;
+		}
+
+		if (runtime.activeLoopName !== activeLoopName) {
+			runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
+			runtime.hostContext = ctx;
+			runtime.activeLoopName = activeLoopName;
+			return activeLoopName;
+		}
+
+		runtime.hostContext = ctx;
+		runtime.activeLoopName = activeLoopName;
+		return activeLoopName;
+	}
+
 	async function handleRuntimeEvent(event: LoopEvent, ctx: any): Promise<void> {
+		if (!syncActiveLoop(ctx)) return;
 		recordRuntimeEvent(runtime, event);
 		if (runtime.halted) return;
 		const outcome = await runtime.detector.handleEvent(event);
@@ -395,8 +502,10 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 	}
 
 	function resetRuntime(ctx: any): void {
+		const activeLoop = getActiveRalphLoop(ctx);
 		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
 		runtime.hostContext = ctx;
+		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 		if (ctx.hasUI) ctx.ui.notify("Ralph loop detector runtime state reset.", "info");
 	}
 
@@ -445,14 +554,14 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 					return;
 				}
 
-				if (command === "status") {
-					const summary = runtime.lastOutcome ? summarizeOutcome(runtime.lastOutcome) : "No loop detected in this session.";
-					const halted = runtime.halted ? `Halted: yes (${runtime.haltReason ?? "unknown"})` : "Halted: no";
-					const recovery = runtime.lastRecoveryPrompt ? `Last recovery route: ${runtime.lastRecoveryAgents.join(" -> ") || "unknown"}` : "Last recovery route: none";
-					const debug = `Debug: ${runtime.debugEnabled ? "on" : "off"} (${runtime.debugEvents.length} buffered)`;
-					if (ctx.hasUI) {
-						ctx.ui.notify(`${summary}\n${halted}\n${recovery}\n${debug}\nCaptured events: ${runtime.events.length}`, "info");
-					}
+					if (command === "status") {
+						const summary = runtime.lastOutcome ? summarizeOutcome(runtime.lastOutcome) : "No loop detected in this session.";
+						const halted = runtime.halted ? `Halted: yes (${runtime.haltReason ?? "unknown"})` : "Halted: no";
+						const recovery = runtime.lastRecoveryPrompt ? "Last recovery prompt: present" : "Last recovery prompt: none";
+						const debug = `Debug: ${runtime.debugEnabled ? "on" : "off"} (${runtime.debugEvents.length} buffered)`;
+						if (ctx.hasUI) {
+							ctx.ui.notify(`${summary}\n${halted}\n${recovery}\n${debug}\nCaptured events: ${runtime.events.length}`, "info");
+						}
 					return;
 				}
 
@@ -508,12 +617,12 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 				...(params.config ?? {}),
 				debug: Boolean(params.config?.debug)
 					? (entry: { stage: string; payload: unknown }) => {
-							debugTrace.push({
-								at: new Date().toISOString(),
-								stage: entry.stage,
-								payload: entry.payload,
-							});
-					  }
+						debugTrace.push({
+							at: new Date().toISOString(),
+							stage: entry.stage,
+							payload: entry.payload,
+						});
+					}
 					: undefined,
 			});
 			let outcome: LoopOutcome = null;
@@ -531,10 +640,9 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 					outcome,
 					state,
 					debugTrace: debugTrace.length > 0 ? debugTrace : undefined,
-					recovery: outcome && outcome.review?.action !== "continue" ? {
-						childAgents: selectRecoveryChildren(),
-						prompt: buildRecoveryPrompt(outcome, { childAgents: selectRecoveryChildren() }),
-					} : undefined,
+						recovery: outcome && outcome.review?.action !== "continue" ? {
+							prompt: buildRecoveryPrompt(outcome),
+						} : undefined,
 					runtimeSummary:
 						inputEvents === runtime.events
 							? {
@@ -550,10 +658,12 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		const activeLoop = getActiveRalphLoop(ctx);
 		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
 		runtime.hostContext = ctx;
+		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 		if (ctx.hasUI) {
-			ctx.ui.notify("Ralph loop detector active for this session.", "info");
+			ctx.ui.notify("Ralph loop detector loaded for this session.", "info");
 		}
 	});
 

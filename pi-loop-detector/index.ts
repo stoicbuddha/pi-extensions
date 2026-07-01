@@ -46,6 +46,7 @@ interface RuntimeState {
 	events: LoopEvent[];
 	inputHistory: string[];
 	hostContext: any | null;
+	debugEnabled: boolean;
 	halted: boolean;
 	haltReason: string | null;
 	lastOutcome: LoopOutcome;
@@ -54,7 +55,7 @@ interface RuntimeState {
 
 const MAX_RUNTIME_EVENTS = 64;
 const MAX_INPUT_HISTORY = 6;
-const DEFAULT_JUDGE_TIMEOUT_MS = 15_000;
+const DEFAULT_JUDGE_TIMEOUT_MS = null;
 const MAX_INPUT_CHARS = 2000;
 const MAX_TOOL_ARG_STRING_CHARS = 500;
 const MAX_TOOL_ARGS_JSON_CHARS = 1400;
@@ -87,6 +88,7 @@ function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: 
 		events: [],
 		inputHistory: [],
 		hostContext: null,
+		debugEnabled: isDebugEnabled(config),
 		halted: false,
 		haltReason: null,
 		lastOutcome: null,
@@ -97,9 +99,45 @@ function createRuntimeState(config: Record<string, unknown> = {}, judgeBridge?: 
 	state.detector = new LoopDetector({
 		...config,
 		judge,
+		debugLogger: createDebugSink(state),
+		onDeterministicRepeat: ({ trigger }: { trigger: { kind?: string; offendingTool?: string | null } }) => {
+			if (state.hostContext?.hasUI) {
+				const tool = trigger.offendingTool ?? "the repeated action";
+				state.hostContext.ui.notify(`Loop detector paused the parent on ${trigger.kind} for ${tool}; judging now.`, "warning");
+			}
+		},
 	});
 
 	return state;
+}
+
+function isDebugEnabled(config: Record<string, unknown>): boolean {
+	return Boolean(config.debug ?? config.debugLogs ?? config.verbose);
+}
+
+function createDebugSink(state: RuntimeState): (entry: Record<string, unknown>) => void {
+	return (entry) => {
+		if (!state.debugEnabled) return;
+		let message = "[loop-detector debug]";
+		try {
+			message = formatDebugEntry(entry);
+		} catch {
+			// Keep debug logging best-effort only.
+		}
+		if (state.hostContext?.hasUI) {
+			state.hostContext.ui.notify(message, "warning");
+			return;
+		}
+		console.warn(message);
+	};
+}
+
+function formatDebugEntry(entry: Record<string, unknown>): string {
+	const stage = typeof entry.stage === "string" ? entry.stage : "debug";
+	const details = { ...entry };
+	delete (details as { stage?: unknown }).stage;
+	const payload = Object.keys(details).length > 0 ? ` ${truncateText(JSON.stringify(sanitizeForPrompt(details)), 1200)}` : "";
+	return `[loop-detector debug] ${stage}${payload}`;
 }
 
 function loadProjectConfig(ctx: any): Record<string, unknown> {
@@ -320,6 +358,7 @@ function getLatestAssistantMessage(event: any): string {
 
 function createJudgeBridge(pi: ExtensionAPI): JudgeBridge {
 	return async (evidence, state) => {
+		notifyJudgeActivation(state, evidence, DEFAULT_JUDGE_TIMEOUT_MS);
 		return evaluateLoopWithSubagent(
 			pi,
 			evidence,
@@ -357,6 +396,22 @@ function applyJudgeOutcome(state: RuntimeState, ctx: any, outcome: NonNullable<L
 	}
 }
 
+function notifyJudgeActivation(state: RuntimeState, evidence: unknown, timeoutMs: number | null | undefined): void {
+	const summary = evidence && typeof evidence === "object" ? (evidence as { trigger?: unknown; normalizedSummary?: { offendingTool?: string | null } }).normalizedSummary : null;
+	const trigger = evidence && typeof evidence === "object" ? (evidence as { trigger?: unknown }).trigger : null;
+	const triggerKind = typeof trigger === "string" ? trigger : "unknown_trigger";
+	const tool = summary && typeof summary.offendingTool === "string" ? summary.offendingTool : null;
+	const timeoutLabel = Number.isFinite(timeoutMs as number) && (timeoutMs as number) > 0 ? `${timeoutMs}ms` : "unlimited";
+	const message = `Loop detector judge activated for ${triggerKind}${tool ? ` on ${tool}` : ""}; evaluating now (timeout: ${timeoutLabel}).`;
+
+	if (state.hostContext?.hasUI) {
+		state.hostContext.ui.notify(message, "warning");
+		return;
+	}
+
+	console.warn(message);
+}
+
 export default function loopDetectorExtension(pi: ExtensionAPI) {
 	let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi));
 
@@ -373,18 +428,32 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const [command] = args.trim().split(/\s+/);
 
-			if (command === "reset") {
+	if (command === "reset") {
 				runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi));
 				runtime.hostContext = ctx;
 				if (ctx.hasUI) ctx.ui.notify("Loop detector runtime state reset.", "info");
 				return;
 			}
 
+			if (command === "debug") {
+				const [, mode] = args.trim().split(/\s+/);
+				if (mode === "on") {
+					runtime.debugEnabled = true;
+				} else if (mode === "off") {
+					runtime.debugEnabled = false;
+				}
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Loop detector debug ${runtime.debugEnabled ? "enabled" : "disabled"}.`, "warning");
+				}
+				return;
+			}
+
 			if (command === "status") {
 				const summary = runtime.lastOutcome ? summarizeOutcome(runtime.lastOutcome) : "No loop detected in this session.";
 				const halted = runtime.halted ? `Halted: yes (${runtime.haltReason ?? "unknown"})` : "Halted: no";
+				const debug = runtime.debugEnabled ? "Debug: yes" : "Debug: no";
 				if (ctx.hasUI) {
-					ctx.ui.notify(`${summary}\n${halted}\nCaptured events: ${runtime.events.length}`, "info");
+					ctx.ui.notify(`${summary}\n${halted}\n${debug}\nCaptured events: ${runtime.events.length}`, "info");
 				}
 				return;
 			}
@@ -394,6 +463,7 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 					[
 						"Loop Detector",
 						"  /loop-detector status   Show runtime detector state",
+						"  /loop-detector debug on|off  Toggle debug logs for this session",
 						"  /loop-detector reset    Clear captured detector state",
 					].join("\n"),
 					"info",
@@ -430,7 +500,11 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
 			const inputEvents = Array.isArray(params.events) && params.events.length > 0 ? (params.events as LoopEvent[]) : runtime.events;
-			const detector = new LoopDetector(params.config ?? {});
+			const debugEnabled = Boolean((params.config as Record<string, unknown> | undefined)?.debug ?? (params.config as Record<string, unknown> | undefined)?.debugLogs ?? runtime.debugEnabled);
+			const detector = new LoopDetector({
+				...(params.config ?? {}),
+				debugLogger: debugEnabled ? createDebugSink(runtime) : undefined,
+			});
 			let outcome: LoopOutcome = null;
 
 			for (const rawEvent of inputEvents) {
@@ -464,6 +538,9 @@ export default function loopDetectorExtension(pi: ExtensionAPI) {
 		runtime.hostContext = ctx;
 		if (ctx.hasUI) {
 			ctx.ui.notify("Loop detector active for this session.", "info");
+			if (runtime.debugEnabled) {
+				ctx.ui.notify("Loop detector debug enabled.", "warning");
+			}
 		}
 	});
 
