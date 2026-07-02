@@ -811,8 +811,7 @@ export default function (pi: ExtensionAPI) {
 	function loadState(ctx: ExtensionContext, name: string, archived = false): LoopState | null {
 		const db = openDb(ctx);
 		void ctx;
-		void archived;
-		return stateFromDb(db, name, false);
+		return stateFromDb(db, name, archived);
 	}
 
 	function saveState(ctx: ExtensionContext, state: LoopState, archived = false): void {
@@ -1436,6 +1435,53 @@ export default function (pi: ExtensionAPI) {
 		dispatchNextIterationResetFollowUp(ctx, state, content, needsReflection);
 	}
 
+	async function advanceLoopIteration(ctx: ExtensionContext, state: LoopState, reason: string): Promise<string> {
+		if (!state || state.status !== "active") return "Ralph loop is not active.";
+		if (ctx.hasPendingMessages()) return "Pending messages already queued. Skipping iteration advance.";
+
+		state.iteration++;
+		recordLoopEvent(ctx, state.name, reason, "Iteration advanced", state.iteration, { sessionStrategy: state.sessionStrategy });
+		if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
+			completeLoop(
+				ctx,
+				state,
+				`───────────────────────────────────────────────────────────────────────
+⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
+───────────────────────────────────────────────────────────────────────`,
+			);
+			return "Max iterations reached. Loop stopped.";
+		}
+		const iterationData = getIterationContent(ctx, state);
+		if (!iterationData) {
+			pauseLoop(ctx, state);
+			return "Error: Could not read Ralph plan state from the database.";
+		}
+		const { content, needsReflection } = iterationData;
+		if (needsReflection) state.lastReflectionAt = state.iteration;
+		saveState(ctx, state);
+		updateUI(ctx);
+		const checkpointResult = checkpointLoopState(ctx, state);
+		if (!checkpointResult.ok) {
+			pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. ${checkpointResult.message}`);
+			return `Error: ${checkpointResult.message}`;
+		}
+		if (checkpointResult.skipped && ctx.hasUI) {
+			ctx.ui.notify(checkpointResult.message, "info");
+		}
+		const graphifyResult = runGraphifyUpdate(ctx);
+		if (!graphifyResult.ok && graphifyResult.message && ctx.hasUI) {
+			ctx.ui.notify(graphifyResult.message, graphifyResult.message.includes("skipped") ? "info" : "warning");
+		}
+		if (state.sessionStrategy === "newSession") {
+			state.pendingSessionReset = true;
+			saveState(ctx, state);
+			await dispatchNextIterationFreshContext(ctx, state);
+			return `Iteration ${state.iteration - 1} complete. Next iteration queued with fresh provider context.`;
+		}
+		dispatchNextIterationResetFollowUp(ctx, state, content, needsReflection);
+		return `Iteration ${state.iteration - 1} complete. Next iteration queued with reset prompt.`;
+	}
+
 	function logCompactionResumeDecision(
 		ctx: ExtensionContext,
 		state: LoopState,
@@ -1617,6 +1663,54 @@ export default function (pi: ExtensionAPI) {
 		dispatchNextIterationFollowUp(ctx, state, planToPromptText(state, plan), needsReflection);
 	}
 
+	function buildInitialLoopState(loopName: string, args: ReturnType<typeof parseArgs>): LoopState {
+		return {
+			name: loopName,
+			taskFile: "",
+			iteration: 1,
+			maxIterations: args.maxIterations,
+			itemsPerIteration: args.itemsPerIteration,
+			reflectEvery: args.reflectEvery,
+			reflectInstructions: args.reflectInstructions,
+			active: true,
+			status: "active",
+			startedAt: nowIso(),
+			lastReflectionAt: 0,
+			lastDoneReminderAt: 0,
+			resumeGeneration: 0,
+			lastResumeDispatchedGeneration: 0,
+			sessionStrategy: args.sessionStrategy,
+			sessionStrategyFailure: args.sessionStrategyFailure,
+			pendingSessionReset: false,
+		};
+	}
+
+	function restoreLoopStateFromPlan(ctx: ExtensionContext, loopName: string, args: ReturnType<typeof parseArgs>): LoopState | null {
+		const archived = loadState(ctx, loopName, true);
+		if (archived) {
+			applyLoopArgs(archived, args);
+			archived.archivedAt = null;
+			archived.completedAt = undefined;
+			archived.status = "paused";
+			archived.active = false;
+			saveState(ctx, archived);
+			return archived;
+		}
+
+		const existingPlan = loadPlan(ctx, loopName);
+		if (!existingPlan) return null;
+
+		const state = buildInitialLoopState(loopName, args);
+		state.status = "paused";
+		state.active = false;
+		state.currentTaskId = inferCurrentTaskId(existingPlan) ?? selectInitialTask(existingPlan)?.id ?? null;
+		saveState(ctx, state);
+		recordLoopEvent(ctx, state.name, "restore", "Restored Ralph loop state from canonical plan", state.iteration, {
+			currentTaskId: state.currentTaskId,
+		});
+		return state;
+	}
+
 	const commands: Record<string, (rest: string, ctx: any) => void | Promise<void>> = {
 		async start(rest, ctx) {
 			const args = parseArgs(rest);
@@ -1630,7 +1724,7 @@ export default function (pi: ExtensionAPI) {
 
 			const isPath = args.name.includes("/") || args.name.includes("\\");
 			const loopName = isPath ? sanitize(path.basename(args.name, path.extname(args.name))) : args.name;
-			const existing = loadState(ctx, loopName);
+			const existing = loadState(ctx, loopName) ?? restoreLoopStateFromPlan(ctx, loopName, args);
 			if (existing) {
 				applyLoopArgs(existing, args);
 				saveState(ctx, existing);
@@ -1638,35 +1732,17 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const state: LoopState = {
-				name: loopName,
-				taskFile: "",
-				iteration: 1,
-				maxIterations: args.maxIterations,
-				itemsPerIteration: args.itemsPerIteration,
-				reflectEvery: args.reflectEvery,
-				reflectInstructions: args.reflectInstructions,
-				active: true,
-				status: "active",
-				startedAt: existing?.startedAt || nowIso(),
-				lastReflectionAt: 0,
-				lastDoneReminderAt: 0,
-				resumeGeneration: 0,
-				lastResumeDispatchedGeneration: 0,
-				sessionStrategy: args.sessionStrategy,
-				sessionStrategyFailure: args.sessionStrategyFailure,
-				pendingSessionReset: false,
-			};
+			const state: LoopState = buildInitialLoopState(loopName, args);
 
-				saveState(ctx, state);
-				const initialPlan = ensurePlan(ctx, state);
-				savePlan(ctx, initialPlan, false);
-				if (!state.currentTaskId) {
-					state.currentTaskId = inferCurrentTaskId(initialPlan);
-					if (!state.currentTaskId) state.currentTaskId = selectInitialTask(initialPlan)?.id ?? null;
-					if (state.currentTaskId) saveState(ctx, state);
-				}
-				setSelectedLoopName(ctx, loopName);
+			saveState(ctx, state);
+			const initialPlan = ensurePlan(ctx, state);
+			savePlan(ctx, initialPlan, false);
+			if (!state.currentTaskId) {
+				state.currentTaskId = inferCurrentTaskId(initialPlan);
+				if (!state.currentTaskId) state.currentTaskId = selectInitialTask(initialPlan)?.id ?? null;
+				if (state.currentTaskId) saveState(ctx, state);
+			}
+			setSelectedLoopName(ctx, loopName);
 			recordLoopEvent(ctx, state.name, "start", "Started Ralph loop", state.iteration, { sessionStrategy: state.sessionStrategy });
 			updateUI(ctx);
 			if (state.sessionStrategy === "newSession") {
@@ -1853,14 +1929,21 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`Task "${taskId}" not found`, "error");
 			return;
 		}
+		const wasDone = task.status === "done";
 		task.status = action === "done" ? "done" : "blocked";
 		addVerification(result.plan, `Task ${task.id} marked ${task.status} via /ralph task.`);
 		if ((action === "done" || action === "block") && result.state.currentTaskId === task.id) {
 			result.state.currentTaskId = selectNextTask(result.plan, null, task.id)?.id ?? null;
 		}
-			savePlan(ctx, result.plan, !!result.state.archivedAt);
-			saveState(ctx, result.state);
-			ctx.ui.notify(`Updated ${task.id}: ${task.title} -> ${task.status}`, "info");
+		savePlan(ctx, result.plan, !!result.state.archivedAt);
+		saveState(ctx, result.state);
+		if (action === "done" && !wasDone && result.state.status === "active") {
+			void advanceLoopIteration(ctx, result.state, "ralph_task_done").then((message) => {
+				if (ctx.hasUI) ctx.ui.notify(`Updated ${task.id}: ${task.title} -> ${task.status}\n${message}`, "info");
+			});
+			return;
+		}
+		ctx.ui.notify(`Updated ${task.id}: ${task.title} -> ${task.status}`, "info");
 		});
 
 		registerPlanCommand("set-max-iterations", "Update a loop's max iteration limit", (rest, ctx) => {
@@ -2104,6 +2187,7 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			if (!result) return { content: [{ type: "text", text: "Ralph loop not found." }], details: {} };
 			const task = findTask(result.plan, params.taskId);
 			if (!task) return { content: [{ type: "text", text: `Task "${params.taskId}" not found.` }], details: {} };
+			const previousStatus = task.status;
 			if (params.status !== undefined) {
 				const status = parseTaskStatus(params.status);
 				if (!status) return { content: [{ type: "text", text: `Invalid task status: ${params.status}` }], details: {} };
@@ -2129,6 +2213,10 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 			}
 			saveState(ctx, result.state);
 			savePlan(ctx, result.plan, !!result.state.archivedAt);
+			if (params.status === "done" && previousStatus !== "done" && result.state.status === "active") {
+				const message = await advanceLoopIteration(ctx, result.state, "ralph_task_done");
+				return { content: [{ type: "text", text: `Updated ${task.id}: ${task.title} [${task.status}]\n${message}` }], details: {} };
+			}
 			return { content: [{ type: "text", text: `Updated ${task.id}: ${task.title} [${task.status}]` }], details: {} };
 		},
 	});
@@ -2189,58 +2277,8 @@ To stop: press ESC to interrupt, then run /ralph-stop when idle`;
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const state = resolveLoopState(ctx);
 			if (!state) return { content: [{ type: "text", text: "No active Ralph loop." }], details: {} };
-			if (!state || state.status !== "active") return { content: [{ type: "text", text: "Ralph loop is not active." }], details: {} };
-			if (ctx.hasPendingMessages()) {
-				return { content: [{ type: "text", text: "Pending messages already queued. Skipping ralph_done." }], details: {} };
-			}
-			state.iteration++;
-			recordLoopEvent(ctx, state.name, "ralph_done", "Iteration advanced", state.iteration, { sessionStrategy: state.sessionStrategy });
-			if (state.maxIterations > 0 && state.iteration > state.maxIterations) {
-				completeLoop(
-					ctx,
-					state,
-					`───────────────────────────────────────────────────────────────────────
-⚠️ RALPH LOOP STOPPED: ${state.name} | Max iterations (${state.maxIterations}) reached
-───────────────────────────────────────────────────────────────────────`,
-				);
-				return { content: [{ type: "text", text: "Max iterations reached. Loop stopped." }], details: {} };
-			}
-			const iterationData = getIterationContent(ctx, state);
-			if (!iterationData) {
-				pauseLoop(ctx, state);
-				return { content: [{ type: "text", text: "Error: Could not read Ralph plan state from the database." }], details: {} };
-			}
-			const { content, needsReflection } = iterationData;
-			if (needsReflection) state.lastReflectionAt = state.iteration;
-			saveState(ctx, state);
-			updateUI(ctx);
-			const checkpointResult = checkpointLoopState(ctx, state);
-			if (!checkpointResult.ok) {
-				pauseLoop(ctx, state, `Paused Ralph loop: ${state.name}. ${checkpointResult.message}`);
-				return { content: [{ type: "text", text: `Error: ${checkpointResult.message}` }], details: {} };
-			}
-			if (checkpointResult.skipped && ctx.hasUI) {
-				ctx.ui.notify(checkpointResult.message, "info");
-			}
-			const graphifyResult = runGraphifyUpdate(ctx);
-			if (!graphifyResult.ok && graphifyResult.message && ctx.hasUI) {
-				ctx.ui.notify(graphifyResult.message, graphifyResult.message.includes("skipped") ? "info" : "warning");
-			}
-			if (state.sessionStrategy === "newSession") {
-				state.pendingSessionReset = true;
-				saveState(ctx, state);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Iteration ${state.iteration - 1} complete. Next iteration queued with fresh provider context.`,
-						},
-					],
-					details: {},
-				};
-			}
-			dispatchNextIterationFollowUp(ctx, state, content, needsReflection);
-			return { content: [{ type: "text", text: `Iteration ${state.iteration - 1} complete. Next iteration queued.` }], details: {} };
+			const message = await advanceLoopIteration(ctx, state, "ralph_done");
+			return { content: [{ type: "text", text: message }], details: {} };
 		},
 	});
 

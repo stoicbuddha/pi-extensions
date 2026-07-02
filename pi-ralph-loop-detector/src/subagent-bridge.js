@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_TIMEOUT_MS = null;
+const MAX_LOOP_JUDGE_FORMAT_CORRECTIONS = 1;
 const JUDGE_SYSTEM_PROMPT = [
   "You are an isolated loop judge running in a separate Pi subprocess.",
   "Analyze only the supplied evidence.",
@@ -21,46 +22,61 @@ const RECOVERY_SUMMARY_SYSTEM_PROMPT = [
 ].join(" ");
 
 export async function evaluateLoopWithSubagent(target, evidence, options = {}) {
-  const payload = buildLoopJudgePayload(evidence, options);
   const timeoutMs = normalizeTimeoutMs(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const rawResult = await invokeSubagentTask(
-    target,
-    payload,
-    options,
-    timeoutMs,
-    {
-      runProcess: runLoopJudgeProcess,
-      adapterOptions: {
-        invokeNames: [
-          "judgeLoop",
-          "evaluateLoop",
-          "invokeLoopJudge",
-          "runLoopJudge",
-          "requestLoopJudge",
-          "judge",
-        ],
-        spawnNames: [
-          "spawnLoopJudge",
-          "spawnJudge",
-          "spawnSubagent",
-          "spawn",
-        ],
-        waitNames: [
-          "waitForLoopJudgeCompletion",
-          "waitForJudgeCompletion",
-          "waitForSubagentCompletion",
-          "waitForCompletion",
-          "awaitCompletion",
-        ],
-      },
-      timeoutMessages: {
-        invoke: "subagent judge timed out",
-        spawn: "subagent spawn timed out",
-        completion: "subagent completion timed out",
-      },
+  const config = {
+    runProcess: runLoopJudgeProcess,
+    adapterOptions: {
+      invokeNames: [
+        "judgeLoop",
+        "evaluateLoop",
+        "invokeLoopJudge",
+        "runLoopJudge",
+        "requestLoopJudge",
+        "judge",
+      ],
+      spawnNames: [
+        "spawnLoopJudge",
+        "spawnJudge",
+        "spawnSubagent",
+        "spawn",
+      ],
+      waitNames: [
+        "waitForLoopJudgeCompletion",
+        "waitForJudgeCompletion",
+        "waitForSubagentCompletion",
+        "waitForCompletion",
+        "awaitCompletion",
+      ],
     },
-  );
-  return normalizeLoopJudgeResponse(rawResult, evidence);
+    timeoutMessages: {
+      invoke: "subagent judge timed out",
+      spawn: "subagent spawn timed out",
+      completion: "subagent completion timed out",
+    },
+  };
+  const maxCorrections = normalizeCorrectionLimit(options.maxFormatCorrections, MAX_LOOP_JUDGE_FORMAT_CORRECTIONS);
+
+  let correctionReason = null;
+  for (let attempt = 0; attempt <= maxCorrections; attempt += 1) {
+    const payload = buildLoopJudgePayload(evidence, {
+      ...options,
+      correctionReason,
+      correctionAttempt: correctionReason ? attempt : undefined,
+    });
+    const rawResult = await invokeSubagentTask(target, payload, buildCorrectionOptions(options, correctionReason, attempt), timeoutMs, config);
+    const normalized = normalizeLoopJudgeResponse(rawResult, evidence);
+    if (!isRetryableLoopJudgeFormatFailure(normalized.reason) || attempt >= maxCorrections) {
+      return normalized;
+    }
+    correctionReason = normalized.reason;
+  }
+
+  return {
+    confidence: 0,
+    action: "stop",
+    reason: "subagent response malformed",
+    offendingTool: evidence?.normalizedSummary?.offendingTool ?? null,
+  };
 }
 
 export async function evaluateRecoverySummaryWithSubagent(target, evidence, options = {}) {
@@ -254,12 +270,21 @@ async function loadToolkitInstructions() {
 }
 
 export function buildLoopJudgePayload(evidence, options = {}) {
-  return {
+  const payload = {
     task: "loop_judge",
     version: 1,
     evidence,
     requestId: options.requestId ?? undefined,
   };
+  if (typeof options.correctionReason === "string" && options.correctionReason.trim()) {
+    payload.correction = {
+      reason: options.correctionReason.trim(),
+      attempt: Number.isFinite(options.correctionAttempt) ? Math.max(1, Number(options.correctionAttempt)) : 1,
+      instruction:
+        'Your previous response was invalid. Return exactly one JSON object with: confidence (0 to 1), action ("continue" | "stop" | "steer"), reason (string), offendingTool (string or null), and optional steer_message when action is "steer".',
+    };
+  }
+  return payload;
 }
 
 export function buildRecoverySummaryPayload(evidence, options = {}) {
@@ -493,6 +518,28 @@ function parseSubagentOutput(stdout) {
   }
 
   return lastJson;
+}
+
+function isRetryableLoopJudgeFormatFailure(reason) {
+  return /^(subagent response malformed|subagent response missing confidence|subagent response missing action|subagent response missing steer_message)$/i.test(
+    typeof reason === "string" ? reason.trim() : "",
+  );
+}
+
+function normalizeCorrectionLimit(value, fallback) {
+  if (value === undefined) return fallback;
+  const limit = Number(value);
+  if (!Number.isFinite(limit) || limit < 0) return fallback;
+  return Math.floor(limit);
+}
+
+function buildCorrectionOptions(options, correctionReason, attempt) {
+  if (!correctionReason) return options;
+  return {
+    ...options,
+    correctionReason,
+    correctionAttempt: attempt,
+  };
 }
 
 function buildFallbackRecoverySummary(evidence) {

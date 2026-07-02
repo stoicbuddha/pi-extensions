@@ -30,6 +30,54 @@ test("bridge accepts continue from a direct subagent response", async () => {
   assert.equal(result.confidence, 0.81);
 });
 
+test("bridge retries one malformed judge response before accepting a correction", async () => {
+  const calls = [];
+  const adapter = {
+    judgeLoop: async (payload) => {
+      calls.push(payload);
+      if (calls.length === 1) {
+        return JSON.stringify({
+          action: "continue",
+          reason: "missing confidence on purpose",
+        });
+      }
+      return JSON.stringify({
+        confidence: 0.64,
+        action: "continue",
+        reason: "corrected response",
+      });
+    },
+  };
+
+  const result = await evaluateLoopWithSubagent(adapter, evidence);
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].correction, undefined);
+  assert.equal(calls[1].correction.reason, "subagent response missing confidence");
+  assert.equal(result.action, "continue");
+  assert.equal(result.confidence, 0.64);
+});
+
+test("bridge stops after one malformed-response correction attempt", async () => {
+  const calls = [];
+  const adapter = {
+    judgeLoop: async (payload) => {
+      calls.push(payload);
+      return JSON.stringify({
+        action: "stop",
+        reason: "still malformed",
+      });
+    },
+  };
+
+  const result = await evaluateLoopWithSubagent(adapter, evidence);
+
+  assert.equal(calls.length, 2);
+  assert.equal(result.action, "stop");
+  assert.equal(result.confidence, 0);
+  assert.equal(result.reason, "subagent response missing confidence");
+});
+
 test("recovery summary bridge returns normalized summary content", async () => {
   const adapter = {
     invokeSubagent: async (payload) => {

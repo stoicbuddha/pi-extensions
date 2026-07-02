@@ -19,6 +19,10 @@ Pause and reflect on your progress:
 5. What are the next priorities?
 
 Record your reflection with Ralph tools, then continue working.`;
+const PROMPT_MAX_CHARS = 7000;
+const PROMPT_FIELD_MAX_CHARS = 400;
+const PROMPT_TASK_TITLE_MAX_CHARS = 220;
+const PROMPT_TASK_WINDOW = 3;
 
 function nowIso() {
   return new Date().toISOString();
@@ -426,6 +430,13 @@ function findTask(loop, taskId) {
   return loop?.tasks?.find((task) => task.id === taskId) ?? null;
 }
 
+function truncateForPrompt(text, maxChars = PROMPT_FIELD_MAX_CHARS) {
+  const normalized = String(text ?? "").replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars)}... [truncated ${normalized.length - maxChars} chars]`;
+}
+
 function addVerification(loop, text) {
   loop.verification.push({ at: nowIso(), text });
 }
@@ -575,14 +586,14 @@ function selectNextTask(loop) {
 }
 
 function formatPromptTask(task) {
-  const lines = [`- [${task.status === "done" ? "x" : " "}] \`${task.id}\` ${task.title} (${String(task.status).toUpperCase()})`];
-  if (task.details?.trim()) lines.push(`  Details: ${task.details.trim()}`);
+  const lines = [`- [${task.status === "done" ? "x" : " "}] \`${task.id}\` ${truncateForPrompt(task.title, PROMPT_TASK_TITLE_MAX_CHARS)} (${String(task.status).toUpperCase()})`];
+  if (task.details?.trim()) lines.push(`  Details: ${truncateForPrompt(task.details)}`);
   if (Array.isArray(task.evidence) && task.evidence.length > 0) {
-    const evidence = task.evidence.slice(-1).map((item) => String(item).trim()).filter(Boolean);
+    const evidence = task.evidence.slice(-1).map((item) => truncateForPrompt(item, 260)).filter(Boolean);
     if (evidence.length > 0) lines.push(`  Recent evidence: ${evidence.join(" | ")}${task.evidence.length > evidence.length ? ` (+${task.evidence.length - evidence.length} older)` : ""}`);
   }
   if (Array.isArray(task.notes) && task.notes.length > 0) {
-    const notes = task.notes.slice(-1).map((item) => String(item).trim()).filter(Boolean);
+    const notes = task.notes.slice(-1).map((item) => truncateForPrompt(item, 260)).filter(Boolean);
     if (notes.length > 0) lines.push(`  Recent notes: ${notes.join(" | ")}${task.notes.length > notes.length ? ` (+${task.notes.length - notes.length} older)` : ""}`);
   }
   return lines.join("\n");
@@ -598,7 +609,7 @@ function summarizeTaskCounts(tasks) {
   return counts;
 }
 
-function buildTaskWindow(loop, maxTasks = 6) {
+function buildTaskWindow(loop, maxTasks = PROMPT_TASK_WINDOW) {
   const tasks = Array.isArray(loop.tasks) ? loop.tasks : [];
   if (tasks.length === 0) return [];
 
@@ -632,7 +643,7 @@ function buildIterationPrompt(loop, overlay = null) {
   const maxStr = loop.maxIterations > 0 ? `/${loop.maxIterations}` : "";
   const currentTaskCount = Array.isArray(loop.tasks) ? loop.tasks.length : 0;
   const counts = summarizeTaskCounts(Array.isArray(loop.tasks) ? loop.tasks : []);
-  const taskWindow = buildTaskWindow(loop, 6);
+  const taskWindow = buildTaskWindow(loop, PROMPT_TASK_WINDOW).filter((task) => task?.id !== nextTask?.id);
   const lines = [
     "───────────────────────────────────────────────────────────────────────",
     `🔄 RALPH LOOP: ${loop.name} | Iteration ${loop.iteration}${maxStr}${loop.reflectEvery > 0 ? " | 🪞 REFLECTION" : ""}`,
@@ -641,8 +652,8 @@ function buildIterationPrompt(loop, overlay = null) {
     "## Current Plan Runtime View (compact; sourced from the Ralph database)",
   ];
 
-  if (loop.title?.trim()) lines.push(`# ${loop.title.trim()}`);
-  if (loop.summary?.trim()) lines.push(loop.summary.trim());
+  if (loop.title?.trim()) lines.push(`# ${truncateForPrompt(loop.title, PROMPT_TASK_TITLE_MAX_CHARS)}`);
+  if (loop.summary?.trim()) lines.push(truncateForPrompt(loop.summary, 600));
   lines.push("");
   lines.push(
     `Tasks: ${currentTaskCount} total, ${counts.done} done, ${counts.in_progress} in progress, ${counts.blocked} blocked, ${counts.todo} todo, ${counts.cancelled} cancelled.${loop.currentTaskId ? ` · current ${loop.currentTaskId}` : ""}`,
@@ -656,7 +667,7 @@ function buildIterationPrompt(loop, overlay = null) {
   }
 
   if (taskWindow.length > 0) {
-    lines.push("", "## Open Tasks");
+    lines.push("", "## Additional Open Tasks");
     for (const task of taskWindow) {
       lines.push(formatPromptTask(task));
     }
@@ -694,14 +705,21 @@ function buildIterationPrompt(loop, overlay = null) {
   );
 
   if (overlay) {
-    lines.push("", "## RALPH.md", overlay);
+    lines.push("", "RALPH.md is already loaded into system context for this turn.");
   }
 
-  return lines.join("\n");
+  const prompt = lines.join("\n");
+  if (prompt.length <= PROMPT_MAX_CHARS) return prompt;
+  return `${prompt.slice(0, PROMPT_MAX_CHARS)}\n\n[Prompt truncated by ${prompt.length - PROMPT_MAX_CHARS} chars. Use Ralph or Graphify tools for additional context.]`;
 }
 
 function buildResetPrompt(loop, overlay = null) {
   return buildIterationPrompt(loop, overlay);
+}
+
+function logPromptDispatch(loop, mode, prompt) {
+  const promptChars = typeof prompt === "string" ? prompt.length : 0;
+  console.info(`[ralph] prompt dispatch mode=${mode} loop=${loop?.name ?? "unknown"} iteration=${loop?.iteration ?? "?"} chars=${promptChars}`);
 }
 
 async function deliverIterationPrompt(target, prompt) {
@@ -730,6 +748,7 @@ async function dispatchNextIteration(pi, ctx, loop) {
 
   if (loop.sessionStrategy === "newSession" && typeof ctx.newSession === "function") {
     try {
+      logPromptDispatch(loop, "next/newSession", prompt);
       const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
       const result = await ctx.newSession({
         parentSession,
@@ -745,6 +764,7 @@ async function dispatchNextIteration(pi, ctx, loop) {
     }
   }
 
+  logPromptDispatch(loop, "next/followUp", prompt);
   if (await deliverIterationPrompt(ctx, prompt)) {
     return true;
   }
@@ -760,10 +780,12 @@ async function dispatchFreshIteration(pi, ctx, loop) {
   const prompt = buildResetPrompt(loop, loadRalphOverlay(ctx));
 
   if (typeof ctx.newSession !== "function") {
+    logPromptDispatch(loop, "fresh/followUp-fallback", prompt);
     return dispatchNextIteration(pi, ctx, loop);
   }
 
   try {
+    logPromptDispatch(loop, "fresh/newSession", prompt);
     const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
     const result = await ctx.newSession({
       parentSession,
@@ -778,6 +800,7 @@ async function dispatchFreshIteration(pi, ctx, loop) {
     // Fall through to follow-up.
   }
 
+  logPromptDispatch(loop, "fresh/followUp", prompt);
   if (await deliverIterationPrompt(ctx, prompt)) {
     return true;
   }

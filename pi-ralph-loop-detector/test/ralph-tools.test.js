@@ -21,3 +21,12 @@ test("exports Ralph stop steering for natural assistant stops", () => {
   assert.match(source, /loop\.lastDoneReminderAt = loop\.iteration;/);
   assert.match(source, /call the actual ralph_done tool now using the tool interface/);
 });
+
+test("iteration prompt avoids duplicating next task and caps prompt fields", () => {
+  assert.match(source, /const PROMPT_MAX_CHARS = 7000;/);
+  assert.match(source, /const PROMPT_TASK_WINDOW = 3;/);
+  assert.match(source, /function truncateForPrompt\(text, maxChars = PROMPT_FIELD_MAX_CHARS\)/);
+  assert.match(source, /buildTaskWindow\(loop, PROMPT_TASK_WINDOW\)\.filter\(\(task\) => task\?\.id !== nextTask\?\.id\)/);
+  assert.match(source, /RALPH\.md is already loaded into system context for this turn\./);
+  assert.match(source, /console\.info\(`\[ralph\] prompt dispatch mode=\$\{mode\} loop=\$\{loop\?\.name \?\? "unknown"\} iteration=\$\{loop\?\.iteration \?\? "\?"\} chars=\$\{promptChars\}`\);/);
+});
