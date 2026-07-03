@@ -23,9 +23,15 @@ const PROMPT_MAX_CHARS = 7000;
 const PROMPT_FIELD_MAX_CHARS = 400;
 const PROMPT_TASK_TITLE_MAX_CHARS = 220;
 const PROMPT_TASK_WINDOW = 3;
+const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";
+const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function storePath(ctx) {
@@ -705,7 +711,12 @@ function buildIterationPrompt(loop, overlay = null) {
   );
 
   if (overlay) {
-    lines.push("", "RALPH.md is already loaded into system context for this turn.");
+    lines.push(
+      "",
+      "## Workspace Overlay",
+      "`./RALPH.md` was found. Its full contents will be injected into hidden system context for this turn.",
+      truncateForPrompt(overlay, 900),
+    );
   }
 
   const prompt = lines.join("\n");
@@ -720,6 +731,27 @@ function buildResetPrompt(loop, overlay = null) {
 function logPromptDispatch(loop, mode, prompt) {
   const promptChars = typeof prompt === "string" ? prompt.length : 0;
   console.info(`[ralph] prompt dispatch mode=${mode} loop=${loop?.name ?? "unknown"} iteration=${loop?.iteration ?? "?"} chars=${promptChars}`);
+}
+
+function stripManagedRalphContext(systemPrompt) {
+  if (typeof systemPrompt !== "string" || !systemPrompt) return "";
+  const managedBlock = new RegExp(`${escapeRegExp(RALPH_CONTEXT_START)}[\\s\\S]*?${escapeRegExp(RALPH_CONTEXT_END)}\\s*`, "g");
+  return systemPrompt.replace(managedBlock, "").trimEnd();
+}
+
+function buildManagedRalphSystemPrompt(loop, overlay = null) {
+  const iterStr = `${loop.iteration}${loop.maxIterations > 0 ? `/${loop.maxIterations}` : ""}`;
+  const instructions = [
+    `You are in a Ralph loop named "${loop.name}" at iteration ${iterStr}.`,
+    ...(overlay ? ["", "## RALPH.md", overlay] : []),
+    "Use /ralph tools to inspect and update canonical loop state.",
+    "After making progress, call ralph_done to queue the next iteration.",
+  ].join("\n");
+  return `${RALPH_CONTEXT_START}
+[RALPH LOOP - ${loop.name} - Iteration ${iterStr}]
+
+${instructions}
+${RALPH_CONTEXT_END}`;
 }
 
 async function deliverIterationPrompt(target, prompt) {
@@ -1386,17 +1418,12 @@ export function registerRalphSurface(pi) {
     const store = loadStore(ctx);
     const loop = getCurrentLoop(store);
     if (!loop || loop.status !== "active") return;
-    const iterStr = `${loop.iteration}${loop.maxIterations > 0 ? `/${loop.maxIterations}` : ""}`;
     const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
     const overlay = loadRalphOverlay(ctx);
-    const instructions = [
-      `You are in a Ralph loop named "${loop.name}" at iteration ${iterStr}.`,
-      ...(overlay ? ["", "## RALPH.md", overlay] : []),
-      "Use /ralph tools to inspect and update canonical loop state.",
-      "After making progress, call ralph_done to queue the next iteration.",
-    ].join("\n");
+    const cleanBasePrompt = stripManagedRalphContext(basePrompt);
+    const managedPrompt = buildManagedRalphSystemPrompt(loop, overlay);
     return {
-      systemPrompt: `${basePrompt}\n[RALPH LOOP - ${loop.name} - Iteration ${iterStr}]\n\n${instructions}`,
+      systemPrompt: cleanBasePrompt ? `${cleanBasePrompt}\n${managedPrompt}` : managedPrompt,
     };
   });
 }

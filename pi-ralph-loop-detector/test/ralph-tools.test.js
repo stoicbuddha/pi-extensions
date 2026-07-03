@@ -27,6 +27,15 @@ test("iteration prompt avoids duplicating next task and caps prompt fields", () 
   assert.match(source, /const PROMPT_TASK_WINDOW = 3;/);
   assert.match(source, /function truncateForPrompt\(text, maxChars = PROMPT_FIELD_MAX_CHARS\)/);
   assert.match(source, /buildTaskWindow\(loop, PROMPT_TASK_WINDOW\)\.filter\(\(task\) => task\?\.id !== nextTask\?\.id\)/);
-  assert.match(source, /RALPH\.md is already loaded into system context for this turn\./);
+  assert.match(source, /## Workspace Overlay/);
+  assert.match(source, /`\.\/RALPH\.md` was found\. Its full contents will be injected into hidden system context for this turn\./);
   assert.match(source, /console\.info\(`\[ralph\] prompt dispatch mode=\$\{mode\} loop=\$\{loop\?\.name \?\? "unknown"\} iteration=\$\{loop\?\.iteration \?\? "\?"\} chars=\$\{promptChars\}`\);/);
+});
+
+test("managed Ralph system prompt is replaced instead of appended repeatedly", () => {
+  assert.match(source, /const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";/);
+  assert.match(source, /const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";/);
+  assert.match(source, /function stripManagedRalphContext\(systemPrompt\)/);
+  assert.match(source, /const cleanBasePrompt = stripManagedRalphContext\(basePrompt\);/);
+  assert.match(source, /const managedPrompt = buildManagedRalphSystemPrompt\(loop, overlay\);/);
 });
