@@ -18,6 +18,7 @@ test("/ralph start routes existing loops through resume behavior", () => {
 test("exports Ralph stop steering for natural assistant stops", () => {
   assert.match(source, /export async function maybeDispatchStoppedLoopSteering\(ctx, pi, options = \{\}\)/);
   assert.match(source, /if \(stopReason !== "stop"\) return false;/);
+  assert.match(source, /if \(loop\.pendingHandoff\) return false;/);
   assert.match(source, /loop\.lastDoneReminderAt = loop\.iteration;/);
   assert.match(source, /call the actual ralph_done tool now using the tool interface/);
 });
@@ -38,4 +39,21 @@ test("managed Ralph system prompt is replaced instead of appended repeatedly", (
   assert.match(source, /function stripManagedRalphContext\(systemPrompt\)/);
   assert.match(source, /const cleanBasePrompt = stripManagedRalphContext\(basePrompt\);/);
   assert.match(source, /const managedPrompt = buildManagedRalphSystemPrompt\(loop, overlay\);/);
+});
+
+test("persists and dispatches pending Ralph handoffs through a dedicated command", () => {
+  assert.match(source, /pending_handoff INTEGER NOT NULL DEFAULT 0/);
+  assert.match(source, /pending_handoff_prompt TEXT/);
+  assert.match(source, /pending_handoff_generation INTEGER NOT NULL DEFAULT 0/);
+  assert.match(source, /export function ensurePendingRalphHandoff\(ctx, loopName, handoffPrompt, reason = "compaction"\)/);
+  assert.match(source, /export async function dispatchPendingRalphHandoff\(pi, ctx, loopName\)/);
+  assert.match(source, /registerCommand\(pi, "ralph-handoff-now", async \(args, ctx\) => \{/);
+  assert.match(source, /const pending = getPendingRalphHandoff\(ctx, loopName\);/);
+  assert.match(source, /const result = await dispatchPendingRalphHandoff\(pi, ctx, pending\.loop\.name\);/);
+});
+
+test("pending handoff suppresses normal Ralph iteration dispatch", () => {
+  assert.match(source, /if \(loop\.pendingHandoff\) \{\s+logPromptDispatch\(loop, "next\/skipped-pending-handoff", ""\);\s+return false;\s+\}/s);
+  assert.match(source, /if \(loop\.pendingHandoff\) \{\s+logPromptDispatch\(loop, "fresh\/skipped-pending-handoff", ""\);\s+return false;\s+\}/s);
+  assert.match(source, /Pending Ralph handoff preserved for \$\{loop\.name\}; skipping in-session iteration dispatch\./);
 });

@@ -82,3 +82,14 @@ test("agent_end wires natural assistant stops into Ralph stop steering", () => {
   assert.match(indexSource, /await maybeDispatchStoppedLoopSteering\(ctx, pi, \{/);
   assert.match(indexSource, /stopReason: typeof lastAssistant\?\.stopReason === "string" \? lastAssistant\.stopReason : ""/);
 });
+
+test("session_before_compact queues a Ralph handoff instead of compacting active loops", () => {
+  assert.match(indexSource, /pi\.on\("session_before_compact", async \(event, ctx\) => \{/);
+  assert.match(indexSource, /const prepared = await prepareCompactionHandoff\(runtime, event, ctx, pi\);/);
+  assert.match(indexSource, /return \{ cancel: true \};/);
+  assert.match(indexSource, /customType: "ralph-handoff-command"/);
+  assert.match(indexSource, /triggerTurn: true/);
+  assert.match(indexSource, /await pi\.sendUserMessage\(command, \{ deliverAs: "followUp" \}\);/);
+  assert.match(indexSource, /const handoffHelpers = await loadFreshRalphHandoffHelpers\(\);/);
+  assert.match(indexSource, /const handoff = handoffHelpers\.ensurePendingRalphHandoff\(ctx, loop\.name, handoffPrompt, "compaction"\);/);
+});

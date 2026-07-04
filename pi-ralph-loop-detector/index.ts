@@ -6,7 +6,15 @@ import * as path from "node:path";
 import { LoopDetector } from "./src/index.js";
 import { evaluateLoopWithSubagent, evaluateRecoverySummaryWithSubagent } from "./src/subagent-bridge.js";
 import { buildRecoveryPrompt, summarizeRecovery } from "./routing.js";
-import { getActiveRalphLoop, maybeDispatchStoppedLoopSteering, registerRalphSurface } from "./ralph-tools.js";
+import {
+	clearPendingRalphHandoff,
+	ensurePendingRalphHandoff,
+	getActiveRalphLoop,
+	getPendingRalphHandoff,
+	markPendingRalphHandoffQueued,
+	maybeDispatchStoppedLoopSteering,
+	registerRalphSurface,
+} from "./ralph-tools.js";
 
 type LoopEvent =
 	| {
@@ -573,6 +581,254 @@ async function buildRecoveryContext(state: RuntimeState, outcome: NonNullable<Lo
 	return { prompt };
 }
 
+function summarizeCompactionMessages(messages: any[], maxMessages = 6): Array<{ role: string; text: string }> {
+	if (!Array.isArray(messages) || messages.length === 0) return [];
+	const summarized = [];
+	for (let i = Math.max(0, messages.length - maxMessages); i < messages.length; i += 1) {
+		const message = messages[i];
+		const role = typeof message?.role === "string" ? message.role : "unknown";
+		const text = truncateText(extractText(message?.content).trim(), 700);
+		if (!text) continue;
+		summarized.push({ role, text });
+	}
+	return summarized;
+}
+
+function summarizeLoopTasks(loop: any, maxTasks = 5): Array<{ id: string; title: string; status: string; details: string; evidence: string[]; notes: string[] }> {
+	if (!Array.isArray(loop?.tasks)) return [];
+	return loop.tasks.slice(0, maxTasks).map((task: any) => ({
+		id: String(task?.id ?? ""),
+		title: truncateText(String(task?.title ?? "").trim(), 220),
+		status: String(task?.status ?? "unknown"),
+		details: truncateText(String(task?.details ?? "").trim(), 280),
+		evidence: Array.isArray(task?.evidence)
+			? task.evidence.slice(-1).map((item: unknown) => truncateText(String(item ?? "").trim(), 220)).filter(Boolean)
+			: [],
+		notes: Array.isArray(task?.notes)
+			? task.notes.slice(-1).map((item: unknown) => truncateText(String(item ?? "").trim(), 220)).filter(Boolean)
+			: [],
+	}));
+}
+
+function buildCompactionSummarizerInput(event: any, loop: any): unknown {
+	const preparation = event?.preparation ?? {};
+	return {
+		task: "ralph_compaction_handoff_summary",
+		version: 1,
+		loop: {
+			name: loop.name,
+			status: loop.status,
+			iteration: loop.iteration,
+			maxIterations: loop.maxIterations,
+			currentTaskId: loop.currentTaskId ?? null,
+			title: loop.title ?? loop.name,
+			summary: truncateText(String(loop.summary ?? "").trim(), 700),
+			goals: Array.isArray(loop.goals) ? loop.goals.slice(0, 5) : [],
+			tasks: summarizeLoopTasks(loop, 5),
+			recentNotes: Array.isArray(loop.notes)
+				? loop.notes.slice(-3).map((item: any) => ({
+					at: item?.at,
+					text: truncateText(String(item?.text ?? "").trim(), 240),
+				}))
+				: [],
+			recentReflections: Array.isArray(loop.reflections)
+				? loop.reflections.slice(-2).map((item: any) => ({
+					at: item?.at,
+					iteration: item?.iteration ?? null,
+					text: truncateText(String(item?.text ?? "").trim(), 260),
+				}))
+				: [],
+			recentVerification: Array.isArray(loop.verification)
+				? loop.verification.slice(-4).map((item: any) => ({
+					at: item?.at,
+					text: truncateText(String(item?.text ?? "").trim(), 220),
+				}))
+				: [],
+		},
+		slice: {
+			customInstructions:
+				typeof event?.customInstructions === "string" && event.customInstructions.trim()
+					? truncateText(event.customInstructions.trim(), 400)
+					: null,
+			tokensBefore: preparation?.tokensBefore ?? null,
+			previousSummary:
+				typeof preparation?.previousSummary === "string" && preparation.previousSummary.trim()
+					? truncateText(preparation.previousSummary.trim(), 900)
+					: null,
+			recentMessages: summarizeCompactionMessages(preparation?.messagesToSummarize ?? [], 6),
+			turnPrefixMessages: summarizeCompactionMessages(preparation?.turnPrefixMessages ?? [], 4),
+		},
+	};
+}
+
+function buildCompactionHandoffPrompt(loop: any, analysis: RecoveryAnalysis): string {
+	const lines = [
+		`Ralph compaction handoff for loop "${loop.name}" at iteration ${loop.iteration}${loop.maxIterations > 0 ? `/${loop.maxIterations}` : ""}.`,
+		"",
+		"Pi skipped compaction and created a fresh session for this Ralph loop.",
+		"Do not assume the old transcript is available.",
+		"Use Ralph canonical state as the source of truth and the summarized handoff below as supporting context.",
+	];
+
+	if (analysis.suspectedGoal?.trim()) {
+		lines.push("", `Suspected goal: ${analysis.suspectedGoal.trim()}`);
+	}
+	if (analysis.summary?.trim()) {
+		lines.push("", "## Handoff Summary", analysis.summary.trim());
+	}
+	if (analysis.rationale?.trim()) {
+		lines.push("", "## Why Fresh Context Was Needed", analysis.rationale.trim());
+	}
+	if (Array.isArray(analysis.nextSteps) && analysis.nextSteps.length > 0) {
+		lines.push("", "## Next Steps");
+		for (const step of analysis.nextSteps) {
+			lines.push(`- ${step}`);
+		}
+	}
+
+	lines.push(
+		"",
+		"Start with the narrowest validating step.",
+		"Do not repeat the same failed action pattern.",
+		"Update Ralph task state and evidence as you work.",
+	);
+
+	return lines.join("\n");
+}
+
+async function queueCompactionHandoffCommand(pi: ExtensionAPI, loopName: string): Promise<boolean> {
+	const command = `/ralph-handoff-now ${loopName}`;
+	if (typeof (pi as any)?.sendMessage === "function") {
+		try {
+			await (pi as any).sendMessage(
+				{
+					customType: "ralph-handoff-command",
+					content: command,
+					display: true,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			return true;
+		} catch {
+			// Fall through to the older user-message path.
+		}
+	}
+	if (typeof pi?.sendUserMessage !== "function") return false;
+	try {
+		await pi.sendUserMessage(command, { deliverAs: "followUp" });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function loadFreshRalphHandoffHelpers(): Promise<null | {
+	getPendingRalphHandoff: typeof getPendingRalphHandoff;
+	ensurePendingRalphHandoff: typeof ensurePendingRalphHandoff;
+	markPendingRalphHandoffQueued: typeof markPendingRalphHandoffQueued;
+	clearPendingRalphHandoff: typeof clearPendingRalphHandoff;
+}> {
+	try {
+		const moduleUrl = new URL(`./ralph-tools.js?ralph_handoff_helpers=${Date.now()}`, import.meta.url).href;
+		const mod = await import(moduleUrl);
+		if (
+			typeof mod?.getPendingRalphHandoff !== "function" ||
+			typeof mod?.ensurePendingRalphHandoff !== "function" ||
+			typeof mod?.markPendingRalphHandoffQueued !== "function" ||
+			typeof mod?.clearPendingRalphHandoff !== "function"
+		) {
+			return null;
+		}
+		return {
+			getPendingRalphHandoff: mod.getPendingRalphHandoff,
+			ensurePendingRalphHandoff: mod.ensurePendingRalphHandoff,
+			markPendingRalphHandoffQueued: mod.markPendingRalphHandoffQueued,
+			clearPendingRalphHandoff: mod.clearPendingRalphHandoff,
+		};
+	} catch {
+		return null;
+	}
+}
+
+async function prepareCompactionHandoff(state: RuntimeState, event: any, ctx: any, pi: ExtensionAPI): Promise<boolean> {
+	const loop = getActiveRalphLoop(ctx);
+	if (!loop || loop.status !== "active") {
+		if (ctx.hasUI) {
+			ctx.ui.notify("Ralph compaction handoff skipped: no active Ralph loop.", "warning");
+		}
+		return false;
+	}
+
+	const handoffHelpers = await loadFreshRalphHandoffHelpers();
+	if (!handoffHelpers) {
+		if (ctx.hasUI) {
+			ctx.ui.notify("Ralph compaction handoff helpers are unavailable in the current extension runtime; allowing normal compaction.", "warning");
+		}
+		return false;
+	}
+
+	const pending = handoffHelpers.getPendingRalphHandoff(ctx, loop.name);
+	if (pending?.commandQueued) {
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Ralph compaction handoff already queued for ${loop.name}; cancelling compaction.`, "warning");
+		}
+		return true;
+	}
+
+	const summarizerInput = buildCompactionSummarizerInput(event, loop);
+	const summarizerInputSize = JSON.stringify(summarizerInput).length;
+	console.info(`[ralph] compaction handoff summarizer input chars=${summarizerInputSize} loop=${loop.name} iteration=${loop.iteration}`);
+	if (ctx.hasUI) {
+		ctx.ui.notify(`Ralph compaction handoff preparing summary for ${loop.name} (${summarizerInputSize} chars).`, "warning");
+	}
+	let analysis: RecoveryAnalysis | null = null;
+	try {
+		analysis = await evaluateRecoverySummaryWithSubagent(pi, summarizerInput, { timeoutMs: DEFAULT_JUDGE_TIMEOUT_MS });
+	} catch (error) {
+		if (ctx.hasUI) {
+			const detail = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Ralph compaction handoff unavailable; allowing normal compaction. ${detail}`, "warning");
+		}
+		return false;
+	}
+
+	if (!analysis?.summary?.trim()) {
+		if (ctx.hasUI) {
+			ctx.ui.notify("Ralph compaction handoff summary came back empty; allowing normal compaction.", "warning");
+		}
+		return false;
+	}
+
+	const handoffPrompt = buildCompactionHandoffPrompt(loop, analysis);
+	const handoff = handoffHelpers.ensurePendingRalphHandoff(ctx, loop.name, handoffPrompt, "compaction");
+	if (!handoff) {
+		if (ctx.hasUI) {
+			ctx.ui.notify("Ralph compaction handoff could not persist pending state; allowing normal compaction.", "warning");
+		}
+		return false;
+	}
+	if (handoff.commandQueued) {
+		if (ctx.hasUI) {
+			ctx.ui.notify(`Ralph compaction handoff was already persisted for ${handoff.loop.name}; cancelling compaction.`, "warning");
+		}
+		return true;
+	}
+
+	const queued = await queueCompactionHandoffCommand(pi, handoff.loop.name);
+	if (!queued) {
+		handoffHelpers.clearPendingRalphHandoff(ctx, handoff.loop.name);
+		if (ctx.hasUI) {
+			ctx.ui.notify("Ralph compaction handoff could not queue /ralph-handoff-now; allowing normal compaction.", "warning");
+		}
+		return false;
+	}
+	handoffHelpers.markPendingRalphHandoffQueued(ctx, handoff.loop.name, true);
+	if (ctx.hasUI) {
+		ctx.ui.notify(`Ralph compaction handoff queued for ${handoff.loop.name}.`, "warning");
+	}
+	return true;
+}
+
 async function dispatchRecovery(state: RuntimeState, ctx: any, outcome: NonNullable<LoopOutcome>, pi: ExtensionAPI): Promise<void> {
 	if (state.halted && state.pendingRecoveryOutcome == null) return;
 	state.halted = true;
@@ -865,6 +1121,15 @@ export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
 		runtime.enabled = wasEnabled;
 		if (ctx.hasUI) {
 			ctx.ui.notify("Ralph loop detector loaded for this session.", "info");
+		}
+	});
+
+	pi.on("session_before_compact", async (event, ctx) => {
+		runtime.hostContext = ctx;
+		if (!syncActiveLoop(ctx)) return;
+		const prepared = await prepareCompactionHandoff(runtime, event, ctx, pi);
+		if (prepared) {
+			return { cancel: true };
 		}
 	});
 

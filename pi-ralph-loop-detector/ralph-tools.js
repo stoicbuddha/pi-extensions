@@ -79,6 +79,13 @@ CREATE TABLE IF NOT EXISTS loops (
 \tlast_done_reminder_at INTEGER NOT NULL DEFAULT 0,
 \tresume_generation INTEGER NOT NULL DEFAULT 0,
 \tlast_resume_dispatched_generation INTEGER NOT NULL DEFAULT 0,
+\tpending_handoff INTEGER NOT NULL DEFAULT 0,
+\tpending_handoff_reason TEXT,
+\tpending_handoff_prompt TEXT,
+\tpending_handoff_created_at TEXT,
+\tpending_handoff_generation INTEGER NOT NULL DEFAULT 0,
+\tlast_handoff_dispatched_generation INTEGER NOT NULL DEFAULT 0,
+\tpending_handoff_command_queued INTEGER NOT NULL DEFAULT 0,
 \tcurrent_task_id TEXT,
 \tstarted_at TEXT NOT NULL,
 \tcompleted_at TEXT,
@@ -139,10 +146,32 @@ CREATE TABLE IF NOT EXISTS loop_entries (
 `;
 }
 
+function ensureLoopColumns(db) {
+  const columns = new Set(
+    db.prepare("PRAGMA table_info(loops)").all().map((row) => row.name),
+  );
+  const additions = [
+    ["pending_handoff", "pending_handoff INTEGER NOT NULL DEFAULT 0"],
+    ["pending_handoff_reason", "pending_handoff_reason TEXT"],
+    ["pending_handoff_prompt", "pending_handoff_prompt TEXT"],
+    ["pending_handoff_created_at", "pending_handoff_created_at TEXT"],
+    ["pending_handoff_generation", "pending_handoff_generation INTEGER NOT NULL DEFAULT 0"],
+    ["last_handoff_dispatched_generation", "last_handoff_dispatched_generation INTEGER NOT NULL DEFAULT 0"],
+    ["pending_handoff_command_queued", "pending_handoff_command_queued INTEGER NOT NULL DEFAULT 0"],
+  ];
+
+  for (const [name, sql] of additions) {
+    if (!columns.has(name)) {
+      db.exec(`ALTER TABLE loops ADD COLUMN ${sql};`);
+    }
+  }
+}
+
 function openDb(ctx) {
   const db = new DatabaseSync(storePath(ctx));
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(schemaSql());
+  ensureLoopColumns(db);
   db.exec(`INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');`);
   return db;
 }
@@ -196,6 +225,13 @@ function hydrateLoop(db, row) {
     lastDoneReminderAt: row.last_done_reminder_at,
     resumeGeneration: row.resume_generation,
     lastResumeDispatchedGeneration: row.last_resume_dispatched_generation,
+    pendingHandoff: Boolean(row.pending_handoff),
+    pendingHandoffReason: row.pending_handoff_reason ?? null,
+    pendingHandoffPrompt: row.pending_handoff_prompt ?? null,
+    pendingHandoffCreatedAt: row.pending_handoff_created_at ?? null,
+    pendingHandoffGeneration: row.pending_handoff_generation ?? 0,
+    lastHandoffDispatchedGeneration: row.last_handoff_dispatched_generation ?? 0,
+    pendingHandoffCommandQueued: Boolean(row.pending_handoff_command_queued),
     currentTaskId: row.current_task_id ?? null,
     sessionStrategy: row.session_strategy,
     sessionStrategyFailure: row.session_strategy_failure,
@@ -246,11 +282,15 @@ function saveStore(ctx, store) {
         id, name, task_file, status, iteration, max_iterations, items_per_iteration, reflect_every,
         reflect_instructions, session_strategy, session_strategy_failure, pending_session_reset,
         last_reflection_at, last_done_reminder_at, resume_generation, last_resume_dispatched_generation,
+        pending_handoff, pending_handoff_reason, pending_handoff_prompt, pending_handoff_created_at,
+        pending_handoff_generation, last_handoff_dispatched_generation, pending_handoff_command_queued,
         current_task_id, started_at, completed_at, created_at, updated_at, archived_at
       ) VALUES (
         @id, @name, @task_file, @status, @iteration, @max_iterations, @items_per_iteration, @reflect_every,
         @reflect_instructions, @session_strategy, @session_strategy_failure, @pending_session_reset,
         @last_reflection_at, @last_done_reminder_at, @resume_generation, @last_resume_dispatched_generation,
+        @pending_handoff, @pending_handoff_reason, @pending_handoff_prompt, @pending_handoff_created_at,
+        @pending_handoff_generation, @last_handoff_dispatched_generation, @pending_handoff_command_queued,
         @current_task_id, @started_at, @completed_at, @created_at, @updated_at, @archived_at
       )
     `);
@@ -293,6 +333,13 @@ function saveStore(ctx, store) {
         last_done_reminder_at: loop.lastDoneReminderAt ?? 0,
         resume_generation: loop.resumeGeneration ?? 0,
         last_resume_dispatched_generation: loop.lastResumeDispatchedGeneration ?? 0,
+        pending_handoff: loop.pendingHandoff ? 1 : 0,
+        pending_handoff_reason: loop.pendingHandoffReason ?? null,
+        pending_handoff_prompt: loop.pendingHandoffPrompt ?? null,
+        pending_handoff_created_at: loop.pendingHandoffCreatedAt ?? null,
+        pending_handoff_generation: loop.pendingHandoffGeneration ?? 0,
+        last_handoff_dispatched_generation: loop.lastHandoffDispatchedGeneration ?? 0,
+        pending_handoff_command_queued: loop.pendingHandoffCommandQueued ? 1 : 0,
         current_task_id: loop.currentTaskId ?? null,
         started_at: loop.startedAt ?? createdAt,
         completed_at: loop.completedAt ?? null,
@@ -361,6 +408,7 @@ function getLoop(store, name) {
 }
 
 function persistLoop(ctx, store, loop) {
+  loop.updatedAt = nowIso();
   const index = store.loops.findIndex((item) => item.name === loop.name);
   if (index >= 0) store.loops[index] = loop;
   else store.loops.push(loop);
@@ -417,6 +465,13 @@ function createLoop(name, args = {}) {
     completedAt: null,
     archivedAt: null,
     currentTaskId: tasks[0]?.id ?? null,
+    pendingHandoff: false,
+    pendingHandoffReason: null,
+    pendingHandoffPrompt: null,
+    pendingHandoffCreatedAt: null,
+    pendingHandoffGeneration: 0,
+    lastHandoffDispatchedGeneration: 0,
+    pendingHandoffCommandQueued: false,
     taskFile: "",
     title: name,
     summary: "",
@@ -775,25 +830,70 @@ async function deliverIterationPrompt(target, prompt) {
   return false;
 }
 
+async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh", onDispatched = null) {
+  if (typeof ctx.newSession !== "function") {
+    logPromptDispatch(loop, `${mode}/followUp-fallback`, prompt);
+    if (await deliverIterationPrompt(ctx, prompt)) {
+      if (typeof onDispatched === "function") {
+        await onDispatched(ctx);
+      }
+      return true;
+    }
+    if (await deliverIterationPrompt(pi, prompt)) {
+      if (typeof onDispatched === "function") {
+        await onDispatched(ctx);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  try {
+    logPromptDispatch(loop, `${mode}/newSession`, prompt);
+    const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
+    const result = await ctx.newSession({
+      parentSession,
+      withSession: async (replacementCtx) => {
+        await deliverIterationPrompt(replacementCtx, prompt);
+        if (typeof onDispatched === "function") {
+          await onDispatched(replacementCtx);
+        }
+      },
+    });
+    if (!result?.cancelled) {
+      return true;
+    }
+  } catch {
+    // Fall through to follow-up.
+  }
+
+  logPromptDispatch(loop, `${mode}/followUp`, prompt);
+  if (await deliverIterationPrompt(ctx, prompt)) {
+    if (typeof onDispatched === "function") {
+      await onDispatched(ctx);
+    }
+    return true;
+  }
+
+  if (await deliverIterationPrompt(pi, prompt)) {
+    if (typeof onDispatched === "function") {
+      await onDispatched(ctx);
+    }
+    return true;
+  }
+
+  return false;
+}
+
 async function dispatchNextIteration(pi, ctx, loop) {
+  if (loop.pendingHandoff) {
+    logPromptDispatch(loop, "next/skipped-pending-handoff", "");
+    return false;
+  }
   const prompt = buildIterationPrompt(loop, loadRalphOverlay(ctx));
 
   if (loop.sessionStrategy === "newSession" && typeof ctx.newSession === "function") {
-    try {
-      logPromptDispatch(loop, "next/newSession", prompt);
-      const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
-      const result = await ctx.newSession({
-        parentSession,
-        withSession: async (replacementCtx) => {
-          await deliverIterationPrompt(replacementCtx, prompt);
-        },
-      });
-      if (!result?.cancelled) {
-        return true;
-      }
-    } catch {
-      // Fall through to the supported follow-up path.
-    }
+    return dispatchFreshContextPrompt(pi, ctx, loop, prompt, "next");
   }
 
   logPromptDispatch(loop, "next/followUp", prompt);
@@ -809,39 +909,158 @@ async function dispatchNextIteration(pi, ctx, loop) {
 }
 
 async function dispatchFreshIteration(pi, ctx, loop) {
+  if (loop.pendingHandoff) {
+    logPromptDispatch(loop, "fresh/skipped-pending-handoff", "");
+    return false;
+  }
   const prompt = buildResetPrompt(loop, loadRalphOverlay(ctx));
+  return dispatchFreshContextPrompt(pi, ctx, loop, prompt, "fresh");
+}
 
-  if (typeof ctx.newSession !== "function") {
-    logPromptDispatch(loop, "fresh/followUp-fallback", prompt);
-    return dispatchNextIteration(pi, ctx, loop);
+function buildCompactionHandoffMessage(loop, handoffPrompt) {
+  const basePrompt = buildResetPrompt(loop, null);
+  const extra = [
+    "",
+    "## Compaction Handoff",
+    String(handoffPrompt ?? "").trim(),
+    "",
+    "Continue from this fresh context rather than relying on the old transcript.",
+    "Use Ralph canonical state as the source of truth.",
+    "Take the smallest validating next step and avoid repeating the same failed action.",
+  ].join("\n");
+  const prompt = `${basePrompt}${extra}`;
+  if (prompt.length <= PROMPT_MAX_CHARS) return prompt;
+  return `${prompt.slice(0, PROMPT_MAX_CHARS)}\n\n[Prompt truncated by ${prompt.length - PROMPT_MAX_CHARS} chars. Use Ralph tools for more context.]`;
+}
+
+function getPendingHandoffLoop(store, loopName) {
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop || !loop.pendingHandoff || !loop.pendingHandoffPrompt) return null;
+  return loop;
+}
+
+export function getPendingRalphHandoff(ctx, loopName) {
+  const store = loadStore(ctx);
+  const loop = getPendingHandoffLoop(store, loopName);
+  if (!loop) return null;
+  return {
+    loop,
+    prompt: loop.pendingHandoffPrompt,
+    reason: loop.pendingHandoffReason ?? null,
+    generation: loop.pendingHandoffGeneration ?? 0,
+    commandQueued: Boolean(loop.pendingHandoffCommandQueued),
+  };
+}
+
+export function ensurePendingRalphHandoff(ctx, loopName, handoffPrompt, reason = "compaction") {
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop) return null;
+
+  if (
+    loop.pendingHandoff &&
+    loop.pendingHandoffReason === reason &&
+    typeof loop.pendingHandoffPrompt === "string" &&
+    loop.pendingHandoffPrompt.trim()
+  ) {
+    return {
+      loop,
+      generation: loop.pendingHandoffGeneration ?? 0,
+      commandQueued: Boolean(loop.pendingHandoffCommandQueued),
+    };
   }
 
-  try {
-    logPromptDispatch(loop, "fresh/newSession", prompt);
-    const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
-    const result = await ctx.newSession({
-      parentSession,
-      withSession: async (replacementCtx) => {
-        await deliverIterationPrompt(replacementCtx, prompt);
-      },
-    });
-    if (!result?.cancelled) {
-      return true;
-    }
-  } catch {
-    // Fall through to follow-up.
+  loop.pendingHandoff = true;
+  loop.pendingHandoffReason = reason;
+  loop.pendingHandoffPrompt = String(handoffPrompt ?? "").trim();
+  loop.pendingHandoffCreatedAt = nowIso();
+  loop.pendingHandoffGeneration = (loop.pendingHandoffGeneration ?? 0) + 1;
+  loop.pendingHandoffCommandQueued = false;
+  addVerification(loop, `Queued fresh-context handoff (${reason})`);
+  persistLoop(ctx, store, loop);
+
+  return {
+    loop,
+    generation: loop.pendingHandoffGeneration,
+    commandQueued: false,
+  };
+}
+
+export function markPendingRalphHandoffQueued(ctx, loopName, queued = true) {
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop) return false;
+  if (!loop.pendingHandoff) return false;
+  loop.pendingHandoffCommandQueued = Boolean(queued);
+  persistLoop(ctx, store, loop);
+  return true;
+}
+
+export function clearPendingRalphHandoff(ctx, loopName, options = {}) {
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop) return false;
+
+  if (options.markDispatched && loop.pendingHandoff) {
+    loop.lastHandoffDispatchedGeneration = loop.pendingHandoffGeneration ?? 0;
   }
 
-  logPromptDispatch(loop, "fresh/followUp", prompt);
-  if (await deliverIterationPrompt(ctx, prompt)) {
-    return true;
+  loop.pendingHandoff = false;
+  loop.pendingHandoffReason = null;
+  loop.pendingHandoffPrompt = null;
+  loop.pendingHandoffCreatedAt = null;
+  loop.pendingHandoffCommandQueued = false;
+  persistLoop(ctx, store, loop);
+  return true;
+}
+
+export async function dispatchPendingRalphHandoff(pi, ctx, loopName) {
+  const store = loadStore(ctx);
+  const loop = getPendingHandoffLoop(store, loopName);
+  if (!loop) {
+    return { dispatched: false, reason: "no_pending_handoff" };
   }
 
-  if (await deliverIterationPrompt(pi, prompt)) {
-    return true;
+  if ((loop.pendingHandoffGeneration ?? 0) <= (loop.lastHandoffDispatchedGeneration ?? 0)) {
+    clearPendingRalphHandoff(ctx, loop.name, { markDispatched: false });
+    return { dispatched: false, reason: "already_dispatched" };
   }
 
-  return false;
+  const prompt = buildCompactionHandoffMessage(loop, loop.pendingHandoffPrompt);
+  let dispatchedLoop = loop;
+  const finalizeDispatch = async (targetCtx) => {
+    const targetStore = loadStore(targetCtx);
+    const targetLoop = getCurrentLoop(targetStore, loop.name);
+    if (!targetLoop) return null;
+
+    addVerification(targetLoop, `Fresh-context handoff dispatched (${targetLoop.pendingHandoffReason ?? "unknown"})`);
+    targetLoop.lastHandoffDispatchedGeneration = targetLoop.pendingHandoffGeneration ?? 0;
+    targetLoop.pendingHandoff = false;
+    targetLoop.pendingHandoffReason = null;
+    targetLoop.pendingHandoffPrompt = null;
+    targetLoop.pendingHandoffCreatedAt = null;
+    targetLoop.pendingHandoffCommandQueued = false;
+    persistLoop(targetCtx, targetStore, targetLoop);
+    dispatchedLoop = targetLoop;
+    return targetLoop;
+  };
+
+  const dispatched = await dispatchFreshContextPrompt(
+    pi,
+    ctx,
+    loop,
+    prompt,
+    `handoff/${loop.pendingHandoffReason ?? "unknown"}`,
+    finalizeDispatch,
+  );
+
+  if (!dispatched) {
+    loop.pendingHandoffCommandQueued = false;
+    persistLoop(ctx, store, loop);
+    return { dispatched: false, reason: "dispatch_failed", loop };
+  }
+
+  return { dispatched: true, loop: dispatchedLoop };
 }
 
 function updateLoopFromArgs(loop, args) {
@@ -972,6 +1191,7 @@ export async function maybeDispatchStoppedLoopSteering(ctx, pi, options = {}) {
   const store = loadStore(ctx);
   const loop = getCurrentLoop(store);
   if (!loop || loop.status !== "active") return false;
+  if (loop.pendingHandoff) return false;
 
   if (typeof ctx?.hasPendingMessages === "function" && ctx.hasPendingMessages()) {
     return false;
@@ -1023,6 +1243,10 @@ async function resumeLoop(pi, ctx, store, loop) {
   loop.iteration += 1;
   persistLoop(ctx, store, loop);
   if (ctx.hasUI) ctx.ui.notify(`Resumed: ${summarizeLoop(loop)}`, "info");
+  if (loop.pendingHandoff) {
+    if (ctx.hasUI) ctx.ui.notify(`Pending Ralph handoff preserved for ${loop.name}; skipping in-session iteration dispatch.`, "warning");
+    return;
+  }
   await dispatchNextIteration(pi, ctx, loop);
 }
 
@@ -1208,6 +1432,23 @@ export function registerRalphSurface(pi) {
     loop.completedAt = nowIso();
     persistLoop(ctx, store, loop);
     if (ctx.hasUI) ctx.ui.notify(`Stopped Ralph loop: ${loop.name}`, "info");
+  });
+
+  registerCommand(pi, "ralph-handoff-now", async (args, ctx) => {
+    const loopName = String(args ?? "").trim() || undefined;
+    const pending = getPendingRalphHandoff(ctx, loopName);
+    if (!pending) {
+      if (ctx.hasUI) ctx.ui.notify(loopName ? `No pending Ralph handoff for "${loopName}".` : "No pending Ralph handoff.", "warning");
+      return;
+    }
+
+    const result = await dispatchPendingRalphHandoff(pi, ctx, pending.loop.name);
+    if (!result.dispatched) {
+      if (ctx.hasUI) ctx.ui.notify(`Ralph handoff did not dispatch (${result.reason}).`, "warning");
+      return;
+    }
+
+    if (ctx.hasUI) ctx.ui.notify(`Ralph handoff dispatched for ${pending.loop.name}.`, "info");
   });
 
   registerTool(pi, {
