@@ -4,6 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 const source = fs.readFileSync(path.join(import.meta.dirname, "..", "ralph-tools.js"), "utf8");
+const bridgeSource = fs.readFileSync(path.join(import.meta.dirname, "..", "src", "subagent-bridge.js"), "utf8");
 
 test("does not register ralph_start as an agent tool", () => {
   assert.equal(source.includes('name: "ralph_start"'), false);
@@ -25,11 +26,20 @@ test("exports Ralph stop steering for natural assistant stops", () => {
 
 test("iteration prompt avoids duplicating next task and caps prompt fields", () => {
   assert.match(source, /const PROMPT_MAX_CHARS = 7000;/);
+  assert.match(source, /const HANDOFF_PROMPT_MAX_CHARS = 12000;/);
   assert.match(source, /const PROMPT_TASK_WINDOW = 3;/);
   assert.match(source, /function truncateForPrompt\(text, maxChars = PROMPT_FIELD_MAX_CHARS\)/);
+  assert.match(source, /function trimHandoffSection\(text, maxChars\)/);
+  assert.match(source, /function isQueuedCompactionHandoffPrompt\(prompt\)/);
   assert.match(source, /buildTaskWindow\(loop, PROMPT_TASK_WINDOW\)\.filter\(\(task\) => task\?\.id !== nextTask\?\.id\)/);
+  assert.match(source, /use the web access tool to look up the exact issue before guessing/);
+  assert.match(source, /Prefer delegating exact-problem investigation before repeated trial-and-error/);
+  assert.match(source, /researcher for deeper investigation and sourced web research, oracle for second-opinion debugging or solution selection/);
+  assert.match(source, /If you hit Rust compiler errors, exact error codes, crate API uncertainty, or framework-specific failures, prefer delegation before repeated local guessing/);
+  assert.match(source, /If two attempts on the same exact issue have not produced new evidence, stop pushing locally and delegate or research before trying again/);
   assert.match(source, /## Workspace Overlay/);
   assert.match(source, /`\.\/RALPH\.md` was found\. Its full contents will be injected into hidden system context for this turn\./);
+  assert.match(source, /\[Handoff prompt still exceeded the safety cap\. Use Ralph tools for the remaining context\.\]/);
   assert.match(source, /console\.info\(`\[ralph\] prompt dispatch mode=\$\{mode\} loop=\$\{loop\?\.name \?\? "unknown"\} iteration=\$\{loop\?\.iteration \?\? "\?"\} chars=\$\{promptChars\}`\);/);
 });
 
@@ -37,23 +47,35 @@ test("managed Ralph system prompt is replaced instead of appended repeatedly", (
   assert.match(source, /const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";/);
   assert.match(source, /const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";/);
   assert.match(source, /function stripManagedRalphContext\(systemPrompt\)/);
+  assert.match(source, /before_agent_start handoff-tool-turn/);
   assert.match(source, /const cleanBasePrompt = stripManagedRalphContext\(basePrompt\);/);
   assert.match(source, /const managedPrompt = buildManagedRalphSystemPrompt\(loop, overlay\);/);
 });
 
-test("persists and dispatches pending Ralph handoffs through a dedicated command", () => {
+test("persists and dispatches pending Ralph handoffs through dedicated tooling", () => {
   assert.match(source, /pending_handoff INTEGER NOT NULL DEFAULT 0/);
   assert.match(source, /pending_handoff_prompt TEXT/);
   assert.match(source, /pending_handoff_generation INTEGER NOT NULL DEFAULT 0/);
   assert.match(source, /export function ensurePendingRalphHandoff\(ctx, loopName, handoffPrompt, reason = "compaction"\)/);
   assert.match(source, /export async function dispatchPendingRalphHandoff\(pi, ctx, loopName\)/);
   assert.match(source, /registerCommand\(pi, "ralph-handoff-now", async \(args, ctx\) => \{/);
+  assert.match(source, /name: "ralph_handoff"/);
+  assert.match(source, /tool ralph_handoff start requestedLoop=/);
+  assert.match(source, /tool ralph_handoff complete loop=/);
   assert.match(source, /const pending = getPendingRalphHandoff\(ctx, loopName\);/);
   assert.match(source, /const result = await dispatchPendingRalphHandoff\(pi, ctx, pending\.loop\.name\);/);
+});
+
+test("recovery summarizer prompt de-emphasizes Ralph bookkeeping mismatches", () => {
+  assert.match(bridgeSource, /Do not turn Ralph bookkeeping mismatches, tracker drift, stale currentTaskId values, or note\/plan inconsistencies into primary work items/);
+  assert.match(bridgeSource, /Prioritize concrete user-task continuity, recent real code activity, and the next productive engineering step/);
 });
 
 test("pending handoff suppresses normal Ralph iteration dispatch", () => {
   assert.match(source, /if \(loop\.pendingHandoff\) \{\s+logPromptDispatch\(loop, "next\/skipped-pending-handoff", ""\);\s+return false;\s+\}/s);
   assert.match(source, /if \(loop\.pendingHandoff\) \{\s+logPromptDispatch\(loop, "fresh\/skipped-pending-handoff", ""\);\s+return false;\s+\}/s);
   assert.match(source, /Pending Ralph handoff preserved for \$\{loop\.name\}; skipping in-session iteration dispatch\./);
+  assert.match(source, /Next iteration will continue via pending Ralph compaction handoff\./);
+  assert.match(source, /Paused after ralph_done because fresh-context dispatch failed/);
+  assert.match(source, /Paused after ralph_done because follow-up dispatch failed/);
 });

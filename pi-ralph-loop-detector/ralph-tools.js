@@ -20,14 +20,43 @@ Pause and reflect on your progress:
 
 Record your reflection with Ralph tools, then continue working.`;
 const PROMPT_MAX_CHARS = 7000;
+const HANDOFF_PROMPT_MAX_CHARS = 12000;
+const HANDOFF_SUMMARY_MAX_CHARS = 4200;
+const HANDOFF_RATIONALE_MAX_CHARS = 2200;
+const HANDOFF_STEP_MAX_CHARS = 240;
+const HANDOFF_MAX_STEPS = 6;
 const PROMPT_FIELD_MAX_CHARS = 400;
 const PROMPT_TASK_TITLE_MAX_CHARS = 220;
 const PROMPT_TASK_WINDOW = 3;
 const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";
 const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";
+let latestSessionControlCtx = null;
+const RALPH_DEBUG_LOG = "/tmp/pi-ralph-loop-detector.log";
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function debugLog(message) {
+  const line = typeof message === "string" ? message : String(message);
+  try {
+    fs.appendFileSync(RALPH_DEBUG_LOG, `${line}\n`, "utf8");
+  } catch {
+    // Ignore logging failures; they must never affect loop execution.
+  }
+}
+
+function rememberSessionControlCtx(ctx) {
+  if (!ctx || typeof ctx.newSession !== "function") return;
+  latestSessionControlCtx = ctx;
+}
+
+function getSessionControlCtx(ctx) {
+  if (ctx && typeof ctx.newSession === "function") return ctx;
+  if (latestSessionControlCtx && typeof latestSessionControlCtx.newSession === "function") {
+    return latestSessionControlCtx;
+  }
+  return ctx;
 }
 
 function escapeRegExp(text) {
@@ -610,7 +639,7 @@ function buildCompactPlanResponse(loop, options = {}) {
     `Loop: ${loop.name}`,
     `Status: ${loop.status}`,
     `Iteration: ${loop.iteration}/${loop.maxIterations}`,
-    `Current task: ${loop.currentTaskId ?? "none"}`,
+    `Next unfinished task: ${selectNextTask(loop)?.id ?? "none"}`,
   ];
 
   for (const task of filtered.slice(0, maxTasks)) {
@@ -626,23 +655,6 @@ function buildCompactPlanResponse(loop, options = {}) {
 
 function selectNextTask(loop) {
   if (!Array.isArray(loop.tasks) || loop.tasks.length === 0) return null;
-  if (loop.currentTaskId) {
-    const current = loop.tasks.find((task) => task.id === loop.currentTaskId);
-    if (current && current.status !== "done" && current.status !== "blocked") {
-      return current;
-    }
-    const currentIndex = loop.tasks.findIndex((task) => task.id === loop.currentTaskId);
-    if (currentIndex >= 0) {
-      for (let i = currentIndex + 1; i < loop.tasks.length; i += 1) {
-        const task = loop.tasks[i];
-        if (task.status !== "done" && task.status !== "blocked") return task;
-      }
-      for (let i = 0; i < currentIndex; i += 1) {
-        const task = loop.tasks[i];
-        if (task.status !== "done" && task.status !== "blocked") return task;
-      }
-    }
-  }
   return loop.tasks.find((task) => task.status !== "done" && task.status !== "blocked") ?? null;
 }
 
@@ -670,41 +682,11 @@ function summarizeTaskCounts(tasks) {
   return counts;
 }
 
-function buildTaskWindow(loop, maxTasks = PROMPT_TASK_WINDOW) {
-  const tasks = Array.isArray(loop.tasks) ? loop.tasks : [];
-  if (tasks.length === 0) return [];
-
-  const openTasks = tasks.filter((task) => task.status !== "done" && task.status !== "blocked");
-  const startIndex = loop.currentTaskId ? tasks.findIndex((task) => task.id === loop.currentTaskId) : -1;
-  const ordered = [];
-
-  if (startIndex >= 0) {
-    for (let i = startIndex; i < tasks.length; i += 1) {
-      const task = tasks[i];
-      if (task.status !== "done" && task.status !== "blocked") ordered.push(task);
-      if (ordered.length >= maxTasks) return ordered;
-    }
-    for (let i = 0; i < startIndex; i += 1) {
-      const task = tasks[i];
-      if (task.status !== "done" && task.status !== "blocked") ordered.push(task);
-      if (ordered.length >= maxTasks) return ordered;
-    }
-  }
-
-  for (const task of openTasks) {
-    if (!ordered.includes(task)) ordered.push(task);
-    if (ordered.length >= maxTasks) break;
-  }
-
-  return ordered.slice(0, maxTasks);
-}
-
 function buildIterationPrompt(loop, overlay = null) {
   const nextTask = selectNextTask(loop);
   const maxStr = loop.maxIterations > 0 ? `/${loop.maxIterations}` : "";
   const currentTaskCount = Array.isArray(loop.tasks) ? loop.tasks.length : 0;
   const counts = summarizeTaskCounts(Array.isArray(loop.tasks) ? loop.tasks : []);
-  const taskWindow = buildTaskWindow(loop, PROMPT_TASK_WINDOW).filter((task) => task?.id !== nextTask?.id);
   const lines = [
     "───────────────────────────────────────────────────────────────────────",
     `🔄 RALPH LOOP: ${loop.name} | Iteration ${loop.iteration}${maxStr}${loop.reflectEvery > 0 ? " | 🪞 REFLECTION" : ""}`,
@@ -717,7 +699,7 @@ function buildIterationPrompt(loop, overlay = null) {
   if (loop.summary?.trim()) lines.push(truncateForPrompt(loop.summary, 600));
   lines.push("");
   lines.push(
-    `Tasks: ${currentTaskCount} total, ${counts.done} done, ${counts.in_progress} in progress, ${counts.blocked} blocked, ${counts.todo} todo, ${counts.cancelled} cancelled.${loop.currentTaskId ? ` · current ${loop.currentTaskId}` : ""}`,
+    `Tasks: ${currentTaskCount} total, ${counts.done} done, ${counts.in_progress} in progress, ${counts.blocked} blocked, ${counts.todo} todo, ${counts.cancelled} cancelled.`,
   );
 
   if (Array.isArray(loop.goals) && loop.goals.length > 0) {
@@ -727,16 +709,9 @@ function buildIterationPrompt(loop, overlay = null) {
     }
   }
 
-  if (taskWindow.length > 0) {
-    lines.push("", "## Additional Open Tasks");
-    for (const task of taskWindow) {
-      lines.push(formatPromptTask(task));
-    }
-  }
-
   lines.push(
     "",
-    "## Next Task",
+    "## Next Unfinished Task",
     nextTask ? formatPromptTask(nextTask) : "- No active task found. If all work is complete, respond with the completion marker.",
     "",
     "## Instructions",
@@ -746,23 +721,34 @@ function buildIterationPrompt(loop, overlay = null) {
     "- Aim for the smallest useful step that reduces uncertainty.",
     "- If you already know the next concrete action, take it now.",
     "- If you need more context, fetch only the missing detail that blocks progress.",
+    "- When compiler errors, Rust error codes, crate API questions, or framework-specific failures are blocking progress, use the web access tool to look up the exact issue before guessing.",
+    "- Treat unresolved exact technical errors as a research or diagnosis problem first, not a review problem.",
+    "- Prefer delegating exact-problem investigation before repeated trial-and-error. Use researcher or oracle to break stalemates instead of headbutting the same issue in the main session.",
     "- The Graphify graph is already built. Start with Graphify query or explain tools to understand project structure, relevant files, symbols, and current architecture before broad manual exploration.",
     "- Leverage the available subagents whenever they are a good fit for the task instead of doing all work in the main session.",
-    "- Prefer delegation for broad research, uncertain code paths, and validation-heavy work.",
-    "- Use scout for quick repo scanning, researcher for deeper investigation, and reviewer for validation or sanity checks.",
+    "- Prefer delegation for broad research, uncertain code paths, validation-heavy work, and exact technical troubleshooting.",
+    "- Use scout for quick repo scanning and local codebase mapping.",
+    "- Use researcher when you need external facts, exact error-code lookup, crate/framework/API research, or comparison across candidate fixes.",
+    "- Use oracle when the problem needs second-opinion diagnosis, ambiguity reduction, or help choosing between plausible fixes.",
+    "- Use reviewer to validate a proposed fix, check a diff, or sanity-check reasoning after you already have a likely path; do not use reviewer as the first stop for an unresolved exact error.",
     "- Keep planning brief, then switch back to tools.",
     "- Good iterations usually look like: inspect, act, verify, report.",
     "",
     `You are in a Ralph loop (iteration ${loop.iteration}${loop.maxIterations > 0 ? ` of ${loop.maxIterations}` : ""}).`,
     loop.itemsPerIteration > 0
       ? `THIS ITERATION: Process approximately ${loop.itemsPerIteration} task item(s), then call the actual ralph_done tool.`
-      : "1. Start from the single Next Task in the runtime view.",
+      : "1. Start from the single Next Unfinished Task in the runtime view.",
     "2. Use Graphify query or explain first to understand where the current project stands from the existing graph, then use Graphify for exact repo navigation and file/symbol lookup.",
-    "3. Leverage the available subagents wherever they fit: scout for quick repo scanning, researcher for deeper investigation, and reviewer for validation or sanity checks.",
-    "4. Use Ralph plan tools when you need more than the compact runtime view.",
-    "5. Move straight to the next concrete step instead of recapping the plan.",
-    "6. Update Ralph task state and evidence as you go.",
-    "7. When the current iteration is complete, call the actual ralph_done tool; it will refresh Graphify and create a git checkpoint push before queuing the next iteration.",
+    "3. If you hit Rust compiler errors, exact error codes, crate API uncertainty, or framework-specific failures, treat that as a research/diagnosis task before more local trial-and-error.",
+    "4. Use the web access tool yourself when a quick exact lookup is enough; use researcher when the issue needs broader sourced investigation, source comparison, or narrowing several possible fixes.",
+    "5. Use oracle when you need a second-opinion diagnosis or help choosing the best next move among plausible fixes.",
+    "6. Use reviewer for validation, diff review, or sanity-checking a proposed fix after you already have a likely answer; do not send unresolved exact technical errors to reviewer first.",
+    "7. Use scout for quick repo scanning and local structure lookup.",
+    "8. If two attempts on the same exact issue have not produced new evidence, stop pushing locally and delegate or research before trying again.",
+    "9. Use Ralph plan tools when you need more than the compact runtime view.",
+    "10. Move straight to the next concrete step instead of recapping the plan.",
+    "11. Update Ralph task state and evidence as you go.",
+    "12. When the current iteration is complete, call the actual ralph_done tool; it will refresh Graphify and create a git checkpoint push before queuing the next iteration.",
   );
 
   if (overlay) {
@@ -783,9 +769,33 @@ function buildResetPrompt(loop, overlay = null) {
   return buildIterationPrompt(loop, overlay);
 }
 
+function trimHandoffSection(text, maxChars) {
+  const trimmed = typeof text === "string" ? text.trim() : "";
+  if (!trimmed) return "";
+  if (trimmed.length <= maxChars) return trimmed;
+  return `${trimmed.slice(0, Math.max(0, maxChars - 25)).trimEnd()}\n[Section truncated for handoff.]`;
+}
+
+function isQueuedCompactionHandoffPrompt(prompt) {
+  const text = typeof prompt === "string" ? prompt : "";
+  return text.includes("A Ralph compaction handoff is queued for loop")
+    && text.includes("Call the `ralph_handoff` tool immediately.");
+}
+
 function logPromptDispatch(loop, mode, prompt) {
   const promptChars = typeof prompt === "string" ? prompt.length : 0;
-  console.info(`[ralph] prompt dispatch mode=${mode} loop=${loop?.name ?? "unknown"} iteration=${loop?.iteration ?? "?"} chars=${promptChars}`);
+  debugLog(`[ralph] prompt dispatch mode=${mode} loop=${loop?.name ?? "unknown"} iteration=${loop?.iteration ?? "?"} chars=${promptChars}`);
+}
+
+function logHandoffStage(loop, stage, details = {}) {
+  const loopName = loop?.name ?? "unknown";
+  const iteration = loop?.iteration ?? "?";
+  const generation = loop?.pendingHandoffGeneration ?? "?";
+  const detailText = Object.entries(details)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(" ");
+  const suffix = detailText ? ` ${detailText}` : "";
+  debugLog(`[ralph] handoff stage=${stage} loop=${loopName} iteration=${iteration} generation=${generation}${suffix}`);
 }
 
 function stripManagedRalphContext(systemPrompt) {
@@ -830,8 +840,26 @@ async function deliverIterationPrompt(target, prompt) {
   return false;
 }
 
+async function deliverFreshSessionPrompt(target, prompt) {
+  if (target && typeof target.sendUserMessage === "function") {
+    debugLog(`[ralph] handoff stage=replacement-sendUserMessage promptChars=${typeof prompt === "string" ? prompt.length : 0}`);
+    await target.sendUserMessage(prompt, { deliverAs: "followUp" });
+    return true;
+  }
+  debugLog(`[ralph] handoff stage=replacement-sendUserMessage-unavailable fallback=true`);
+  return deliverIterationPrompt(target, prompt);
+}
+
 async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh", onDispatched = null) {
+  const controlCtx = getSessionControlCtx(ctx);
+  const canNewSession = Boolean(controlCtx && typeof controlCtx.newSession === "function");
+  let attemptedSessionReplacement = false;
   if (typeof ctx.newSession !== "function") {
+    logHandoffStage(loop, `${mode}-ctx-no-newSession`, { controlCtxHasNewSession: canNewSession });
+  }
+
+  if (!canNewSession) {
+    logHandoffStage(loop, `${mode}-no-newSession`);
     logPromptDispatch(loop, `${mode}/followUp-fallback`, prompt);
     if (await deliverIterationPrompt(ctx, prompt)) {
       if (typeof onDispatched === "function") {
@@ -849,24 +877,38 @@ async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh",
   }
 
   try {
+    attemptedSessionReplacement = true;
+    logHandoffStage(loop, `${mode}-newSession-start`, { promptChars: typeof prompt === "string" ? prompt.length : 0 });
     logPromptDispatch(loop, `${mode}/newSession`, prompt);
-    const parentSession = ctx.sessionManager?.getSessionFile?.() ?? undefined;
-    const result = await ctx.newSession({
+    const parentSession = controlCtx.sessionManager?.getSessionFile?.() ?? ctx.sessionManager?.getSessionFile?.() ?? undefined;
+    const result = await controlCtx.newSession({
       parentSession,
       withSession: async (replacementCtx) => {
-        await deliverIterationPrompt(replacementCtx, prompt);
+        rememberSessionControlCtx(replacementCtx);
+        logHandoffStage(loop, `${mode}-withSession-enter`, { parentSession });
+        await deliverFreshSessionPrompt(replacementCtx, prompt);
+        logHandoffStage(loop, `${mode}-withSession-delivered`);
         if (typeof onDispatched === "function") {
           await onDispatched(replacementCtx);
+          logHandoffStage(loop, `${mode}-withSession-finalized`);
         }
       },
     });
+    logHandoffStage(loop, `${mode}-newSession-result`, { cancelled: Boolean(result?.cancelled) });
     if (!result?.cancelled) {
       return true;
     }
-  } catch {
-    // Fall through to follow-up.
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    logHandoffStage(loop, `${mode}-newSession-error`, { error: detail });
   }
 
+  if (attemptedSessionReplacement) {
+    logHandoffStage(loop, `${mode}-post-newSession-no-fallback`);
+    return false;
+  }
+
+  logHandoffStage(loop, `${mode}-followUp-fallback-start`);
   logPromptDispatch(loop, `${mode}/followUp`, prompt);
   if (await deliverIterationPrompt(ctx, prompt)) {
     if (typeof onDispatched === "function") {
@@ -919,18 +961,40 @@ async function dispatchFreshIteration(pi, ctx, loop) {
 
 function buildCompactionHandoffMessage(loop, handoffPrompt) {
   const basePrompt = buildResetPrompt(loop, null);
-  const extra = [
+  const rawHandoff = String(handoffPrompt ?? "").trim();
+  const summaryMatch = rawHandoff.match(/## Handoff Summary\s*([\s\S]*?)(?:\n## |\s*$)/);
+  const rationaleMatch = rawHandoff.match(/## Why Fresh Context Was Needed\s*([\s\S]*?)(?:\n## |\s*$)/);
+  const nextStepsMatch = rawHandoff.match(/## Next Steps\s*([\s\S]*?)(?:\n## |\s*$)/);
+  const intro = rawHandoff
+    .replace(/## Handoff Summary[\s\S]*$/m, "")
+    .trim();
+  const summary = trimHandoffSection(summaryMatch?.[1] ?? "", HANDOFF_SUMMARY_MAX_CHARS);
+  const rationale = trimHandoffSection(rationaleMatch?.[1] ?? "", HANDOFF_RATIONALE_MAX_CHARS);
+  const steps = String(nextStepsMatch?.[1] ?? "")
+    .split("\n")
+    .map((line) => line.replace(/^\s*-\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, HANDOFF_MAX_STEPS)
+    .map((step) => `- ${trimHandoffSection(step, HANDOFF_STEP_MAX_CHARS)}`);
+
+  const extraLines = [
     "",
     "## Compaction Handoff",
-    String(handoffPrompt ?? "").trim(),
+    intro,
+  ];
+  if (summary) extraLines.push("", "## Handoff Summary", summary);
+  if (rationale) extraLines.push("", "## Why Fresh Context Was Needed", rationale);
+  if (steps.length > 0) extraLines.push("", "## Next Steps", ...steps);
+  extraLines.push(
     "",
     "Continue from this fresh context rather than relying on the old transcript.",
     "Use Ralph canonical state as the source of truth.",
     "Take the smallest validating next step and avoid repeating the same failed action.",
-  ].join("\n");
-  const prompt = `${basePrompt}${extra}`;
-  if (prompt.length <= PROMPT_MAX_CHARS) return prompt;
-  return `${prompt.slice(0, PROMPT_MAX_CHARS)}\n\n[Prompt truncated by ${prompt.length - PROMPT_MAX_CHARS} chars. Use Ralph tools for more context.]`;
+  );
+
+  const prompt = `${basePrompt}${extraLines.join("\n")}`;
+  if (prompt.length <= HANDOFF_PROMPT_MAX_CHARS) return prompt;
+  return `${prompt.slice(0, HANDOFF_PROMPT_MAX_CHARS)}\n\n[Handoff prompt still exceeded the safety cap. Use Ralph tools for the remaining context.]`;
 }
 
 function getPendingHandoffLoop(store, loopName) {
@@ -978,6 +1042,7 @@ export function ensurePendingRalphHandoff(ctx, loopName, handoffPrompt, reason =
   loop.pendingHandoffCommandQueued = false;
   addVerification(loop, `Queued fresh-context handoff (${reason})`);
   persistLoop(ctx, store, loop);
+  logHandoffStage(loop, "persisted", { reason, promptChars: loop.pendingHandoffPrompt.length });
 
   return {
     loop,
@@ -993,7 +1058,25 @@ export function markPendingRalphHandoffQueued(ctx, loopName, queued = true) {
   if (!loop.pendingHandoff) return false;
   loop.pendingHandoffCommandQueued = Boolean(queued);
   persistLoop(ctx, store, loop);
+  logHandoffStage(loop, "command-queued", { queued: Boolean(queued) });
   return true;
+}
+
+export function updatePendingRalphHandoffPrompt(ctx, loopName, handoffPrompt, reason) {
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop || !loop.pendingHandoff) return null;
+  loop.pendingHandoffPrompt = String(handoffPrompt ?? "").trim();
+  if (typeof reason === "string" && reason.trim()) {
+    loop.pendingHandoffReason = reason.trim();
+  }
+  persistLoop(ctx, store, loop);
+  logHandoffStage(loop, "prompt-updated", { promptChars: loop.pendingHandoffPrompt.length });
+  return {
+    loop,
+    generation: loop.pendingHandoffGeneration ?? 0,
+    commandQueued: Boolean(loop.pendingHandoffCommandQueued),
+  };
 }
 
 export function clearPendingRalphHandoff(ctx, loopName, options = {}) {
@@ -1018,31 +1101,56 @@ export async function dispatchPendingRalphHandoff(pi, ctx, loopName) {
   const store = loadStore(ctx);
   const loop = getPendingHandoffLoop(store, loopName);
   if (!loop) {
+    debugLog(`[ralph] handoff stage=dispatch-missing loop=${loopName ?? "unknown"}`);
     return { dispatched: false, reason: "no_pending_handoff" };
   }
+  logHandoffStage(loop, "dispatch-start", { reason: loop.pendingHandoffReason ?? null, commandQueued: Boolean(loop.pendingHandoffCommandQueued) });
 
   if ((loop.pendingHandoffGeneration ?? 0) <= (loop.lastHandoffDispatchedGeneration ?? 0)) {
+    logHandoffStage(loop, "dispatch-already-dispatched", { lastDispatchedGeneration: loop.lastHandoffDispatchedGeneration ?? 0 });
     clearPendingRalphHandoff(ctx, loop.name, { markDispatched: false });
     return { dispatched: false, reason: "already_dispatched" };
   }
 
   const prompt = buildCompactionHandoffMessage(loop, loop.pendingHandoffPrompt);
+  const handoffReason = loop.pendingHandoffReason ?? "unknown";
+  const pendingSnapshot = {
+    reason: loop.pendingHandoffReason ?? null,
+    prompt: loop.pendingHandoffPrompt ?? null,
+    createdAt: loop.pendingHandoffCreatedAt ?? null,
+    generation: loop.pendingHandoffGeneration ?? 0,
+    commandQueued: Boolean(loop.pendingHandoffCommandQueued),
+  };
+  loop.lastHandoffDispatchedGeneration = pendingSnapshot.generation;
+  loop.pendingHandoff = false;
+  loop.pendingHandoffReason = null;
+  loop.pendingHandoffPrompt = null;
+  loop.pendingHandoffCreatedAt = null;
+  loop.pendingHandoffCommandQueued = false;
+  persistLoop(ctx, store, loop);
+  logHandoffStage(loop, "pre-switch-cleared", { lastDispatchedGeneration: loop.lastHandoffDispatchedGeneration ?? 0 });
+
   let dispatchedLoop = loop;
   const finalizeDispatch = async (targetCtx) => {
-    const targetStore = loadStore(targetCtx);
-    const targetLoop = getCurrentLoop(targetStore, loop.name);
-    if (!targetLoop) return null;
+    try {
+      logHandoffStage(loop, "finalize-start");
+      const targetStore = loadStore(targetCtx);
+      const targetLoop = getCurrentLoop(targetStore, loop.name);
+      if (!targetLoop) {
+        logHandoffStage(loop, "finalize-missing-loop");
+        return null;
+      }
 
-    addVerification(targetLoop, `Fresh-context handoff dispatched (${targetLoop.pendingHandoffReason ?? "unknown"})`);
-    targetLoop.lastHandoffDispatchedGeneration = targetLoop.pendingHandoffGeneration ?? 0;
-    targetLoop.pendingHandoff = false;
-    targetLoop.pendingHandoffReason = null;
-    targetLoop.pendingHandoffPrompt = null;
-    targetLoop.pendingHandoffCreatedAt = null;
-    targetLoop.pendingHandoffCommandQueued = false;
-    persistLoop(targetCtx, targetStore, targetLoop);
-    dispatchedLoop = targetLoop;
-    return targetLoop;
+      addVerification(targetLoop, `Fresh-context handoff dispatched (${pendingSnapshot.reason ?? "unknown"})`);
+      persistLoop(targetCtx, targetStore, targetLoop);
+      logHandoffStage(targetLoop, "finalize-complete", { lastDispatchedGeneration: targetLoop.lastHandoffDispatchedGeneration ?? 0 });
+      dispatchedLoop = targetLoop;
+      return targetLoop;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      logHandoffStage(loop, "finalize-error", { error: detail });
+      return null;
+    }
   };
 
   const dispatched = await dispatchFreshContextPrompt(
@@ -1050,16 +1158,24 @@ export async function dispatchPendingRalphHandoff(pi, ctx, loopName) {
     ctx,
     loop,
     prompt,
-    `handoff/${loop.pendingHandoffReason ?? "unknown"}`,
+    `handoff/${handoffReason}`,
     finalizeDispatch,
   );
 
   if (!dispatched) {
+    loop.pendingHandoff = true;
+    loop.pendingHandoffReason = pendingSnapshot.reason;
+    loop.pendingHandoffPrompt = pendingSnapshot.prompt;
+    loop.pendingHandoffCreatedAt = pendingSnapshot.createdAt;
+    loop.pendingHandoffGeneration = pendingSnapshot.generation;
+    loop.lastHandoffDispatchedGeneration = Math.max((pendingSnapshot.generation ?? 0) - 1, 0);
     loop.pendingHandoffCommandQueued = false;
     persistLoop(ctx, store, loop);
+    logHandoffStage(loop, "dispatch-failed-restored", { restoredGeneration: loop.pendingHandoffGeneration ?? 0 });
     return { dispatched: false, reason: "dispatch_failed", loop };
   }
 
+  logHandoffStage(dispatchedLoop, "dispatch-complete");
   return { dispatched: true, loop: dispatchedLoop };
 }
 
@@ -1230,7 +1346,10 @@ function setStatus(loop, status) {
 function registerCommand(pi, name, handler) {
   pi.registerCommand(name, {
     description: "Ralph loop command",
-    handler,
+    handler: async (args, ctx) => {
+      rememberSessionControlCtx(ctx);
+      return handler(args, ctx);
+    },
   });
 }
 
@@ -1447,8 +1566,6 @@ export function registerRalphSurface(pi) {
       if (ctx.hasUI) ctx.ui.notify(`Ralph handoff did not dispatch (${result.reason}).`, "warning");
       return;
     }
-
-    if (ctx.hasUI) ctx.ui.notify(`Ralph handoff dispatched for ${pending.loop.name}.`, "info");
   });
 
   registerTool(pi, {
@@ -1610,6 +1727,40 @@ export function registerRalphSurface(pi) {
   });
 
   registerTool(pi, {
+    name: "ralph_handoff",
+    label: "Execute Ralph Handoff",
+    description: "Use a stored Ralph compaction handoff to continue in a fresh provider context.",
+    promptSnippet: "Execute a queued Ralph handoff after compaction or transcript loss.",
+    promptGuidelines: ["Use this immediately when the user or system says a Ralph handoff is queued."],
+    parameters: Type.Object({
+      loopName: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const loopName = typeof params?.loopName === "string" && params.loopName.trim() ? params.loopName.trim() : undefined;
+      debugLog(`[ralph] tool ralph_handoff start requestedLoop=${JSON.stringify(loopName ?? null)}`);
+      const pending = getPendingRalphHandoff(ctx, loopName);
+      if (!pending) {
+        debugLog(`[ralph] tool ralph_handoff no-pending requestedLoop=${JSON.stringify(loopName ?? null)}`);
+        return { content: [{ type: "text", text: loopName ? `No pending Ralph handoff for "${loopName}".` : "No pending Ralph handoff." }], details: {} };
+      }
+      debugLog(`[ralph] tool ralph_handoff pending loop=${pending.loop.name} generation=${pending.generation}`);
+      const result = await dispatchPendingRalphHandoff(pi, ctx, pending.loop.name);
+      if (!result.dispatched) {
+        debugLog(`[ralph] tool ralph_handoff failed loop=${pending.loop.name} reason=${result.reason}`);
+        return {
+          content: [{ type: "text", text: `Ralph handoff did not dispatch (${result.reason}).` }],
+          details: { loop: result.loop ?? pending.loop, reason: result.reason },
+        };
+      }
+      debugLog(`[ralph] tool ralph_handoff complete loop=${pending.loop.name}`);
+      return {
+        content: [{ type: "text", text: `Ralph handoff dispatched for ${pending.loop.name}.` }],
+        details: { loop: result.loop ?? pending.loop },
+      };
+    },
+  });
+
+  registerTool(pi, {
     name: "ralph_done",
     label: "Ralph Iteration Done",
     description: "Signal that you've completed this iteration of the Ralph loop.",
@@ -1644,13 +1795,39 @@ export function registerRalphSurface(pi) {
         ctx.ui.notify(graphifyResult.message, graphifyResult.message.includes("skipped") ? "info" : "warning");
       }
       if (loop.sessionStrategy === "newSession") {
-        await dispatchFreshIteration(pi, ctx, loop);
+        const dispatched = await dispatchFreshIteration(pi, ctx, loop);
+        if (!dispatched && loop.pendingHandoff) {
+          return {
+            content: [{ type: "text", text: `Iteration ${loop.iteration - 1} complete. Next iteration will continue via pending Ralph compaction handoff.` }],
+            details: { loop },
+          };
+        }
+        if (!dispatched) {
+          setStatus(loop, "paused");
+          addVerification(loop, "Paused after ralph_done because fresh-context dispatch failed");
+          persistLoop(ctx, store, loop);
+          if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}. Fresh-context dispatch failed after ralph_done. Resume manually once the handoff path is healthy.`, "warning");
+          return {
+            content: [{ type: "text", text: `Error: iteration advanced, but fresh-context dispatch failed for loop "${loop.name}". Ralph paused for manual resume.` }],
+            details: { loop },
+          };
+        }
         return {
           content: [{ type: "text", text: `Iteration ${loop.iteration - 1} complete. Next iteration queued with fresh provider context.` }],
           details: { loop },
         };
       }
-      await dispatchNextIteration(pi, ctx, loop);
+      const dispatched = await dispatchNextIteration(pi, ctx, loop);
+      if (!dispatched) {
+        setStatus(loop, "paused");
+        addVerification(loop, "Paused after ralph_done because follow-up dispatch failed");
+        persistLoop(ctx, store, loop);
+        if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}. Follow-up dispatch failed after ralph_done. Resume manually once the queue path is healthy.`, "warning");
+        return {
+          content: [{ type: "text", text: `Error: iteration advanced, but follow-up dispatch failed for loop "${loop.name}". Ralph paused for manual resume.` }],
+          details: { loop },
+        };
+      }
       return { content: [{ type: "text", text: `Iteration ${loop.iteration - 1} complete. Next iteration queued.` }], details: { loop } };
     },
   });
@@ -1660,9 +1837,21 @@ export function registerRalphSurface(pi) {
     const loop = getCurrentLoop(store);
     if (!loop || loop.status !== "active") return;
     const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
+    const userPrompt = typeof event?.prompt === "string" ? event.prompt : "";
     const overlay = loadRalphOverlay(ctx);
     const cleanBasePrompt = stripManagedRalphContext(basePrompt);
+    if (isQueuedCompactionHandoffPrompt(userPrompt)) {
+      debugLog(
+        `[ralph] before_agent_start handoff-tool-turn loop=${loop.name} iteration=${loop.iteration} baseChars=${basePrompt.length} cleanBaseChars=${cleanBasePrompt.length}`
+      );
+      return {
+        systemPrompt: cleanBasePrompt,
+      };
+    }
     const managedPrompt = buildManagedRalphSystemPrompt(loop, overlay);
+    debugLog(
+      `[ralph] before_agent_start loop=${loop.name} iteration=${loop.iteration} baseChars=${basePrompt.length} cleanBaseChars=${cleanBasePrompt.length} managedChars=${managedPrompt.length} overlayChars=${overlay ? overlay.length : 0}`
+    );
     return {
       systemPrompt: cleanBasePrompt ? `${cleanBasePrompt}\n${managedPrompt}` : managedPrompt,
     };
