@@ -309,6 +309,18 @@ function loadProjectConfig(ctx: any): Record<string, unknown> {
 	return {};
 }
 
+function safeLoadProjectConfig(ctx: any): Record<string, unknown> {
+	try {
+		return loadProjectConfig(ctx);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) {
+			debugLog("[ralph] ignored stale extension ctx while reading Ralph project config");
+			return {};
+		}
+		throw error;
+	}
+}
+
 function summarizeOutcome(outcome: LoopOutcome): string {
 	return summarizeRecovery(outcome);
 }
@@ -647,25 +659,25 @@ function summarizeCompactionMessages(messages: any[], maxMessages = 6): Array<{ 
 	for (let i = Math.max(0, messages.length - maxMessages); i < messages.length; i += 1) {
 		const message = messages[i];
 		const role = typeof message?.role === "string" ? message.role : "unknown";
-		const text = truncateText(extractText(message?.content).trim(), 700);
+		const text = truncateText(extractText(message?.content).trim(), 1200);
 		if (!text) continue;
 		summarized.push({ role, text });
 	}
 	return summarized;
 }
 
-function summarizeLoopTasks(loop: any, maxTasks = 5): Array<{ id: string; title: string; status: string; details: string; evidence: string[]; notes: string[] }> {
+function summarizeLoopTasks(loop: any, maxTasks = 8): Array<{ id: string; title: string; status: string; details: string; evidence: string[]; notes: string[] }> {
 	if (!Array.isArray(loop?.tasks)) return [];
 	return loop.tasks.slice(0, maxTasks).map((task: any) => ({
 		id: String(task?.id ?? ""),
 		title: truncateText(String(task?.title ?? "").trim(), 220),
 		status: String(task?.status ?? "unknown"),
-		details: truncateText(String(task?.details ?? "").trim(), 280),
+		details: truncateText(String(task?.details ?? "").trim(), 420),
 		evidence: Array.isArray(task?.evidence)
-			? task.evidence.slice(-1).map((item: unknown) => truncateText(String(item ?? "").trim(), 220)).filter(Boolean)
+			? task.evidence.slice(-2).map((item: unknown) => truncateText(String(item ?? "").trim(), 320)).filter(Boolean)
 			: [],
 		notes: Array.isArray(task?.notes)
-			? task.notes.slice(-1).map((item: unknown) => truncateText(String(item ?? "").trim(), 220)).filter(Boolean)
+			? task.notes.slice(-2).map((item: unknown) => truncateText(String(item ?? "").trim(), 320)).filter(Boolean)
 			: [],
 	}));
 }
@@ -686,41 +698,41 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 			iteration: loop.iteration,
 			maxIterations: loop.maxIterations,
 			title: loop.title ?? loop.name,
-			summary: truncateText(String(loop.summary ?? "").trim(), 700),
+			summary: truncateText(String(loop.summary ?? "").trim(), 1200),
 			goals: Array.isArray(loop.goals) ? loop.goals.slice(0, 5) : [],
-			tasks: summarizeLoopTasks(loop, 5),
+			tasks: summarizeLoopTasks(loop, 8),
 			recentNotes: Array.isArray(loop.notes)
-				? loop.notes.slice(-3).map((item: any) => ({
+				? loop.notes.slice(-5).map((item: any) => ({
 					at: item?.at,
-					text: truncateText(String(item?.text ?? "").trim(), 240),
+					text: truncateText(String(item?.text ?? "").trim(), 360),
 				}))
 				: [],
 			recentReflections: Array.isArray(loop.reflections)
-				? loop.reflections.slice(-2).map((item: any) => ({
+				? loop.reflections.slice(-3).map((item: any) => ({
 					at: item?.at,
 					iteration: item?.iteration ?? null,
-					text: truncateText(String(item?.text ?? "").trim(), 260),
+					text: truncateText(String(item?.text ?? "").trim(), 420),
 				}))
 				: [],
 			recentVerification: Array.isArray(loop.verification)
-				? loop.verification.slice(-4).map((item: any) => ({
+				? loop.verification.slice(-6).map((item: any) => ({
 					at: item?.at,
-					text: truncateText(String(item?.text ?? "").trim(), 220),
+					text: truncateText(String(item?.text ?? "").trim(), 320),
 				}))
 				: [],
 		},
 		slice: {
 			customInstructions:
 				typeof slice?.customInstructions === "string" && slice.customInstructions.trim()
-					? truncateText(slice.customInstructions.trim(), 400)
+					? truncateText(slice.customInstructions.trim(), 800)
 					: null,
 			tokensBefore: slice?.tokensBefore ?? null,
 			previousSummary:
 				typeof slice?.previousSummary === "string" && slice.previousSummary.trim()
-					? truncateText(slice.previousSummary.trim(), 900)
+					? truncateText(slice.previousSummary.trim(), 1800)
 					: null,
-			recentMessages: summarizeCompactionMessages(slice?.recentMessages ?? [], 6),
-			turnPrefixMessages: summarizeCompactionMessages(slice?.turnPrefixMessages ?? [], 4),
+			recentMessages: summarizeCompactionMessages(slice?.recentMessages ?? [], 10),
+			turnPrefixMessages: summarizeCompactionMessages(slice?.turnPrefixMessages ?? [], 6),
 		},
 	};
 }
@@ -1029,14 +1041,14 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 }
 
 	export default function ralphLoopDetectorExtension(pi: ExtensionAPI) {
-		let runtime = createRuntimeState(loadProjectConfig(null), createJudgeBridge(pi, () => runtime.hostContext));
+		let runtime = createRuntimeState(safeLoadProjectConfig(null), createJudgeBridge(pi, () => runtime.hostContext));
 
 		function syncActiveLoop(ctx: any): string | null {
 			const activeLoop = safeGetActiveRalphLoop(ctx);
 			const activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 			if (!activeLoopName) {
 				if (runtime.activeLoopName !== null || runtime.events.length > 0 || runtime.halted || runtime.lastOutcome) {
-					runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
+					runtime = createRuntimeState(safeLoadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 					runtime.hostContext = ctx;
 			}
 			runtime.activeLoopName = null;
@@ -1044,7 +1056,7 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 		}
 
 		if (runtime.activeLoopName !== activeLoopName) {
-			runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
+			runtime = createRuntimeState(safeLoadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 			runtime.hostContext = ctx;
 			runtime.activeLoopName = activeLoopName;
 			return activeLoopName;
@@ -1069,9 +1081,9 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 	}
 
 	function resetRuntime(ctx: any): void {
-		const activeLoop = getActiveRalphLoop(ctx);
+		const activeLoop = safeGetActiveRalphLoop(ctx);
 		const wasEnabled = runtime.enabled;
-		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
+		runtime = createRuntimeState(safeLoadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 		runtime.hostContext = ctx;
 		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 		runtime.enabled = wasEnabled;
@@ -1247,7 +1259,7 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 			typeof (_event as any)?.previousSessionFile === "string" ? (_event as any).previousSessionFile : undefined;
 		const activeLoop = safeGetActiveRalphLoop(ctx);
 		const wasEnabled = runtime.enabled;
-		runtime = createRuntimeState(loadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
+		runtime = createRuntimeState(safeLoadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 		runtime.hostContext = ctx;
 		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 		runtime.enabled = wasEnabled;
