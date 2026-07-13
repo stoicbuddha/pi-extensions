@@ -30,6 +30,11 @@ const HANDOFF_STATE_TEXT_MAX_CHARS = 420;
 const PROMPT_FIELD_MAX_CHARS = 400;
 const PROMPT_TASK_TITLE_MAX_CHARS = 220;
 const PROMPT_TASK_WINDOW = 3;
+const GRAPHIFY_QUERY_LIMIT = 3;
+const GRAPHIFY_HINT_LIMIT = 8;
+const GRAPHIFY_CONTEXT_ITEM_LIMIT = 6;
+const GRAPHIFY_QUERY_BUDGET = 700;
+const GRAPHIFY_QUERY_NOTE_MAX_CHARS = 220;
 const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";
 const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";
 let latestSessionControlCtx = null;
@@ -150,6 +155,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 \tstatus TEXT NOT NULL,
 \torder_index INTEGER NOT NULL,
 \tdetails TEXT,
+\tmeta_json TEXT,
 \tcreated_at TEXT NOT NULL,
 \tupdated_at TEXT NOT NULL
 );
@@ -198,13 +204,196 @@ function ensureLoopColumns(db) {
   }
 }
 
+function ensureTaskColumns(db) {
+  const columns = new Set(
+    db.prepare("PRAGMA table_info(tasks)").all().map((row) => row.name),
+  );
+  if (!columns.has("meta_json")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN meta_json TEXT;");
+  }
+}
+
 function openDb(ctx) {
   const db = new DatabaseSync(storePath(ctx));
   db.exec("PRAGMA foreign_keys = ON;");
   db.exec(schemaSql());
   ensureLoopColumns(db);
+  ensureTaskColumns(db);
   db.exec(`INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', '1');`);
   return db;
+}
+
+function parseJsonObject(value) {
+  if (!value) return null;
+  if (typeof value === "object" && !Array.isArray(value)) {
+    return value;
+  }
+  if (typeof value !== "string") return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function cleanString(value) {
+  if (typeof value !== "string") return "";
+  return value.trim();
+}
+
+function cleanStringArray(values, limit = GRAPHIFY_HINT_LIMIT) {
+  const list = Array.isArray(values) ? values : typeof values === "string" ? [values] : [];
+  const seen = new Set();
+  const cleaned = [];
+  for (const item of list) {
+    const text = cleanString(item).replace(/\s+/g, " ");
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    cleaned.push(text);
+    if (cleaned.length >= limit) break;
+  }
+  return cleaned;
+}
+
+function firstDefined(...values) {
+  for (const value of values) {
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function normalizeVerificationTarget(value) {
+  return cleanStringArray(value, 6);
+}
+
+function normalizeTaskContract(input) {
+  const source = input && typeof input === "object" ? input : null;
+  if (!source) return null;
+  const purpose = cleanString(firstDefined(source.purpose, source.goal, source.objective));
+  const requiredCodeChanges = cleanStringArray(firstDefined(
+    source.requiredCodeChanges,
+    source.required_code_changes,
+    source.codeChanges,
+  ), 6);
+  const verificationTarget = normalizeVerificationTarget(firstDefined(
+    source.verificationTarget,
+    source.verification_target,
+    source.verification,
+  ));
+  if (!purpose && requiredCodeChanges.length === 0 && verificationTarget.length === 0) {
+    return null;
+  }
+  return {
+    purpose: purpose || null,
+    requiredCodeChanges,
+    verificationTarget,
+  };
+}
+
+function normalizeGraphifyQuery(input) {
+  const source = input && typeof input === "object" ? input : null;
+  if (!source) return null;
+  const question = cleanString(firstDefined(source.question, source.query));
+  if (!question) return null;
+  const rawMode = cleanString(firstDefined(source.mode, source.traversal)).toLowerCase();
+  const mode = rawMode === "dfs" ? "dfs" : "bfs";
+  const contexts = cleanStringArray(firstDefined(source.contexts, source.context, source.filters), 4);
+  const expected = cleanString(firstDefined(source.expected, source.expect, source.notes));
+  const budgetRaw = Number(firstDefined(source.budget, source.tokenBudget));
+  const budget = Number.isFinite(budgetRaw)
+    ? Math.max(200, Math.min(1400, Math.trunc(budgetRaw)))
+    : GRAPHIFY_QUERY_BUDGET;
+  return { question, mode, contexts, expected: expected || null, budget };
+}
+
+function normalizeGraphifyPlan(input, hints = null) {
+  const source = input && typeof input === "object" ? input : null;
+  const hintSource = hints && typeof hints === "object" ? hints : source;
+  if (!source && !hintSource) return null;
+  const likelyPaths = cleanStringArray(firstDefined(
+    hintSource?.likelyPaths,
+    hintSource?.likely_paths,
+    hintSource?.likelyFiles,
+    hintSource?.likely_files,
+    hintSource?.files,
+    hintSource?.paths,
+    source?.expectedTargets,
+    source?.expected_targets,
+  ));
+  const likelySymbols = cleanStringArray(firstDefined(
+    hintSource?.likelySymbols,
+    hintSource?.likely_symbols,
+    hintSource?.symbols,
+  ));
+  const likelySubsystems = cleanStringArray(firstDefined(
+    hintSource?.likelySubsystems,
+    hintSource?.likely_subsystems,
+    hintSource?.subsystems,
+    hintSource?.modules,
+    hintSource?.relatedModules,
+    hintSource?.related_modules,
+  ));
+  const queries = (Array.isArray(source?.queries) ? source.queries : [])
+    .map((query) => normalizeGraphifyQuery(query))
+    .filter(Boolean)
+    .slice(0, GRAPHIFY_QUERY_LIMIT);
+
+  if (likelyPaths.length === 0 && likelySymbols.length === 0 && likelySubsystems.length === 0 && queries.length === 0) {
+    return null;
+  }
+
+  return {
+    likelyPaths,
+    likelySymbols,
+    likelySubsystems,
+    queries,
+  };
+}
+
+function normalizeGraphifyContext(input) {
+  const source = input && typeof input === "object" ? input : null;
+  if (!source) return null;
+  const summary = source.summary && typeof source.summary === "object" ? source.summary : {};
+  return {
+    status: cleanString(source.status) || "error",
+    generatedAt: cleanString(source.generatedAt || source.generated_at) || null,
+    lastAttemptIteration: Number.isFinite(source.lastAttemptIteration) ? source.lastAttemptIteration : null,
+    planFingerprint: cleanString(source.planFingerprint || source.plan_fingerprint) || "",
+    graphPath: cleanString(source.graphPath || source.graph_path) || null,
+    error: cleanString(source.error) || null,
+    summary: {
+      likelyFiles: cleanStringArray(summary.likelyFiles || summary.files),
+      likelySymbols: cleanStringArray(summary.likelySymbols || summary.symbols),
+      likelyCallSites: cleanStringArray(summary.likelyCallSites || summary.callSites || summary.calls),
+      relatedArtifacts: cleanStringArray(summary.relatedArtifacts || summary.related || summary.modules),
+      queryNotes: cleanStringArray(summary.queryNotes || summary.notes, GRAPHIFY_CONTEXT_ITEM_LIMIT),
+    },
+  };
+}
+
+function normalizeTaskMetadata(input) {
+  const source = input && typeof input === "object" ? input : null;
+  if (!source) return null;
+  const contract = normalizeTaskContract(source.contract ?? source);
+  const graphifyPlan = normalizeGraphifyPlan(source.graphifyPlan ?? source.graphify_plan, source.discoveryHints ?? source.discovery_hints ?? source);
+  const graphifyContext = normalizeGraphifyContext(source.graphifyContext ?? source.graphify_context);
+  if (!contract && !graphifyPlan && !graphifyContext) return null;
+  return {
+    contract,
+    graphifyPlan,
+    graphifyContext,
+  };
 }
 
 function blankStore() {
@@ -228,6 +417,7 @@ function hydrateLoop(db, row) {
       details: taskRow.details ?? "",
       createdAt: taskRow.created_at,
       updatedAt: taskRow.updated_at,
+      metadata: normalizeTaskMetadata(parseJsonObject(taskRow.meta_json)),
       notes: entries.filter((entry) => entry.kind === "note").map((entry) => entry.body),
       evidence: entries.filter((entry) => entry.kind === "evidence").map((entry) => entry.body),
     };
@@ -331,8 +521,8 @@ function saveStore(ctx, store) {
     `);
     const insertGoal = db.prepare(`INSERT INTO plan_goals (loop_id, goal, order_index) VALUES (?, ?, ?)`);
     const insertTask = db.prepare(`
-      INSERT INTO tasks (id, loop_id, task_key, title, status, order_index, details, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO tasks (id, loop_id, task_key, title, status, order_index, details, meta_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertTaskEntry = db.prepare(`
       INSERT INTO task_entries (loop_id, task_id, kind, body, iteration, created_at, meta_json)
@@ -398,7 +588,18 @@ function saveStore(ctx, store) {
         const taskKey = task.taskKey ?? taskId.split(":").pop() ?? taskId;
         const taskCreatedAt = task.createdAt ?? createdAt;
         const taskUpdatedAt = task.updatedAt ?? updatedAt;
-        insertTask.run(taskId, loopId, taskKey, task.title ?? taskId, task.status ?? "todo", task.order ?? index + 1, task.details ?? null, taskCreatedAt, taskUpdatedAt);
+        insertTask.run(
+          taskId,
+          loopId,
+          taskKey,
+          task.title ?? taskId,
+          task.status ?? "todo",
+          task.order ?? index + 1,
+          task.details ?? null,
+          JSON.stringify(normalizeTaskMetadata(task.metadata) ?? null),
+          taskCreatedAt,
+          taskUpdatedAt,
+        );
         for (const note of task.notes ?? []) {
           insertTaskEntry.run(loopId, taskId, "note", note, null, taskUpdatedAt, null);
         }
@@ -474,6 +675,7 @@ function parseTasksFromText(text, loopName) {
     status: "todo",
     order: index + 1,
     details: "",
+    metadata: null,
     evidence: [],
     notes: [],
   }));
@@ -660,6 +862,165 @@ function selectNextTask(loop) {
   return loop.tasks.find((task) => task.status !== "done" && task.status !== "blocked") ?? null;
 }
 
+function selectActiveTask(loop) {
+  return findTask(loop, loop?.currentTaskId) ?? selectNextTask(loop);
+}
+
+function formatInlineList(items) {
+  return items.map((item) => `\`${truncateForPrompt(item, 120)}\``).join(", ");
+}
+
+function extractPathCandidates(text) {
+  const matches = String(text ?? "").match(/\b(?:[\w.-]+\/)+[\w./-]+\b/g) ?? [];
+  return cleanStringArray(matches, GRAPHIFY_CONTEXT_ITEM_LIMIT * 2);
+}
+
+function extractSymbolCandidates(text) {
+  const matches = String(text ?? "").match(/\b[A-Za-z_]\w*(?:::[A-Za-z_]\w*)+\b|\b[A-Za-z_]\w+\([^)]*\)/g) ?? [];
+  return cleanStringArray(matches, GRAPHIFY_CONTEXT_ITEM_LIMIT * 2);
+}
+
+function extractContextLines(text, matcher, limit = GRAPHIFY_CONTEXT_ITEM_LIMIT) {
+  return String(text ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^[*-]\s*/, ""))
+    .filter((line) => line && matcher.test(line))
+    .map((line) => truncateForPrompt(line, GRAPHIFY_QUERY_NOTE_MAX_CHARS))
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function runGraphifyQuery(ctx, query, graphPath) {
+  const args = ["query", query.question, "--budget", String(query.budget ?? GRAPHIFY_QUERY_BUDGET), "--graph", graphPath];
+  if (query.mode === "dfs") args.splice(2, 0, "--dfs");
+  for (const context of query.contexts ?? []) {
+    args.push("--context", context);
+  }
+  const result = spawnSync("graphify", args, {
+    cwd: ctx.cwd,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  if (result.status === 0) {
+    return { ok: true, output: stdout };
+  }
+  const message = [stderr, stdout].filter(Boolean).join("\n").trim() || `exit ${result.status ?? "unknown"}`;
+  if (/graph file not found/i.test(message)) {
+    return { ok: false, message: "graphify graph not found; skipped preplanned graph context." };
+  }
+  if (/ENOENT|not found|command not found/i.test(message)) {
+    return { ok: false, message: "graphify not available; skipped preplanned graph context." };
+  }
+  return { ok: false, message: `graphify query failed: ${message}` };
+}
+
+function buildGraphifyContextSummary(plan, results) {
+  const combinedText = results.map((item) => item.output).join("\n");
+  const likelyFiles = cleanStringArray([
+    ...(plan.likelyPaths ?? []),
+    ...extractPathCandidates(combinedText),
+  ], GRAPHIFY_CONTEXT_ITEM_LIMIT);
+  const likelySymbols = cleanStringArray([
+    ...(plan.likelySymbols ?? []),
+    ...extractSymbolCandidates(combinedText),
+  ], GRAPHIFY_CONTEXT_ITEM_LIMIT);
+  const likelyCallSites = cleanStringArray(extractContextLines(
+    combinedText,
+    /\b(call|calls|called by|handler|route|endpoint|invoke|dispatch|wires?)\b/i,
+  ), GRAPHIFY_CONTEXT_ITEM_LIMIT);
+  const relatedArtifacts = cleanStringArray([
+    ...(plan.likelySubsystems ?? []),
+    ...extractContextLines(combinedText, /\b(module|subsystem|template|test|route|handler|service|repo|controller)\b/i),
+  ], GRAPHIFY_CONTEXT_ITEM_LIMIT);
+  const queryNotes = cleanStringArray(results.flatMap((result) => {
+    const noteLines = String(result.output ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.trim().replace(/^[*-]\s*/, ""))
+      .filter((line) => line && !/^question[:\s]/i.test(line))
+      .slice(0, 2)
+      .map((line) => truncateForPrompt(`${result.question}: ${line}`, GRAPHIFY_QUERY_NOTE_MAX_CHARS));
+    return noteLines;
+  }), GRAPHIFY_CONTEXT_ITEM_LIMIT);
+
+  return {
+    likelyFiles,
+    likelySymbols,
+    likelyCallSites,
+    relatedArtifacts,
+    queryNotes,
+  };
+}
+
+function ensureTaskGraphifyContext(ctx, store, loop, task) {
+  const metadata = normalizeTaskMetadata(task?.metadata);
+  const graphifyPlan = metadata?.graphifyPlan ?? null;
+  if (!task || !graphifyPlan || !Array.isArray(graphifyPlan.queries) || graphifyPlan.queries.length === 0) {
+    return { task, context: metadata?.graphifyContext ?? null };
+  }
+
+  const planFingerprint = stableStringify(graphifyPlan);
+  const currentContext = normalizeGraphifyContext(metadata?.graphifyContext);
+  if (currentContext?.status === "ready" && currentContext.planFingerprint === planFingerprint) {
+    task.metadata = { ...metadata, graphifyContext: currentContext };
+    return { task, context: currentContext };
+  }
+  if (currentContext?.planFingerprint === planFingerprint && currentContext.lastAttemptIteration === loop.iteration) {
+    task.metadata = { ...metadata, graphifyContext: currentContext };
+    return { task, context: currentContext.status === "ready" ? currentContext : null };
+  }
+
+  const graphPath = path.join(ctx.cwd, "graphify-out", "graph.json");
+  if (!fs.existsSync(graphPath)) {
+    const errorContext = {
+      status: "error",
+      generatedAt: nowIso(),
+      lastAttemptIteration: loop.iteration,
+      planFingerprint,
+      graphPath,
+      error: "graphify graph not found; skipped preplanned graph context.",
+      summary: { likelyFiles: [], likelySymbols: [], likelyCallSites: [], relatedArtifacts: [], queryNotes: [] },
+    };
+    task.metadata = { ...metadata, graphifyPlan, graphifyContext: errorContext };
+    persistLoop(ctx, store, loop);
+    return { task, context: null };
+  }
+
+  const results = [];
+  for (const query of graphifyPlan.queries) {
+    const queryResult = runGraphifyQuery(ctx, query, graphPath);
+    if (!queryResult.ok) {
+      const errorContext = {
+        status: "error",
+        generatedAt: nowIso(),
+        lastAttemptIteration: loop.iteration,
+        planFingerprint,
+        graphPath,
+        error: queryResult.message,
+        summary: { likelyFiles: [], likelySymbols: [], likelyCallSites: [], relatedArtifacts: [], queryNotes: [] },
+      };
+      task.metadata = { ...metadata, graphifyPlan, graphifyContext: errorContext };
+      persistLoop(ctx, store, loop);
+      return { task, context: null };
+    }
+    results.push({ question: query.question, output: queryResult.output, expected: query.expected ?? null });
+  }
+
+  const readyContext = {
+    status: "ready",
+    generatedAt: nowIso(),
+    lastAttemptIteration: loop.iteration,
+    planFingerprint,
+    graphPath,
+    error: null,
+    summary: buildGraphifyContextSummary(graphifyPlan, results),
+  };
+  task.metadata = { ...metadata, graphifyPlan, graphifyContext: readyContext };
+  persistLoop(ctx, store, loop);
+  return { task, context: readyContext };
+}
+
 function formatPromptTask(task) {
   const lines = [`- [${task.status === "done" ? "x" : " "}] \`${task.id}\` ${truncateForPrompt(task.title, PROMPT_TASK_TITLE_MAX_CHARS)} (${String(task.status).toUpperCase()})`];
   if (task.details?.trim()) lines.push(`  Details: ${truncateForPrompt(task.details)}`);
@@ -684,8 +1045,52 @@ function summarizeTaskCounts(tasks) {
   return counts;
 }
 
-function buildIterationPrompt(loop, overlay = null) {
-  const nextTask = selectNextTask(loop);
+function buildContractPromptLines(task) {
+  const contract = normalizeTaskMetadata(task?.metadata)?.contract;
+  if (!contract) return ["- No explicit task contract recorded."];
+  const lines = [];
+  if (contract.purpose) lines.push(`- Purpose: ${truncateForPrompt(contract.purpose, 260)}`);
+  if (contract.requiredCodeChanges.length > 0) {
+    lines.push(`- Required code changes: ${contract.requiredCodeChanges.map((item) => truncateForPrompt(item, 140)).join(" | ")}`);
+  }
+  return lines.length > 0 ? lines : ["- No explicit task contract recorded."];
+}
+
+function buildVerificationPromptLines(task) {
+  const contract = normalizeTaskMetadata(task?.metadata)?.contract;
+  if (!contract || contract.verificationTarget.length === 0) {
+    return ["- No exact verification target recorded."];
+  }
+  return contract.verificationTarget.map((item) => `- ${truncateForPrompt(item, 220)}`);
+}
+
+function buildGraphContextPromptLines(task) {
+  const context = normalizeTaskMetadata(task?.metadata)?.graphifyContext;
+  if (!context || context.status !== "ready") return [];
+  const lines = [
+    "## Relevant Graph Context",
+    "Use this task-scoped Graphify context first. Only broaden repo search if it is missing, stale, or contradicted.",
+  ];
+  if (context.summary.likelyFiles.length > 0) {
+    lines.push(`- Likely files: ${formatInlineList(context.summary.likelyFiles)}`);
+  }
+  if (context.summary.likelySymbols.length > 0) {
+    lines.push(`- Likely symbols: ${formatInlineList(context.summary.likelySymbols)}`);
+  }
+  if (context.summary.likelyCallSites.length > 0) {
+    lines.push(`- Likely call sites: ${context.summary.likelyCallSites.map((item) => truncateForPrompt(item, 120)).join(" | ")}`);
+  }
+  if (context.summary.relatedArtifacts.length > 0) {
+    lines.push(`- Related modules/routes/templates/tests: ${formatInlineList(context.summary.relatedArtifacts)}`);
+  }
+  if (context.summary.queryNotes.length > 0) {
+    lines.push(`- Query notes: ${context.summary.queryNotes.map((item) => truncateForPrompt(item, 140)).join(" | ")}`);
+  }
+  return lines;
+}
+
+function buildIterationPrompt(loop, task, overlay = null) {
+  const currentTask = task ?? selectActiveTask(loop);
   const maxStr = loop.maxIterations > 0 ? `/${loop.maxIterations}` : "";
   const currentTaskCount = Array.isArray(loop.tasks) ? loop.tasks.length : 0;
   const counts = summarizeTaskCounts(Array.isArray(loop.tasks) ? loop.tasks : []);
@@ -694,63 +1099,43 @@ function buildIterationPrompt(loop, overlay = null) {
     `🔄 RALPH LOOP: ${loop.name} | Iteration ${loop.iteration}${maxStr}${loop.reflectEvery > 0 ? " | 🪞 REFLECTION" : ""}`,
     "───────────────────────────────────────────────────────────────────────",
     "",
-    "## Current Plan Runtime View (compact; sourced from the Ralph database)",
+    `Tasks: ${currentTaskCount} total, ${counts.done} done, ${counts.in_progress} in progress, ${counts.blocked} blocked, ${counts.todo} todo, ${counts.cancelled} cancelled.`,
   ];
 
   if (loop.title?.trim()) lines.push(`# ${truncateForPrompt(loop.title, PROMPT_TASK_TITLE_MAX_CHARS)}`);
-  if (loop.summary?.trim()) lines.push(truncateForPrompt(loop.summary, 600));
-  lines.push("");
+  if (loop.summary?.trim()) lines.push(truncateForPrompt(loop.summary, 500));
+
   lines.push(
-    `Tasks: ${currentTaskCount} total, ${counts.done} done, ${counts.in_progress} in progress, ${counts.blocked} blocked, ${counts.todo} todo, ${counts.cancelled} cancelled.`,
+    "",
+    "## Current Task",
+    currentTask ? formatPromptTask(currentTask) : "- No active task found. If all work is complete, call `ralph_done` or stop the loop.",
+    "",
+    "## Verification Target",
+    ...buildVerificationPromptLines(currentTask),
+    "",
+    "## Active Task Contract",
+    ...buildContractPromptLines(currentTask),
   );
 
-  if (Array.isArray(loop.goals) && loop.goals.length > 0) {
-    lines.push("", "## Goals");
-    for (const goal of loop.goals.slice(0, 5)) {
-      lines.push(`- ${goal}`);
-    }
+  const graphContextLines = buildGraphContextPromptLines(currentTask);
+  if (graphContextLines.length > 0) {
+    lines.push("", ...graphContextLines);
   }
 
   lines.push(
     "",
-    "## Next Unfinished Task",
-    nextTask ? formatPromptTask(nextTask) : "- No active task found. If all work is complete, respond with the completion marker.",
-    "",
-    "## Instructions",
-    "User controls: ESC pauses the assistant. Send a message to resume. Run /ralph-stop when idle to stop the loop.",
-    "",
-    "## Momentum",
-    "- Aim for the smallest useful step that reduces uncertainty.",
-    "- If you already know the next concrete action, take it now.",
-    "- If you need more context, fetch only the missing detail that blocks progress.",
-    "- When compiler errors, Rust error codes, crate API questions, or framework-specific failures are blocking progress, use the web access tool to look up the exact issue before guessing.",
-    "- Treat unresolved exact technical errors as a research or diagnosis problem first, not a review problem.",
-    "- Prefer delegating exact-problem investigation before repeated trial-and-error. Use researcher or oracle to break stalemates instead of headbutting the same issue in the main session.",
-    "- The Graphify graph is already built. Start with Graphify query or explain tools to understand project structure, relevant files, symbols, and current architecture before broad manual exploration.",
-    "- Leverage the available subagents whenever they are a good fit for the task instead of doing all work in the main session.",
-    "- Prefer delegation for broad research, uncertain code paths, validation-heavy work, and exact technical troubleshooting.",
-    "- Use scout for quick repo scanning and local codebase mapping.",
-    "- Use researcher when you need external facts, exact error-code lookup, crate/framework/API research, or comparison across candidate fixes.",
-    "- Use oracle when the problem needs second-opinion diagnosis, ambiguity reduction, or help choosing between plausible fixes.",
-    "- Use reviewer to validate a proposed fix, check a diff, or sanity-check reasoning after you already have a likely path; do not use reviewer as the first stop for an unresolved exact error.",
-    "- Keep planning brief, then switch back to tools.",
-    "- Good iterations usually look like: inspect, act, verify, report.",
-    "",
-    `You are in a Ralph loop (iteration ${loop.iteration}${loop.maxIterations > 0 ? ` of ${loop.maxIterations}` : ""}).`,
+    "## Runtime Rules",
+    "- Start with the current task and verification target. Avoid broad re-planning.",
+    graphContextLines.length > 0
+      ? "- Use the injected Graphify context first. Do not invent a wide discovery plan unless that context is missing or contradicted."
+      : "- If structure is unclear, use Graphify query or explain before broad manual exploration.",
+    "- Use Ralph tools to keep task status, evidence, notes, and contract state canonical.",
+    "- When exact compiler, API, or framework failures block progress, research the exact issue before guessing.",
+    "- If two attempts on the same exact issue produce no new evidence, change approach or delegate.",
     loop.itemsPerIteration > 0
-      ? `THIS ITERATION: Process approximately ${loop.itemsPerIteration} task item(s), then call the actual ralph_done tool.`
-      : "1. Start from the single Next Unfinished Task in the runtime view.",
-    "2. Use Graphify query or explain first to understand where the current project stands from the existing graph, then use Graphify for exact repo navigation and file/symbol lookup.",
-    "3. If you hit Rust compiler errors, exact error codes, crate API uncertainty, or framework-specific failures, treat that as a research/diagnosis task before more local trial-and-error.",
-    "4. Use the web access tool yourself when a quick exact lookup is enough; use researcher when the issue needs broader sourced investigation, source comparison, or narrowing several possible fixes.",
-    "5. Use oracle when you need a second-opinion diagnosis or help choosing the best next move among plausible fixes.",
-    "6. Use reviewer for validation, diff review, or sanity-checking a proposed fix after you already have a likely answer; do not send unresolved exact technical errors to reviewer first.",
-    "7. Use scout for quick repo scanning and local structure lookup.",
-    "8. If two attempts on the same exact issue have not produced new evidence, stop pushing locally and delegate or research before trying again.",
-    "9. Use Ralph plan tools when you need more than the compact runtime view.",
-    "10. Move straight to the next concrete step instead of recapping the plan.",
-    "11. Update Ralph task state and evidence as you go.",
-    "12. When the current iteration is complete, call the actual ralph_done tool; it will refresh Graphify and create a git checkpoint push before queuing the next iteration.",
+      ? `- Complete about ${loop.itemsPerIteration} task item(s) this iteration, then call the actual \`ralph_done\` tool.`
+      : "- Take the smallest validating next step, then call the actual `ralph_done` tool when this iteration is complete.",
+    "- User controls: ESC pauses the assistant. Run `/ralph-stop` only when idle.",
   );
 
   if (overlay) {
@@ -767,8 +1152,8 @@ function buildIterationPrompt(loop, overlay = null) {
   return `${prompt.slice(0, PROMPT_MAX_CHARS)}\n\n[Prompt truncated by ${prompt.length - PROMPT_MAX_CHARS} chars. Use Ralph or Graphify tools for additional context.]`;
 }
 
-function buildResetPrompt(loop, overlay = null) {
-  return buildIterationPrompt(loop, overlay);
+function buildResetPrompt(loop, task, overlay = null) {
+  return buildIterationPrompt(loop, task, overlay);
 }
 
 function trimHandoffSection(text, maxChars) {
@@ -934,13 +1319,17 @@ async function dispatchNextIteration(pi, ctx, loop) {
     logPromptDispatch(loop, "next/skipped-pending-handoff", "");
     return false;
   }
-  const prompt = buildIterationPrompt(loop, loadRalphOverlay(ctx));
+  const store = loadStore(ctx);
+  const currentLoop = getCurrentLoop(store, loop.name) ?? loop;
+  const activeTask = selectActiveTask(currentLoop);
+  if (activeTask) ensureTaskGraphifyContext(ctx, store, currentLoop, activeTask);
+  const prompt = buildIterationPrompt(currentLoop, activeTask, loadRalphOverlay(ctx));
 
-  if (loop.sessionStrategy === "newSession" && typeof ctx.newSession === "function") {
-    return dispatchFreshContextPrompt(pi, ctx, loop, prompt, "next");
+  if (currentLoop.sessionStrategy === "newSession" && typeof ctx.newSession === "function") {
+    return dispatchFreshContextPrompt(pi, ctx, currentLoop, prompt, "next");
   }
 
-  logPromptDispatch(loop, "next/followUp", prompt);
+  logPromptDispatch(currentLoop, "next/followUp", prompt);
   if (await deliverIterationPrompt(ctx, prompt)) {
     return true;
   }
@@ -957,12 +1346,16 @@ async function dispatchFreshIteration(pi, ctx, loop) {
     logPromptDispatch(loop, "fresh/skipped-pending-handoff", "");
     return false;
   }
-  const prompt = buildResetPrompt(loop, loadRalphOverlay(ctx));
-  return dispatchFreshContextPrompt(pi, ctx, loop, prompt, "fresh");
+  const store = loadStore(ctx);
+  const currentLoop = getCurrentLoop(store, loop.name) ?? loop;
+  const activeTask = selectActiveTask(currentLoop);
+  if (activeTask) ensureTaskGraphifyContext(ctx, store, currentLoop, activeTask);
+  const prompt = buildResetPrompt(currentLoop, activeTask, loadRalphOverlay(ctx));
+  return dispatchFreshContextPrompt(pi, ctx, currentLoop, prompt, "fresh");
 }
 
 function buildCompactionHandoffMessage(loop, handoffPrompt) {
-  const basePrompt = buildResetPrompt(loop, null);
+  const basePrompt = buildResetPrompt(loop, selectActiveTask(loop), null);
   const rawHandoff = String(handoffPrompt ?? "").trim();
   const summaryMatch = rawHandoff.match(/## Handoff Summary\s*([\s\S]*?)(?:\n## |\s*$)/);
   const rationaleMatch = rawHandoff.match(/## Why Fresh Context Was Needed\s*([\s\S]*?)(?:\n## |\s*$)/);
@@ -1395,6 +1788,19 @@ function setStatus(loop, status) {
   if (status === "completed") loop.completedAt = nowIso();
 }
 
+const TASK_METADATA_PARAMETER = Type.Object({}, { additionalProperties: true });
+
+function mergeTaskMetadata(task, input) {
+  const base = normalizeTaskMetadata(task?.metadata) ?? {};
+  const next = normalizeTaskMetadata(input);
+  if (!next) return Object.keys(base).length > 0 ? base : null;
+  return {
+    contract: next.contract ?? base.contract ?? null,
+    graphifyPlan: next.graphifyPlan ?? base.graphifyPlan ?? null,
+    graphifyContext: next.graphifyPlan ? null : next.graphifyContext ?? base.graphifyContext ?? null,
+  };
+}
+
 function registerCommand(pi, name, handler) {
   pi.registerCommand(name, {
     description: "Ralph loop command",
@@ -1671,6 +2077,7 @@ export function registerRalphSurface(pi) {
       details: Type.Optional(Type.String()),
       loopName: Type.Optional(Type.String()),
       position: Type.Optional(Type.Number()),
+      metadata: Type.Optional(TASK_METADATA_PARAMETER),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = loadStore(ctx);
@@ -1682,6 +2089,7 @@ export function registerRalphSurface(pi) {
         status: "todo",
         order: loop.tasks.length + 1,
         details: params.details?.trim() || "",
+        metadata: mergeTaskMetadata(null, params.metadata),
         evidence: [],
         notes: [],
       };
@@ -1711,6 +2119,7 @@ export function registerRalphSurface(pi) {
       note: Type.Optional(Type.String()),
       evidence: Type.Optional(Type.String()),
       position: Type.Optional(Type.Number()),
+      metadata: Type.Optional(TASK_METADATA_PARAMETER),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const store = loadStore(ctx);
@@ -1721,6 +2130,9 @@ export function registerRalphSurface(pi) {
       if (params.status) task.status = params.status;
       if (params.title !== undefined) task.title = params.title.trim() || task.title;
       if (params.details !== undefined) task.details = params.details.trim();
+      if (params.metadata && typeof params.metadata === "object") {
+        task.metadata = mergeTaskMetadata(task, params.metadata);
+      }
       if (params.note?.trim()) task.notes.push(params.note.trim());
       if (params.evidence?.trim()) {
         task.evidence.push(params.evidence.trim());

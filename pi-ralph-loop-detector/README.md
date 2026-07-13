@@ -10,6 +10,7 @@ This package combines the loop-detector policy with Ralph-oriented recovery rout
 - Falls back to the supported host follow-up path when `newSession` is unavailable
 - Prefers the child-agent order `scout -> researcher -> reviewer`
 - Exposes the legacy Ralph operator surface at `/ralph` plus `ralph_*` tools for listing loops, listing tasks, and updating plan state
+- Supports task-scoped metadata, including planner-supplied Graphify query plans and cached compact graph context for runtime prompts
 
 ## Usage
 

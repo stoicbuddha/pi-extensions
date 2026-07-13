@@ -26,21 +26,20 @@ test("exports Ralph stop steering for natural assistant stops", () => {
 
 test("iteration prompt avoids duplicating next task and caps prompt fields", () => {
   assert.match(source, /const PROMPT_MAX_CHARS = 7000;/);
-  assert.match(source, /const HANDOFF_PROMPT_MAX_CHARS = 12000;/);
+  assert.match(source, /const HANDOFF_PROMPT_MAX_CHARS = 18000;/);
   assert.match(source, /const PROMPT_TASK_WINDOW = 3;/);
   assert.match(source, /function truncateForPrompt\(text, maxChars = PROMPT_FIELD_MAX_CHARS\)/);
   assert.match(source, /function trimHandoffSection\(text, maxChars\)/);
   assert.match(source, /function isQueuedCompactionHandoffPrompt\(prompt\)/);
-  assert.match(source, /buildTaskWindow\(loop, PROMPT_TASK_WINDOW\)\.filter\(\(task\) => task\?\.id !== nextTask\?\.id\)/);
-  assert.match(source, /use the web access tool to look up the exact issue before guessing/);
-  assert.match(source, /Prefer delegating exact-problem investigation before repeated trial-and-error/);
-  assert.match(source, /researcher for deeper investigation and sourced web research, oracle for second-opinion debugging or solution selection/);
-  assert.match(source, /If you hit Rust compiler errors, exact error codes, crate API uncertainty, or framework-specific failures, prefer delegation before repeated local guessing/);
-  assert.match(source, /If two attempts on the same exact issue have not produced new evidence, stop pushing locally and delegate or research before trying again/);
+  assert.match(source, /## Verification Target/);
+  assert.match(source, /## Active Task Contract/);
+  assert.match(source, /## Relevant Graph Context/);
+  assert.match(source, /Use this task-scoped Graphify context first/);
+  assert.match(source, /Do not invent a wide discovery plan unless that context is missing or contradicted/);
   assert.match(source, /## Workspace Overlay/);
   assert.match(source, /`\.\/RALPH\.md` was found\. Its full contents will be injected into hidden system context for this turn\./);
   assert.match(source, /\[Handoff prompt still exceeded the safety cap\. Use Ralph tools for the remaining context\.\]/);
-  assert.match(source, /console\.info\(`\[ralph\] prompt dispatch mode=\$\{mode\} loop=\$\{loop\?\.name \?\? "unknown"\} iteration=\$\{loop\?\.iteration \?\? "\?"\} chars=\$\{promptChars\}`\);/);
+  assert.match(source, /debugLog\(`\[ralph\] prompt dispatch mode=\$\{mode\} loop=\$\{loop\?\.name \?\? "unknown"\} iteration=\$\{loop\?\.iteration \?\? "\?"\} chars=\$\{promptChars\}`\);/);
 });
 
 test("managed Ralph system prompt is replaced instead of appended repeatedly", () => {
@@ -64,6 +63,16 @@ test("persists and dispatches pending Ralph handoffs through dedicated tooling",
   assert.match(source, /tool ralph_handoff complete loop=/);
   assert.match(source, /const pending = getPendingRalphHandoff\(ctx, loopName\);/);
   assert.match(source, /const result = await dispatchPendingRalphHandoff\(pi, ctx, pending\.loop\.name\);/);
+});
+
+test("task metadata persists graphify plans and cached graph context", () => {
+  assert.match(source, /meta_json TEXT/);
+  assert.match(source, /function ensureTaskColumns\(db\)/);
+  assert.match(source, /function normalizeTaskMetadata\(input\)/);
+  assert.match(source, /function ensureTaskGraphifyContext\(ctx, store, loop, task\)/);
+  assert.match(source, /graphify graph not found; skipped preplanned graph context/);
+  assert.match(source, /spawnSync\("graphify", args/);
+  assert.match(source, /metadata: Type\.Optional\(TASK_METADATA_PARAMETER\)/);
 });
 
 test("recovery summarizer prompt de-emphasizes Ralph bookkeeping mismatches", () => {
