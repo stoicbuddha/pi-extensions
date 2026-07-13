@@ -25,6 +25,8 @@ const HANDOFF_SUMMARY_MAX_CHARS = 8000;
 const HANDOFF_RATIONALE_MAX_CHARS = 3200;
 const HANDOFF_STEP_MAX_CHARS = 420;
 const HANDOFF_MAX_STEPS = 10;
+const HANDOFF_STATE_MAX_ITEMS = 8;
+const HANDOFF_STATE_TEXT_MAX_CHARS = 420;
 const PROMPT_FIELD_MAX_CHARS = 400;
 const PROMPT_TASK_TITLE_MAX_CHARS = 220;
 const PROMPT_TASK_WINDOW = 3;
@@ -976,12 +978,62 @@ function buildCompactionHandoffMessage(loop, handoffPrompt) {
     .filter(Boolean)
     .slice(0, HANDOFF_MAX_STEPS)
     .map((step) => `- ${trimHandoffSection(step, HANDOFF_STEP_MAX_CHARS)}`);
+  const openTasks = Array.isArray(loop.tasks)
+    ? loop.tasks.filter((task) => task && task.status !== "done" && task.status !== "blocked" && task.status !== "cancelled")
+    : [];
+  const completedTasks = Array.isArray(loop.tasks)
+    ? loop.tasks.filter((task) => task && task.status === "done")
+    : [];
+  const recentVerification = Array.isArray(loop.verification) ? loop.verification.slice(-HANDOFF_STATE_MAX_ITEMS) : [];
+  const recentNotes = Array.isArray(loop.notes) ? loop.notes.slice(-Math.min(5, HANDOFF_STATE_MAX_ITEMS)) : [];
+  const recentReflections = Array.isArray(loop.reflections) ? loop.reflections.slice(-Math.min(3, HANDOFF_STATE_MAX_ITEMS)) : [];
 
   const extraLines = [
     "",
     "## Compaction Handoff",
     intro,
   ];
+  extraLines.push(
+    "",
+    "## Ralph State Snapshot",
+    `- Loop: ${loop.name}`,
+    `- Iteration: ${loop.iteration}${loop.maxIterations > 0 ? `/${loop.maxIterations}` : ""}`,
+    `- Status: ${loop.status}`,
+    `- Suspected goal: ${trimHandoffSection(String(loop.summary ?? loop.title ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS) || "unknown"}`,
+  );
+  if (openTasks.length > 0) {
+    extraLines.push("", "## Open Tasks");
+    for (const task of openTasks.slice(0, HANDOFF_STATE_MAX_ITEMS)) {
+      extraLines.push(`- ${task.id}: ${trimHandoffSection(String(task.title ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+      if (task.details?.trim()) {
+        extraLines.push(`  Details: ${trimHandoffSection(task.details, HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+      }
+    }
+  }
+  if (completedTasks.length > 0) {
+    extraLines.push("", "## Recently Completed Tasks");
+    for (const task of completedTasks.slice(-HANDOFF_STATE_MAX_ITEMS)) {
+      extraLines.push(`- ${task.id}: ${trimHandoffSection(String(task.title ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    }
+  }
+  if (recentVerification.length > 0) {
+    extraLines.push("", "## Recent Verification");
+    for (const item of recentVerification) {
+      extraLines.push(`- ${trimHandoffSection(String(item?.text ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    }
+  }
+  if (recentNotes.length > 0) {
+    extraLines.push("", "## Recent Notes");
+    for (const item of recentNotes) {
+      extraLines.push(`- ${trimHandoffSection(String(item?.text ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    }
+  }
+  if (recentReflections.length > 0) {
+    extraLines.push("", "## Recent Reflections");
+    for (const item of recentReflections) {
+      extraLines.push(`- ${trimHandoffSection(String(item?.text ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    }
+  }
   if (summary) extraLines.push("", "## Handoff Summary", summary);
   if (rationale) extraLines.push("", "## Why Fresh Context Was Needed", rationale);
   if (steps.length > 0) extraLines.push("", "## Next Steps", ...steps);

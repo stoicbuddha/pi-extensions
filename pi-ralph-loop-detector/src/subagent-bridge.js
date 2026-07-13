@@ -15,12 +15,16 @@ const JUDGE_SYSTEM_PROMPT = [
 const RECOVERY_SUMMARY_SYSTEM_PROMPT = [
   "You are an isolated Ralph loop recovery analyst running in a separate Pi subprocess.",
   "Analyze only the supplied evidence.",
-  "Summarize what the agent appears to be trying to do, why it got stuck, and what the next fresh-context steps should be.",
+  "Produce a dense fresh-context engineering handoff, not a brief recap.",
+  "Summarize what the agent appears to be trying to do, what concrete work was already completed, what files/components/features were touched, what failed or became uncertain, and what the next fresh-context steps should be.",
   "Treat Ralph bookkeeping fields as secondary context only.",
   "Do not turn Ralph bookkeeping mismatches, tracker drift, stale currentTaskId values, or note/plan inconsistencies into primary work items unless the evidence clearly shows they are blocking execution.",
   "Prioritize concrete user-task continuity, recent real code activity, and the next productive engineering step.",
+  "Bias toward preserving continuity for the next agent. Include implementation details, named files/routes/modules/components when available, already-completed subtasks, recent failed attempts, and the narrowest high-value next moves.",
+  "The summary should be substantial and specific rather than terse. Prefer a detailed multi-paragraph handoff over a short abstract summary.",
+  "next_steps should be concrete engineering actions, not generic advice.",
   "Do not suggest restoring git branches, checking out branches, resetting git state, or any other action outside the documented tool contract.",
-  'Return exactly one JSON object with: summary (string), next_steps (array of short strings), rationale (string), suspected_goal (string), and offendingTool (string or null).',
+  'Return exactly one JSON object with: summary (string), next_steps (array of concrete strings), rationale (string), suspected_goal (string), and offendingTool (string or null).',
   "Do not include markdown, code fences, or any extra text.",
 ].join(" ");
 
@@ -567,7 +571,7 @@ function normalizeStringArray(value) {
   return value
     .map((item) => (typeof item === "string" ? item.trim() : ""))
     .filter(Boolean)
-    .slice(0, 6);
+    .slice(0, 12);
 }
 
 function extractTextFromMessage(message) {
