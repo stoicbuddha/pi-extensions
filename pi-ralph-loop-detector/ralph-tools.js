@@ -862,11 +862,12 @@ function buildPlanPreview(loop, statusFilter) {
 function buildCompactPlanResponse(loop, options = {}) {
   const filtered = options.status ? loop.tasks.filter((task) => task.status === options.status) : loop.tasks;
   const maxTasks = Number.isFinite(options.maxTasks) ? Math.max(1, Math.min(50, options.maxTasks)) : 12;
+  const currentTask = selectActiveTask(loop);
   const lines = [
     `Loop: ${loop.name}`,
     `Status: ${loop.status}`,
     `Iteration: ${loop.iteration}/${loop.maxIterations}`,
-    `Next unfinished task: ${selectNextTask(loop)?.id ?? "none"}`,
+    `Current task: ${currentTask?.id ?? "none"}`,
   ];
 
   for (const task of filtered.slice(0, maxTasks)) {
@@ -886,7 +887,7 @@ function selectNextTask(loop) {
 }
 
 function selectActiveTask(loop) {
-  return findTask(loop, loop?.currentTaskId) ?? selectNextTask(loop);
+  return selectNextTask(loop);
 }
 
 function formatInlineList(items) {

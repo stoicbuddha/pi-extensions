@@ -42,6 +42,12 @@ test("iteration prompt avoids duplicating next task and caps prompt fields", () 
   assert.match(source, /debugLog\(`\[ralph\] prompt dispatch mode=\$\{mode\} loop=\$\{loop\?\.name \?\? "unknown"\} iteration=\$\{loop\?\.iteration \?\? "\?"\} chars=\$\{promptChars\}`\);/);
 });
 
+test("task selection ignores currentTaskId and uses first unfinished task", () => {
+  assert.match(source, /function selectActiveTask\(loop\) \{\s+return selectNextTask\(loop\);\s+\}/s);
+  assert.match(source, /const currentTask = selectActiveTask\(loop\);/);
+  assert.match(source, /`Current task: \$\{currentTask\?\.id \?\? "none"\}`/);
+});
+
 test("managed Ralph system prompt is replaced instead of appended repeatedly", () => {
   assert.match(source, /const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";/);
   assert.match(source, /const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";/);
