@@ -75,6 +75,14 @@ test("task metadata persists graphify plans and cached graph context", () => {
   assert.match(source, /metadata: Type\.Optional\(TASK_METADATA_PARAMETER\)/);
 });
 
+test("ralph_done resolves the running loop through session hints", () => {
+  assert.match(source, /const sessionLoopHints = new Map\(\);/);
+  assert.match(source, /function rememberLoopHint\(ctx, loopName\)/);
+  assert.match(source, /function getCurrentLoopWithHint\(store, ctx, loopName\)/);
+  assert.match(source, /const loop = getCurrentLoopWithHint\(store, ctx\);/);
+  assert.match(source, /rememberLoopHint\(ctx, loop\.name\);/);
+});
+
 test("recovery summarizer prompt de-emphasizes Ralph bookkeeping mismatches", () => {
   assert.match(bridgeSource, /Do not turn Ralph bookkeeping mismatches, tracker drift, stale currentTaskId values, or note\/plan inconsistencies into primary work items/);
   assert.match(bridgeSource, /Prioritize concrete user-task continuity, recent real code activity, and the next productive engineering step/);

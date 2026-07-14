@@ -38,6 +38,8 @@ const GRAPHIFY_QUERY_NOTE_MAX_CHARS = 220;
 const RALPH_CONTEXT_START = "<!-- RALPH_LOOP_CONTEXT_START -->";
 const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";
 let latestSessionControlCtx = null;
+let latestLoopHint = null;
+const sessionLoopHints = new Map();
 const RALPH_DEBUG_LOG = "/tmp/pi-ralph-loop-detector.log";
 
 function nowIso() {
@@ -64,6 +66,26 @@ function getSessionControlCtx(ctx) {
     return latestSessionControlCtx;
   }
   return ctx;
+}
+
+function getSessionHintKey(ctx) {
+  const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+  return typeof sessionFile === "string" && sessionFile ? sessionFile : null;
+}
+
+function rememberLoopHint(ctx, loopName) {
+  if (typeof loopName !== "string" || !loopName.trim()) return;
+  latestLoopHint = loopName;
+  const key = getSessionHintKey(ctx);
+  if (key) sessionLoopHints.set(key, loopName);
+}
+
+function getLoopHint(ctx) {
+  const key = getSessionHintKey(ctx);
+  if (key && sessionLoopHints.has(key)) {
+    return sessionLoopHints.get(key) ?? null;
+  }
+  return latestLoopHint;
 }
 
 function escapeRegExp(text) {
@@ -645,6 +667,7 @@ function persistLoop(ctx, store, loop) {
   if (index >= 0) store.loops[index] = loop;
   else store.loops.push(loop);
   store.selectedLoopName = loop.name;
+  rememberLoopHint(ctx, loop.name);
   saveStore(ctx, store);
 }
 
@@ -1240,6 +1263,7 @@ async function deliverFreshSessionPrompt(target, prompt) {
 async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh", onDispatched = null) {
   const controlCtx = getSessionControlCtx(ctx);
   const canNewSession = Boolean(controlCtx && typeof controlCtx.newSession === "function");
+  rememberLoopHint(ctx, loop?.name);
   let attemptedSessionReplacement = false;
   if (typeof ctx.newSession !== "function") {
     logHandoffStage(loop, `${mode}-ctx-no-newSession`, { controlCtxHasNewSession: canNewSession });
@@ -1272,6 +1296,7 @@ async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh",
       parentSession,
       withSession: async (replacementCtx) => {
         rememberSessionControlCtx(replacementCtx);
+        rememberLoopHint(replacementCtx, loop?.name);
         logHandoffStage(loop, `${mode}-withSession-enter`, { parentSession });
         await deliverFreshSessionPrompt(replacementCtx, prompt);
         logHandoffStage(loop, `${mode}-withSession-delivered`);
@@ -1319,6 +1344,7 @@ async function dispatchNextIteration(pi, ctx, loop) {
     logPromptDispatch(loop, "next/skipped-pending-handoff", "");
     return false;
   }
+  rememberLoopHint(ctx, loop?.name);
   const store = loadStore(ctx);
   const currentLoop = getCurrentLoop(store, loop.name) ?? loop;
   const activeTask = selectActiveTask(currentLoop);
@@ -1346,6 +1372,7 @@ async function dispatchFreshIteration(pi, ctx, loop) {
     logPromptDispatch(loop, "fresh/skipped-pending-handoff", "");
     return false;
   }
+  rememberLoopHint(ctx, loop?.name);
   const store = loadStore(ctx);
   const currentLoop = getCurrentLoop(store, loop.name) ?? loop;
   const activeTask = selectActiveTask(currentLoop);
@@ -1738,9 +1765,17 @@ function getCurrentLoop(store, loopName) {
   return loop ?? null;
 }
 
+function getCurrentLoopWithHint(store, ctx, loopName) {
+  const direct = getCurrentLoop(store, loopName);
+  if (direct) return direct;
+  const hintedLoopName = getLoopHint(ctx);
+  if (!hintedLoopName || hintedLoopName === loopName) return direct;
+  return getCurrentLoop(store, hintedLoopName);
+}
+
 export function getActiveRalphLoop(ctx) {
   const store = loadStore(ctx);
-  const loop = getCurrentLoop(store);
+  const loop = getCurrentLoopWithHint(store, ctx);
   if (!loop || loop.status !== "active") return null;
   return loop;
 }
@@ -2233,9 +2268,10 @@ export function registerRalphSurface(pi) {
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const store = loadStore(ctx);
-      const loop = getCurrentLoop(store);
+      const loop = getCurrentLoopWithHint(store, ctx);
       if (!loop) return { content: [{ type: "text", text: "No active Ralph loop." }], details: {} };
       if (loop.status !== "active") return { content: [{ type: "text", text: "Ralph loop is not active." }], details: {} };
+      rememberLoopHint(ctx, loop.name);
       loop.iteration += 1;
       addVerification(loop, "Iteration advanced via ralph_done");
       if (loop.maxIterations > 0 && loop.iteration > loop.maxIterations) {
@@ -2298,8 +2334,9 @@ export function registerRalphSurface(pi) {
 
   pi.on("before_agent_start", async (event, ctx) => {
     const store = loadStore(ctx);
-    const loop = getCurrentLoop(store);
+    const loop = getCurrentLoopWithHint(store, ctx);
     if (!loop || loop.status !== "active") return;
+    rememberLoopHint(ctx, loop.name);
     const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
     const userPrompt = typeof event?.prompt === "string" ? event.prompt : "";
     const overlay = loadRalphOverlay(ctx);
