@@ -17,6 +17,14 @@ test("/ralph start routes existing loops through resume behavior", () => {
   assert.match(source, /if \(!hasRemainingTaskWork\(loop\)\) \{\s+setStatus\(loop, "completed"\);/s);
 });
 
+test("/ralph resume resolves paused or selected loops without active-loop fallback", () => {
+  assert.match(source, /function getResumeLoop\(store, ctx, loopName\) \{/);
+  assert.match(source, /if \(store\.selectedLoopName\) \{\s+const selected = store\.loops\.find\(\(loop\) => loop\.name === store\.selectedLoopName\) \?\? null;\s+if \(selected\) return selected;\s+\}/s);
+  assert.match(source, /return store\.loops\.find\(\(loop\) => loop\.status === "paused"\)\s+\?\? store\.loops\.find\(\(loop\) => loop\.status === "active"\)\s+\?\? store\.loops\[0\]\s+\?\? null;/s);
+  assert.match(source, /const loop = getResumeLoop\(store, ctx, name \|\| undefined\);/);
+  assert.match(source, /if \(loop\.status === "completed"\) \{/);
+});
+
 test("exports Ralph stop steering for natural assistant stops", () => {
   assert.match(source, /export async function maybeDispatchStoppedLoopSteering\(ctx, pi, options = \{\}\)/);
   assert.match(source, /if \(stopReason !== "stop"\) return false;/);

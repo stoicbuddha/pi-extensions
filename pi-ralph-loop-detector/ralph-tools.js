@@ -1792,6 +1792,26 @@ function getCurrentLoopWithHint(store, ctx, loopName) {
   return getCurrentLoop(store, hintedLoopName);
 }
 
+function getResumeLoop(store, ctx, loopName) {
+  const explicitName = typeof loopName === "string" && loopName.trim() ? loopName.trim() : null;
+  if (explicitName) {
+    return store.loops.find((loop) => loop.name === explicitName) ?? null;
+  }
+  if (store.selectedLoopName) {
+    const selected = store.loops.find((loop) => loop.name === store.selectedLoopName) ?? null;
+    if (selected) return selected;
+  }
+  const hintedLoopName = getLoopHint(ctx);
+  if (hintedLoopName) {
+    const hinted = store.loops.find((loop) => loop.name === hintedLoopName) ?? null;
+    if (hinted) return hinted;
+  }
+  return store.loops.find((loop) => loop.status === "paused")
+    ?? store.loops.find((loop) => loop.status === "active")
+    ?? store.loops[0]
+    ?? null;
+}
+
 export function getActiveRalphLoop(ctx) {
   const store = loadStore(ctx);
   const loop = getCurrentLoopWithHint(store, ctx);
@@ -1933,9 +1953,13 @@ export function registerRalphSurface(pi) {
 
     if (cmd === "resume") {
       const name = rest.trim();
-      const loop = getCurrentLoop(store, name || undefined);
+      const loop = getResumeLoop(store, ctx, name || undefined);
       if (!loop) {
         if (ctx.hasUI) ctx.ui.notify(name ? `Loop "${name}" not found` : "No selected Ralph loop found. Use /ralph resume <name>.", "warning");
+        return;
+      }
+      if (loop.status === "completed") {
+        if (ctx.hasUI) ctx.ui.notify(`Loop "${loop.name}" is already completed.`, "info");
         return;
       }
       await resumeLoop(pi, ctx, store, loop);
