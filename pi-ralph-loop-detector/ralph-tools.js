@@ -890,6 +890,10 @@ function selectActiveTask(loop) {
   return selectNextTask(loop);
 }
 
+function hasRemainingTaskWork(loop) {
+  return Boolean(selectNextTask(loop));
+}
+
 function formatInlineList(items) {
   return items.map((item) => `\`${truncateForPrompt(item, 120)}\``).join(", ");
 }
@@ -1349,6 +1353,13 @@ async function dispatchNextIteration(pi, ctx, loop) {
   const store = loadStore(ctx);
   const currentLoop = getCurrentLoop(store, loop.name) ?? loop;
   const activeTask = selectActiveTask(currentLoop);
+  if (!activeTask) {
+    setStatus(currentLoop, "completed");
+    persistLoop(ctx, store, currentLoop);
+    logPromptDispatch(currentLoop, "next/completed-no-active-task", "");
+    if (ctx.hasUI) ctx.ui.notify(`Completed Ralph loop: ${currentLoop.name}. No unfinished tasks remain.`, "info");
+    return true;
+  }
   if (activeTask) ensureTaskGraphifyContext(ctx, store, currentLoop, activeTask);
   const prompt = buildIterationPrompt(currentLoop, activeTask, loadRalphOverlay(ctx));
 
@@ -1377,6 +1388,13 @@ async function dispatchFreshIteration(pi, ctx, loop) {
   const store = loadStore(ctx);
   const currentLoop = getCurrentLoop(store, loop.name) ?? loop;
   const activeTask = selectActiveTask(currentLoop);
+  if (!activeTask) {
+    setStatus(currentLoop, "completed");
+    persistLoop(ctx, store, currentLoop);
+    logPromptDispatch(currentLoop, "fresh/completed-no-active-task", "");
+    if (ctx.hasUI) ctx.ui.notify(`Completed Ralph loop: ${currentLoop.name}. No unfinished tasks remain.`, "info");
+    return true;
+  }
   if (activeTask) ensureTaskGraphifyContext(ctx, store, currentLoop, activeTask);
   const prompt = buildResetPrompt(currentLoop, activeTask, loadRalphOverlay(ctx));
   return dispatchFreshContextPrompt(pi, ctx, currentLoop, prompt, "fresh");
@@ -1852,6 +1870,12 @@ function registerTool(pi, spec) {
 }
 
 async function resumeLoop(pi, ctx, store, loop) {
+  if (!hasRemainingTaskWork(loop)) {
+    setStatus(loop, "completed");
+    persistLoop(ctx, store, loop);
+    if (ctx.hasUI) ctx.ui.notify(`Loop already complete: ${loop.name}`, "info");
+    return;
+  }
   setStatus(loop, "active");
   loop.iteration += 1;
   persistLoop(ctx, store, loop);
@@ -2275,6 +2299,12 @@ export function registerRalphSurface(pi) {
       rememberLoopHint(ctx, loop.name);
       loop.iteration += 1;
       addVerification(loop, "Iteration advanced via ralph_done");
+      if (!hasRemainingTaskWork(loop)) {
+        setStatus(loop, "completed");
+        saveStore(ctx, store);
+        if (ctx.hasUI) ctx.ui.notify(`Completed Ralph loop: ${loop.name}. No unfinished tasks remain.`, "info");
+        return { content: [{ type: "text", text: "All Ralph tasks are complete. Loop stopped." }], details: { loop } };
+      }
       if (loop.maxIterations > 0 && loop.iteration > loop.maxIterations) {
         setStatus(loop, "completed");
         saveStore(ctx, store);

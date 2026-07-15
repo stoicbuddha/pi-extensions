@@ -14,6 +14,7 @@ test("does not register ralph_start as an agent tool", () => {
 test("/ralph start routes existing loops through resume behavior", () => {
   assert.match(source, /const existing = getCurrentLoop\(store, parsed\.name\);/);
   assert.match(source, /if \(existing\) \{\s+updateLoopFromArgs\(existing, parsed\);\s+await resumeLoop\(pi, ctx, store, existing\);/s);
+  assert.match(source, /if \(!hasRemainingTaskWork\(loop\)\) \{\s+setStatus\(loop, "completed"\);/s);
 });
 
 test("exports Ralph stop steering for natural assistant stops", () => {
@@ -43,6 +44,7 @@ test("iteration prompt avoids duplicating next task and caps prompt fields", () 
 });
 
 test("task selection ignores currentTaskId and uses first unfinished task", () => {
+  assert.match(source, /function hasRemainingTaskWork\(loop\) \{\s+return Boolean\(selectNextTask\(loop\)\);\s+\}/s);
   assert.match(source, /function selectActiveTask\(loop\) \{\s+return selectNextTask\(loop\);\s+\}/s);
   assert.match(source, /const currentTask = selectActiveTask\(loop\);/);
   assert.match(source, /`Current task: \$\{currentTask\?\.id \?\? "none"\}`/);
@@ -87,6 +89,8 @@ test("ralph_done resolves the running loop through session hints", () => {
   assert.match(source, /function getCurrentLoopWithHint\(store, ctx, loopName\)/);
   assert.match(source, /const loop = getCurrentLoopWithHint\(store, ctx\);/);
   assert.match(source, /rememberLoopHint\(ctx, loop\.name\);/);
+  assert.match(source, /if \(!hasRemainingTaskWork\(loop\)\) \{\s+setStatus\(loop, "completed"\);/s);
+  assert.match(source, /All Ralph tasks are complete\. Loop stopped\./);
 });
 
 test("recovery summarizer prompt de-emphasizes Ralph bookkeeping mismatches", () => {
@@ -97,6 +101,8 @@ test("recovery summarizer prompt de-emphasizes Ralph bookkeeping mismatches", ()
 test("pending handoff suppresses normal Ralph iteration dispatch", () => {
   assert.match(source, /if \(loop\.pendingHandoff\) \{\s+logPromptDispatch\(loop, "next\/skipped-pending-handoff", ""\);\s+return false;\s+\}/s);
   assert.match(source, /if \(loop\.pendingHandoff\) \{\s+logPromptDispatch\(loop, "fresh\/skipped-pending-handoff", ""\);\s+return false;\s+\}/s);
+  assert.match(source, /logPromptDispatch\(currentLoop, "next\/completed-no-active-task", ""\);/);
+  assert.match(source, /logPromptDispatch\(currentLoop, "fresh\/completed-no-active-task", ""\);/);
   assert.match(source, /Pending Ralph handoff preserved for \$\{loop\.name\}; skipping in-session iteration dispatch\./);
   assert.match(source, /Next iteration will continue via pending Ralph compaction handoff\./);
   assert.match(source, /Paused after ralph_done because fresh-context dispatch failed/);
