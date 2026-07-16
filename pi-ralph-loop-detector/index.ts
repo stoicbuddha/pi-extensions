@@ -682,6 +682,138 @@ function summarizeLoopTasks(loop: any, maxTasks = 8): Array<{ id: string; title:
 	}));
 }
 
+function summarizeTaskCounts(loop: any): { todo: number; in_progress: number; blocked: number; done: number; cancelled: number } {
+	const counts = { todo: 0, in_progress: 0, blocked: 0, done: 0, cancelled: 0 };
+	if (!Array.isArray(loop?.tasks)) return counts;
+	for (const task of loop.tasks) {
+		const status = typeof task?.status === "string" ? task.status : "";
+		if (Object.prototype.hasOwnProperty.call(counts, status)) {
+			counts[status as keyof typeof counts] += 1;
+		}
+	}
+	return counts;
+}
+
+function summarizeTaskMetadata(task: any): null | {
+	contract: null | {
+		purpose: string | null;
+		requiredCodeChanges: string[];
+		verificationTarget: string[];
+	};
+	graphifyPlan: null | {
+		likelyPaths: string[];
+		likelySymbols: string[];
+		likelySubsystems: string[];
+		queries: Array<{ question: string; expected: string | null }>;
+	};
+	graphifyContext: null | {
+		status: string;
+		error: string | null;
+		summary: {
+			likelyFiles: string[];
+			likelySymbols: string[];
+			likelyCallSites: string[];
+			relatedArtifacts: string[];
+			queryNotes: string[];
+		};
+	};
+} {
+	const metadata = task?.metadata && typeof task.metadata === "object" ? task.metadata : null;
+	if (!metadata) return null;
+	const contract = metadata.contract && typeof metadata.contract === "object"
+		? {
+			purpose: typeof metadata.contract.purpose === "string" && metadata.contract.purpose.trim()
+				? truncateText(metadata.contract.purpose.trim(), 260)
+				: null,
+			requiredCodeChanges: Array.isArray(metadata.contract.requiredCodeChanges)
+				? metadata.contract.requiredCodeChanges.map((item: unknown) => truncateText(String(item ?? "").trim(), 160)).filter(Boolean).slice(0, 5)
+				: [],
+			verificationTarget: Array.isArray(metadata.contract.verificationTarget)
+				? metadata.contract.verificationTarget.map((item: unknown) => truncateText(String(item ?? "").trim(), 180)).filter(Boolean).slice(0, 5)
+				: [],
+		}
+		: null;
+	const graphifyPlan = metadata.graphifyPlan && typeof metadata.graphifyPlan === "object"
+		? {
+			likelyPaths: Array.isArray(metadata.graphifyPlan.likelyPaths)
+				? metadata.graphifyPlan.likelyPaths.map((item: unknown) => truncateText(String(item ?? "").trim(), 160)).filter(Boolean).slice(0, 6)
+				: [],
+			likelySymbols: Array.isArray(metadata.graphifyPlan.likelySymbols)
+				? metadata.graphifyPlan.likelySymbols.map((item: unknown) => truncateText(String(item ?? "").trim(), 160)).filter(Boolean).slice(0, 6)
+				: [],
+			likelySubsystems: Array.isArray(metadata.graphifyPlan.likelySubsystems)
+				? metadata.graphifyPlan.likelySubsystems.map((item: unknown) => truncateText(String(item ?? "").trim(), 160)).filter(Boolean).slice(0, 6)
+				: [],
+			queries: Array.isArray(metadata.graphifyPlan.queries)
+				? metadata.graphifyPlan.queries.map((query: any) => ({
+					question: truncateText(String(query?.question ?? "").trim(), 220),
+					expected: typeof query?.expected === "string" && query.expected.trim() ? truncateText(query.expected.trim(), 180) : null,
+				})).filter((query: any) => query.question).slice(0, 4)
+				: [],
+		}
+		: null;
+	const contextSummary = metadata.graphifyContext?.summary && typeof metadata.graphifyContext.summary === "object"
+		? metadata.graphifyContext.summary
+		: {};
+	const graphifyContext = metadata.graphifyContext && typeof metadata.graphifyContext === "object"
+		? {
+			status: typeof metadata.graphifyContext.status === "string" ? metadata.graphifyContext.status : "unknown",
+			error: typeof metadata.graphifyContext.error === "string" && metadata.graphifyContext.error.trim()
+				? truncateText(metadata.graphifyContext.error.trim(), 220)
+				: null,
+			summary: {
+				likelyFiles: Array.isArray(contextSummary.likelyFiles)
+					? contextSummary.likelyFiles.map((item: unknown) => truncateText(String(item ?? "").trim(), 180)).filter(Boolean).slice(0, 6)
+					: [],
+				likelySymbols: Array.isArray(contextSummary.likelySymbols)
+					? contextSummary.likelySymbols.map((item: unknown) => truncateText(String(item ?? "").trim(), 180)).filter(Boolean).slice(0, 6)
+					: [],
+				likelyCallSites: Array.isArray(contextSummary.likelyCallSites)
+					? contextSummary.likelyCallSites.map((item: unknown) => truncateText(String(item ?? "").trim(), 180)).filter(Boolean).slice(0, 6)
+					: [],
+				relatedArtifacts: Array.isArray(contextSummary.relatedArtifacts)
+					? contextSummary.relatedArtifacts.map((item: unknown) => truncateText(String(item ?? "").trim(), 180)).filter(Boolean).slice(0, 6)
+					: [],
+				queryNotes: Array.isArray(contextSummary.queryNotes)
+					? contextSummary.queryNotes.map((item: unknown) => truncateText(String(item ?? "").trim(), 220)).filter(Boolean).slice(0, 6)
+					: [],
+			},
+		}
+		: null;
+	if (!contract && !graphifyPlan && !graphifyContext) return null;
+	return { contract, graphifyPlan, graphifyContext };
+}
+
+function summarizeTaskForHandoff(task: any): null | {
+	id: string;
+	title: string;
+	status: string;
+	details: string;
+	evidence: string[];
+	notes: string[];
+	metadata: ReturnType<typeof summarizeTaskMetadata>;
+} {
+	if (!task || typeof task !== "object") return null;
+	return {
+		id: String(task?.id ?? ""),
+		title: truncateText(String(task?.title ?? "").trim(), 220),
+		status: String(task?.status ?? "unknown"),
+		details: truncateText(String(task?.details ?? "").trim(), 420),
+		evidence: Array.isArray(task?.evidence)
+			? task.evidence.slice(-4).map((item: unknown) => truncateText(String(item ?? "").trim(), 360)).filter(Boolean)
+			: [],
+		notes: Array.isArray(task?.notes)
+			? task.notes.slice(-4).map((item: unknown) => truncateText(String(item ?? "").trim(), 360)).filter(Boolean)
+			: [],
+		metadata: summarizeTaskMetadata(task),
+	};
+}
+
+function selectCompactionActiveTask(loop: any): any | null {
+	if (!Array.isArray(loop?.tasks)) return null;
+	return loop.tasks.find((task: any) => task && task.status !== "done" && task.status !== "blocked" && task.status !== "cancelled") ?? loop.tasks[0] ?? null;
+}
+
 function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 	customInstructions?: string | null;
 	tokensBefore?: number | null;
@@ -689,6 +821,14 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 	recentMessages?: any[];
 	turnPrefixMessages?: any[];
 }): unknown {
+	const activeTask = selectCompactionActiveTask(loop);
+	const taskCounts = summarizeTaskCounts(loop);
+	const openTasks = Array.isArray(loop?.tasks)
+		? loop.tasks.filter((task: any) => task && task.status !== "done" && task.status !== "cancelled").slice(0, 10).map((task: any) => summarizeTaskForHandoff(task))
+		: [];
+	const recentlyCompletedTasks = Array.isArray(loop?.tasks)
+		? loop.tasks.filter((task: any) => task && task.status === "done").slice(-6).map((task: any) => summarizeTaskForHandoff(task))
+		: [];
 	return {
 		task: "ralph_compaction_handoff_summary",
 		version: 1,
@@ -700,7 +840,11 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 			title: loop.title ?? loop.name,
 			summary: truncateText(String(loop.summary ?? "").trim(), 1200),
 			goals: Array.isArray(loop.goals) ? loop.goals.slice(0, 5) : [],
+			taskCounts,
+			currentTask: summarizeTaskForHandoff(activeTask),
 			tasks: summarizeLoopTasks(loop, 8),
+			openTasks,
+			recentlyCompletedTasks,
 			recentNotes: Array.isArray(loop.notes)
 				? loop.notes.slice(-5).map((item: any) => ({
 					at: item?.at,
@@ -715,7 +859,7 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 				}))
 				: [],
 			recentVerification: Array.isArray(loop.verification)
-				? loop.verification.slice(-6).map((item: any) => ({
+				? loop.verification.slice(-10).map((item: any) => ({
 					at: item?.at,
 					text: truncateText(String(item?.text ?? "").trim(), 320),
 				}))
@@ -729,10 +873,10 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 			tokensBefore: slice?.tokensBefore ?? null,
 			previousSummary:
 				typeof slice?.previousSummary === "string" && slice.previousSummary.trim()
-					? truncateText(slice.previousSummary.trim(), 1800)
+					? truncateText(slice.previousSummary.trim(), 2500)
 					: null,
-			recentMessages: summarizeCompactionMessages(slice?.recentMessages ?? [], 10),
-			turnPrefixMessages: summarizeCompactionMessages(slice?.turnPrefixMessages ?? [], 6),
+			recentMessages: summarizeCompactionMessages(slice?.recentMessages ?? [], 16),
+			turnPrefixMessages: summarizeCompactionMessages(slice?.turnPrefixMessages ?? [], 10),
 		},
 	};
 }
@@ -812,6 +956,7 @@ async function loadFreshRalphHandoffHelpers(): Promise<null | {
 	markPendingRalphHandoffQueued: typeof markPendingRalphHandoffQueued;
 	clearPendingRalphHandoff: typeof clearPendingRalphHandoff;
 	updatePendingRalphHandoffPrompt: typeof updatePendingRalphHandoffPrompt;
+	primeActiveTaskGraphifyContext: (ctx: any, loopName: string) => { loop: any; task: any; context: any } | null;
 	dispatchPendingRalphHandoff: typeof dispatchPendingRalphHandoff;
 }> {
 	try {
@@ -823,6 +968,7 @@ async function loadFreshRalphHandoffHelpers(): Promise<null | {
 			typeof mod?.markPendingRalphHandoffQueued !== "function" ||
 			typeof mod?.clearPendingRalphHandoff !== "function" ||
 			typeof mod?.updatePendingRalphHandoffPrompt !== "function" ||
+			typeof mod?.primeActiveTaskGraphifyContext !== "function" ||
 			typeof mod?.dispatchPendingRalphHandoff !== "function"
 		) {
 			return null;
@@ -833,6 +979,7 @@ async function loadFreshRalphHandoffHelpers(): Promise<null | {
 			markPendingRalphHandoffQueued: mod.markPendingRalphHandoffQueued,
 			clearPendingRalphHandoff: mod.clearPendingRalphHandoff,
 			updatePendingRalphHandoffPrompt: mod.updatePendingRalphHandoffPrompt,
+			primeActiveTaskGraphifyContext: mod.primeActiveTaskGraphifyContext,
 			dispatchPendingRalphHandoff: mod.dispatchPendingRalphHandoff,
 		};
 	} catch {
@@ -857,6 +1004,8 @@ async function prepareCompactionHandoff(state: RuntimeState, event: any, ctx: an
 		}
 		return false;
 	}
+
+	handoffHelpers.primeActiveTaskGraphifyContext(ctx, loop.name);
 
 	const pending = handoffHelpers.getPendingRalphHandoff(ctx, loop.name);
 	if (pending?.commandQueued) {

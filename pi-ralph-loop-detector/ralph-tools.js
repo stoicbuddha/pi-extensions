@@ -418,6 +418,61 @@ function normalizeTaskMetadata(input) {
   };
 }
 
+function buildDefaultGraphifyTopic(loop, task) {
+  const primary = cleanString(task?.title) || cleanString(loop?.title) || cleanString(loop?.name);
+  const detail = cleanString(task?.details);
+  if (!primary && !detail) return "";
+  const combined = detail ? `${primary}: ${detail}` : primary;
+  return truncateForPrompt(combined, 180);
+}
+
+function buildDefaultGraphifyPlan(loop, task) {
+  if (!loop || !task) return null;
+  const topic = buildDefaultGraphifyTopic(loop, task);
+  if (!topic) return null;
+  const taskText = [
+    cleanString(loop?.summary),
+    cleanString(task?.title),
+    cleanString(task?.details),
+    ...(Array.isArray(task?.evidence) ? task.evidence.slice(-2).map((item) => cleanString(item)) : []),
+    ...(Array.isArray(task?.notes) ? task.notes.slice(-2).map((item) => cleanString(item)) : []),
+  ].filter(Boolean).join("\n");
+  const likelyPaths = cleanStringArray(extractPathCandidates(taskText), GRAPHIFY_HINT_LIMIT);
+  const likelySymbols = cleanStringArray(extractSymbolCandidates(taskText), GRAPHIFY_HINT_LIMIT);
+  const likelySubsystems = cleanStringArray([
+    cleanString(loop?.name),
+    cleanString(loop?.title),
+    cleanString(task?.title),
+  ], GRAPHIFY_HINT_LIMIT);
+  const contexts = cleanStringArray([
+    ...likelyPaths,
+    ...likelySymbols,
+  ], 4);
+  return normalizeGraphifyPlan({
+    likelyPaths,
+    likelySymbols,
+    likelySubsystems,
+    queries: [
+      {
+        question: `What files, modules, and entry points are most relevant to "${topic}"?`,
+        expected: "Likely implementation files, entry points, and tests.",
+        contexts,
+      },
+      {
+        question: `How is "${topic}" wired through the codebase? Include callers, handlers, routes, and tests.`,
+        mode: "dfs",
+        expected: "Call paths, handlers, routes, and adjacent tests.",
+        contexts,
+      },
+      {
+        question: `What neighboring modules, configs, or tests would likely need coordinated changes for "${topic}"?`,
+        expected: "Related modules, configs, tests, or templates that may need coordinated edits.",
+        contexts,
+      },
+    ],
+  });
+}
+
 function blankStore() {
   return {
     selectedLoopName: null,
@@ -863,13 +918,45 @@ function buildCompactPlanResponse(loop, options = {}) {
   const filtered = options.status ? loop.tasks.filter((task) => task.status === options.status) : loop.tasks;
   const maxTasks = Number.isFinite(options.maxTasks) ? Math.max(1, Math.min(50, options.maxTasks)) : 12;
   const currentTask = selectActiveTask(loop);
+  const counts = summarizeTaskCounts(Array.isArray(loop.tasks) ? loop.tasks : []);
   const lines = [
     `Loop: ${loop.name}`,
     `Status: ${loop.status}`,
     `Iteration: ${loop.iteration}/${loop.maxIterations}`,
+    `Task counts: todo ${counts.todo}, in_progress ${counts.in_progress}, blocked ${counts.blocked}, done ${counts.done}, cancelled ${counts.cancelled}`,
     `Current task: ${currentTask?.id ?? "none"}`,
   ];
 
+  if (loop.title?.trim()) lines.push(`Title: ${truncateForPrompt(loop.title, 220)}`);
+  if (loop.summary?.trim()) lines.push(`Summary: ${truncateForPrompt(loop.summary, 900)}`);
+
+  if (currentTask) {
+    lines.push(
+      "",
+      "## Current Task",
+      formatPromptTask(currentTask),
+      "",
+      "## Verification Target",
+      ...buildVerificationPromptLines(currentTask),
+      "",
+      "## Active Task Contract",
+      ...buildContractPromptLines(currentTask),
+    );
+    const graphContextLines = buildGraphContextPromptLines(currentTask);
+    if (graphContextLines.length > 0) {
+      lines.push("", ...graphContextLines);
+    }
+  }
+
+  const recentVerification = Array.isArray(loop.verification) ? loop.verification.slice(-4) : [];
+  if (recentVerification.length > 0) {
+    lines.push("", "## Recent Verification");
+    for (const item of recentVerification) {
+      lines.push(`- ${truncateForPrompt(String(item?.text ?? "").trim(), 220)}`);
+    }
+  }
+
+  lines.push("", "## Tasks");
   for (const task of filtered.slice(0, maxTasks)) {
     lines.push(`- [${task.status}] ${task.id} ${task.title}`);
   }
@@ -983,13 +1070,21 @@ function buildGraphifyContextSummary(plan, results) {
 
 function ensureTaskGraphifyContext(ctx, store, loop, task) {
   const metadata = normalizeTaskMetadata(task?.metadata);
-  const graphifyPlan = metadata?.graphifyPlan ?? null;
+  const defaultGraphifyPlan = !metadata?.graphifyPlan ? buildDefaultGraphifyPlan(loop, task) : null;
+  const graphifyPlan = metadata?.graphifyPlan ?? defaultGraphifyPlan ?? null;
+  if (task && graphifyPlan && (!metadata || !metadata.graphifyPlan)) {
+    task.metadata = {
+      contract: metadata?.contract ?? null,
+      graphifyPlan,
+      graphifyContext: null,
+    };
+  }
   if (!task || !graphifyPlan || !Array.isArray(graphifyPlan.queries) || graphifyPlan.queries.length === 0) {
     return { task, context: metadata?.graphifyContext ?? null };
   }
 
   const planFingerprint = stableStringify(graphifyPlan);
-  const currentContext = normalizeGraphifyContext(metadata?.graphifyContext);
+  const currentContext = normalizeGraphifyContext(task?.metadata?.graphifyContext ?? metadata?.graphifyContext);
   if (currentContext?.status === "ready" && currentContext.planFingerprint === planFingerprint) {
     task.metadata = { ...metadata, graphifyContext: currentContext };
     return { task, context: currentContext };
@@ -1042,9 +1137,9 @@ function ensureTaskGraphifyContext(ctx, store, loop, task) {
     planFingerprint,
     graphPath,
     error: null,
-    summary: buildGraphifyContextSummary(graphifyPlan, results),
-  };
-  task.metadata = { ...metadata, graphifyPlan, graphifyContext: readyContext };
+      summary: buildGraphifyContextSummary(graphifyPlan, results),
+    };
+  task.metadata = { ...(normalizeTaskMetadata(task.metadata) ?? metadata), graphifyPlan, graphifyContext: readyContext };
   persistLoop(ctx, store, loop);
   return { task, context: readyContext };
 }
@@ -1094,7 +1189,13 @@ function buildVerificationPromptLines(task) {
 
 function buildGraphContextPromptLines(task) {
   const context = normalizeTaskMetadata(task?.metadata)?.graphifyContext;
-  if (!context || context.status !== "ready") return [];
+  if (!context) return [];
+  if (context.status !== "ready") {
+    return [
+      "## Relevant Graph Context",
+      `- Graphify bootstrap unavailable: ${truncateForPrompt(context.error || "No graph context available.", 220)}`,
+    ];
+  }
   const lines = [
     "## Relevant Graph Context",
     "Use this task-scoped Graphify context first. Only broaden repo search if it is missing, stale, or contradicted.",
@@ -1401,7 +1502,8 @@ async function dispatchFreshIteration(pi, ctx, loop) {
 }
 
 function buildCompactionHandoffMessage(loop, handoffPrompt) {
-  const basePrompt = buildResetPrompt(loop, selectActiveTask(loop), null);
+  const activeTask = selectActiveTask(loop);
+  const basePrompt = buildResetPrompt(loop, activeTask, null);
   const rawHandoff = String(handoffPrompt ?? "").trim();
   const summaryMatch = rawHandoff.match(/## Handoff Summary\s*([\s\S]*?)(?:\n## |\s*$)/);
   const rationaleMatch = rawHandoff.match(/## Why Fresh Context Was Needed\s*([\s\S]*?)(?:\n## |\s*$)/);
@@ -1426,6 +1528,9 @@ function buildCompactionHandoffMessage(loop, handoffPrompt) {
   const recentVerification = Array.isArray(loop.verification) ? loop.verification.slice(-HANDOFF_STATE_MAX_ITEMS) : [];
   const recentNotes = Array.isArray(loop.notes) ? loop.notes.slice(-Math.min(5, HANDOFF_STATE_MAX_ITEMS)) : [];
   const recentReflections = Array.isArray(loop.reflections) ? loop.reflections.slice(-Math.min(3, HANDOFF_STATE_MAX_ITEMS)) : [];
+  const taskEvidence = Array.isArray(activeTask?.evidence) ? activeTask.evidence.slice(-4) : [];
+  const taskNotes = Array.isArray(activeTask?.notes) ? activeTask.notes.slice(-4) : [];
+  const activeTaskGraphContext = buildGraphContextPromptLines(activeTask);
 
   const extraLines = [
     "",
@@ -1471,6 +1576,27 @@ function buildCompactionHandoffMessage(loop, handoffPrompt) {
     extraLines.push("", "## Recent Reflections");
     for (const item of recentReflections) {
       extraLines.push(`- ${trimHandoffSection(String(item?.text ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    }
+  }
+  if (activeTask) {
+    extraLines.push("", "## Active Task Momentum", `- Current task: ${activeTask.id} ${trimHandoffSection(String(activeTask.title ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    if (activeTask.details?.trim()) {
+      extraLines.push(`- Task details: ${trimHandoffSection(activeTask.details, HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+    }
+    if (taskEvidence.length > 0) {
+      extraLines.push("- Recent task evidence:");
+      for (const item of taskEvidence) {
+        extraLines.push(`  - ${trimHandoffSection(String(item ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+      }
+    }
+    if (taskNotes.length > 0) {
+      extraLines.push("- Recent task notes:");
+      for (const item of taskNotes) {
+        extraLines.push(`  - ${trimHandoffSection(String(item ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
+      }
+    }
+    if (activeTaskGraphContext.length > 0) {
+      extraLines.push("", ...activeTaskGraphContext);
     }
   }
   if (summary) extraLines.push("", "## Handoff Summary", summary);
@@ -1570,6 +1696,16 @@ export function updatePendingRalphHandoffPrompt(ctx, loopName, handoffPrompt, re
   };
 }
 
+export function primeActiveTaskGraphifyContext(ctx, loopName) {
+  const store = loadStore(ctx);
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop) return null;
+  const activeTask = selectActiveTask(loop);
+  if (!activeTask) return { loop, task: null, context: null };
+  const result = ensureTaskGraphifyContext(ctx, store, loop, activeTask);
+  return { loop, task: activeTask, context: result.context ?? null };
+}
+
 export function clearPendingRalphHandoff(ctx, loopName, options = {}) {
   const store = loadStore(ctx);
   const loop = getCurrentLoop(store, loopName);
@@ -1603,6 +1739,8 @@ export async function dispatchPendingRalphHandoff(pi, ctx, loopName) {
     return { dispatched: false, reason: "already_dispatched" };
   }
 
+  const activeTask = selectActiveTask(loop);
+  if (activeTask) ensureTaskGraphifyContext(ctx, store, loop, activeTask);
   const prompt = buildCompactionHandoffMessage(loop, loop.pendingHandoffPrompt);
   const handoffReason = loop.pendingHandoffReason ?? "unknown";
   const pendingSnapshot = {
