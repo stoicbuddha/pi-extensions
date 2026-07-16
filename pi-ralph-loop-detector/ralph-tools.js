@@ -1501,15 +1501,15 @@ async function dispatchFreshIteration(pi, ctx, loop) {
   return dispatchFreshContextPrompt(pi, ctx, currentLoop, prompt, "fresh");
 }
 
-function buildCompactionHandoffMessage(loop, handoffPrompt) {
+export function buildCompactionHandoffMessage(loop, handoffPrompt) {
   const activeTask = selectActiveTask(loop);
   const basePrompt = buildResetPrompt(loop, activeTask, null);
   const rawHandoff = String(handoffPrompt ?? "").trim();
-  const summaryMatch = rawHandoff.match(/## Handoff Summary\s*([\s\S]*?)(?:\n## |\s*$)/);
+  const summaryMatch = rawHandoff.match(/## (?:Continuity Delta|Handoff Summary)\s*([\s\S]*?)(?:\n## |\s*$)/);
   const rationaleMatch = rawHandoff.match(/## Why Fresh Context Was Needed\s*([\s\S]*?)(?:\n## |\s*$)/);
   const nextStepsMatch = rawHandoff.match(/## Next Steps\s*([\s\S]*?)(?:\n## |\s*$)/);
   const intro = rawHandoff
-    .replace(/## Handoff Summary[\s\S]*$/m, "")
+    .replace(/## (?:Continuity Delta|Handoff Summary)[\s\S]*$/m, "")
     .trim();
   const summary = trimHandoffSection(summaryMatch?.[1] ?? "", HANDOFF_SUMMARY_MAX_CHARS);
   const rationale = trimHandoffSection(rationaleMatch?.[1] ?? "", HANDOFF_RATIONALE_MAX_CHARS);
@@ -1547,7 +1547,7 @@ function buildCompactionHandoffMessage(loop, handoffPrompt) {
   );
   if (openTasks.length > 0) {
     extraLines.push("", "## Open Tasks");
-    for (const task of openTasks.slice(0, HANDOFF_STATE_MAX_ITEMS)) {
+    for (const task of openTasks.slice(0, Math.min(3, HANDOFF_STATE_MAX_ITEMS))) {
       extraLines.push(`- ${task.id}: ${trimHandoffSection(String(task.title ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
       if (task.details?.trim()) {
         extraLines.push(`  Details: ${trimHandoffSection(task.details, HANDOFF_STATE_TEXT_MAX_CHARS)}`);
@@ -1556,19 +1556,19 @@ function buildCompactionHandoffMessage(loop, handoffPrompt) {
   }
   if (completedTasks.length > 0) {
     extraLines.push("", "## Recently Completed Tasks");
-    for (const task of completedTasks.slice(-HANDOFF_STATE_MAX_ITEMS)) {
+    for (const task of completedTasks.slice(-Math.min(4, HANDOFF_STATE_MAX_ITEMS))) {
       extraLines.push(`- ${task.id}: ${trimHandoffSection(String(task.title ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
     }
   }
   if (recentVerification.length > 0) {
     extraLines.push("", "## Recent Verification");
-    for (const item of recentVerification) {
+    for (const item of recentVerification.slice(-4)) {
       extraLines.push(`- ${trimHandoffSection(String(item?.text ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
     }
   }
   if (recentNotes.length > 0) {
     extraLines.push("", "## Recent Notes");
-    for (const item of recentNotes) {
+    for (const item of recentNotes.slice(-4)) {
       extraLines.push(`- ${trimHandoffSection(String(item?.text ?? "").trim(), HANDOFF_STATE_TEXT_MAX_CHARS)}`);
     }
   }
@@ -1599,7 +1599,7 @@ function buildCompactionHandoffMessage(loop, handoffPrompt) {
       extraLines.push("", ...activeTaskGraphContext);
     }
   }
-  if (summary) extraLines.push("", "## Handoff Summary", summary);
+  if (summary) extraLines.push("", "## Continuity Delta", summary);
   if (rationale) extraLines.push("", "## Why Fresh Context Was Needed", rationale);
   if (steps.length > 0) extraLines.push("", "## Next Steps", ...steps);
   extraLines.push(

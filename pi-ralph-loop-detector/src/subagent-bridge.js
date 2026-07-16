@@ -21,6 +21,8 @@ const RECOVERY_SUMMARY_SYSTEM_PROMPT = [
   "Do not turn Ralph bookkeeping mismatches, tracker drift, stale currentTaskId values, or note/plan inconsistencies into primary work items unless the evidence clearly shows they are blocking execution.",
   "Prioritize concrete user-task continuity, recent real code activity, and the next productive engineering step.",
   "Bias toward preserving continuity for the next agent. Include implementation details, named files/routes/modules/components when available, already-completed subtasks, recent failed attempts, and the narrowest high-value next moves.",
+  "If parentSessionContinuity is present, carry forward the useful thoughts from that session, but do not repeat canonical Ralph state or simply restate task titles/details already present elsewhere.",
+  "Prefer a continuity delta: what changed, what the agent was doing when context rotated, what remains uncertain, and the smallest concrete next moves.",
   "The summary should be substantial and specific rather than terse. Prefer a detailed multi-paragraph handoff over a short abstract summary.",
   "next_steps should be concrete engineering actions, not generic advice.",
   "Do not suggest restoring git branches, checking out branches, resetting git state, or any other action outside the documented tool contract.",

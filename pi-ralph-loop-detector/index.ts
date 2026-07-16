@@ -6,6 +6,7 @@ import * as path from "node:path";
 import { LoopDetector } from "./src/index.js";
 import { evaluateLoopWithSubagent, evaluateRecoverySummaryWithSubagent } from "./src/subagent-bridge.js";
 import { buildRecoveryPrompt, summarizeRecovery } from "./routing.js";
+import { summarizeParentSessionContinuity } from "./session-continuity.js";
 import {
 	clearPendingRalphHandoff,
 	dispatchPendingRalphHandoff,
@@ -86,6 +87,25 @@ interface RecoveryAnalysis {
 	rationale?: string;
 	suspectedGoal?: string;
 	offendingTool?: string | null;
+}
+
+interface ParentSessionContinuity {
+	sourceSessionFile: string;
+	currentSessionFile: string;
+	id: string | null;
+	timestamp: string | null;
+	parentSession: string | null;
+	cwd: string | null;
+	latestRalphIteration: string | null;
+	lastAssistantMessage: string | null;
+	lastUserMessage: string | null;
+	recentMessages: Array<{
+		type: string;
+		role: string | null;
+		customType: string | null;
+		text: string;
+		timestamp: string | null;
+	}>;
 }
 
 const RALPH_DEBUG_LOG = "/tmp/pi-ralph-loop-detector.log";
@@ -820,18 +840,18 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 	previousSummary?: string | null;
 	recentMessages?: any[];
 	turnPrefixMessages?: any[];
-}): unknown {
+}, parentSessionContinuity: ParentSessionContinuity | null = null): unknown {
 	const activeTask = selectCompactionActiveTask(loop);
 	const taskCounts = summarizeTaskCounts(loop);
 	const openTasks = Array.isArray(loop?.tasks)
-		? loop.tasks.filter((task: any) => task && task.status !== "done" && task.status !== "cancelled").slice(0, 10).map((task: any) => summarizeTaskForHandoff(task))
+		? loop.tasks.filter((task: any) => task && task.status !== "done" && task.status !== "cancelled").slice(0, 4).map((task: any) => summarizeTaskForHandoff(task))
 		: [];
 	const recentlyCompletedTasks = Array.isArray(loop?.tasks)
-		? loop.tasks.filter((task: any) => task && task.status === "done").slice(-6).map((task: any) => summarizeTaskForHandoff(task))
+		? loop.tasks.filter((task: any) => task && task.status === "done").slice(-4).map((task: any) => summarizeTaskForHandoff(task))
 		: [];
 	return {
 		task: "ralph_compaction_handoff_summary",
-		version: 1,
+		version: 2,
 		loop: {
 			name: loop.name,
 			status: loop.status,
@@ -865,6 +885,33 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 				}))
 				: [],
 		},
+		parentSessionContinuity: parentSessionContinuity
+			? {
+				sessionId: parentSessionContinuity.id,
+				timestamp: parentSessionContinuity.timestamp,
+				latestRalphIteration:
+					typeof parentSessionContinuity.latestRalphIteration === "string" && parentSessionContinuity.latestRalphIteration.trim()
+						? truncateText(parentSessionContinuity.latestRalphIteration.trim(), 1200)
+						: null,
+				lastAssistantMessage:
+					typeof parentSessionContinuity.lastAssistantMessage === "string" && parentSessionContinuity.lastAssistantMessage.trim()
+						? truncateText(parentSessionContinuity.lastAssistantMessage.trim(), 420)
+						: null,
+				lastUserMessage:
+					typeof parentSessionContinuity.lastUserMessage === "string" && parentSessionContinuity.lastUserMessage.trim()
+						? truncateText(parentSessionContinuity.lastUserMessage.trim(), 320)
+						: null,
+				recentMessages: Array.isArray(parentSessionContinuity.recentMessages)
+					? parentSessionContinuity.recentMessages.slice(-4).map((item) => ({
+						type: item.type,
+						role: item.role,
+						customType: item.customType,
+						timestamp: item.timestamp,
+						text: truncateText(String(item.text ?? "").trim(), 280),
+					}))
+					: [],
+			}
+			: null,
 		slice: {
 			customInstructions:
 				typeof slice?.customInstructions === "string" && slice.customInstructions.trim()
@@ -881,15 +928,27 @@ function buildCompactionSummarizerInputFromSlice(loop: any, slice: {
 	};
 }
 
-function buildCompactionSummarizerInput(event: any, loop: any): unknown {
+function loadParentSessionContinuity(ctx: any): ParentSessionContinuity | null {
+	const sessionFile = ctx?.sessionManager?.getSessionFile?.();
+	if (typeof sessionFile !== "string" || !sessionFile.trim()) return null;
+	try {
+		const continuity = summarizeParentSessionContinuity(sessionFile, { expectedCwd: ctx?.cwd });
+		return continuity as ParentSessionContinuity | null;
+	} catch {
+		return null;
+	}
+}
+
+function buildCompactionSummarizerInput(ctx: any, event: any, loop: any): unknown {
 	const preparation = event?.preparation ?? {};
+	const parentSessionContinuity = loadParentSessionContinuity(ctx);
 	return buildCompactionSummarizerInputFromSlice(loop, {
 		customInstructions: typeof event?.customInstructions === "string" ? event.customInstructions : null,
 		tokensBefore: preparation?.tokensBefore ?? null,
 		previousSummary: typeof preparation?.previousSummary === "string" ? preparation.previousSummary : null,
 		recentMessages: preparation?.messagesToSummarize ?? [],
 		turnPrefixMessages: preparation?.turnPrefixMessages ?? [],
-	});
+	}, parentSessionContinuity);
 }
 
 function buildCompactionSummarizerInputFromContext(ctx: any, loop: any): unknown {
@@ -910,20 +969,46 @@ function buildCompactionSummarizerInputFromContext(ctx: any, loop: any): unknown
 	});
 }
 
-function buildCompactionHandoffPrompt(loop: any, analysis: RecoveryAnalysis): string {
+function buildCompactionHandoffPrompt(
+	loop: any,
+	analysis: RecoveryAnalysis,
+	parentSessionContinuity: ParentSessionContinuity | null = null,
+): string {
 	const lines = [
 		`Ralph compaction handoff for loop "${loop.name}" at iteration ${loop.iteration}${loop.maxIterations > 0 ? `/${loop.maxIterations}` : ""}.`,
 		"",
 		"Pi skipped compaction and created a fresh session for this Ralph loop.",
 		"Do not assume the old transcript is available.",
-		"Use Ralph canonical state as the source of truth and the summarized handoff below as supporting context.",
+		"Use Ralph canonical state as the source of truth and the continuity delta below as supporting context.",
 	];
 
 	if (analysis.suspectedGoal?.trim()) {
 		lines.push("", `Suspected goal: ${analysis.suspectedGoal.trim()}`);
 	}
+	if (
+		parentSessionContinuity
+		&& (
+			parentSessionContinuity.latestRalphIteration?.trim()
+			|| parentSessionContinuity.lastAssistantMessage?.trim()
+			|| parentSessionContinuity.lastUserMessage?.trim()
+		)
+	) {
+		lines.push("", "## Prior Session Continuity");
+		if (parentSessionContinuity.timestamp) {
+			lines.push(`- Source timestamp: ${parentSessionContinuity.timestamp}`);
+		}
+		if (parentSessionContinuity.latestRalphIteration?.trim()) {
+			lines.push(`- Latest Ralph note: ${parentSessionContinuity.latestRalphIteration.trim()}`);
+		}
+		if (parentSessionContinuity.lastAssistantMessage?.trim()) {
+			lines.push(`- Last assistant thought: ${parentSessionContinuity.lastAssistantMessage.trim()}`);
+		}
+		if (parentSessionContinuity.lastUserMessage?.trim()) {
+			lines.push(`- Last user ask: ${parentSessionContinuity.lastUserMessage.trim()}`);
+		}
+	}
 	if (analysis.summary?.trim()) {
-		lines.push("", "## Handoff Summary", analysis.summary.trim());
+		lines.push("", "## Continuity Delta", analysis.summary.trim());
 	}
 	if (analysis.rationale?.trim()) {
 		lines.push("", "## Why Fresh Context Was Needed", analysis.rationale.trim());
@@ -1016,7 +1101,8 @@ async function prepareCompactionHandoff(state: RuntimeState, event: any, ctx: an
 		return false;
 	}
 
-	const summarizerInput = buildCompactionSummarizerInput(event, loop);
+	const parentSessionContinuity = loadParentSessionContinuity(ctx);
+	const summarizerInput = buildCompactionSummarizerInput(ctx, event, loop);
 	const summarizerInputSize = JSON.stringify(summarizerInput).length;
 	debugLog(`[ralph] compaction handoff summarizer input chars=${summarizerInputSize} loop=${loop.name} iteration=${loop.iteration}`);
 	if (ctx.hasUI) {
@@ -1040,7 +1126,7 @@ async function prepareCompactionHandoff(state: RuntimeState, event: any, ctx: an
 
 	const handoffPrompt =
 		analysis?.summary?.trim()
-			? buildCompactionHandoffPrompt(loop, analysis)
+			? buildCompactionHandoffPrompt(loop, analysis, parentSessionContinuity)
 			: [
 				`Ralph compaction handoff for loop "${loop.name}" at iteration ${loop.iteration}.`,
 				"",

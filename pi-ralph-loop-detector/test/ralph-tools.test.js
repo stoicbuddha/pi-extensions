@@ -3,6 +3,8 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { buildCompactionHandoffMessage } from "../ralph-tools.js";
+
 const source = fs.readFileSync(path.join(import.meta.dirname, "..", "ralph-tools.js"), "utf8");
 const bridgeSource = fs.readFileSync(path.join(import.meta.dirname, "..", "src", "subagent-bridge.js"), "utf8");
 const indexSource = fs.readFileSync(path.join(import.meta.dirname, "..", "index.ts"), "utf8");
@@ -141,4 +143,57 @@ test("pending handoff suppresses normal Ralph iteration dispatch", () => {
   assert.match(source, /Paused after ralph_done because fresh-context dispatch failed/);
   assert.match(source, /Paused after ralph_done because follow-up dispatch failed/);
   assert.match(source, /## Active Task Momentum/);
+});
+
+test("compaction handoff message renders continuity delta once and preserves prior-session continuity", () => {
+  const prompt = buildCompactionHandoffMessage(
+    {
+      name: "rust-store-mvp-v1",
+      status: "active",
+      iteration: 49,
+      maxIterations: 300,
+      summary: "Build the Rust store MVP.",
+      tasks: [
+        {
+          id: "task-28",
+          title: "Issue the auth cookie after successful login",
+          status: "todo",
+          details: "Add secure cookie issuance and a verification test.",
+          evidence: ["Session row creation already works."],
+          notes: ["Cookie flags still need to be centralized."],
+        },
+        {
+          id: "task-27",
+          title: "Add DB-backed session creation on successful login",
+          status: "done",
+        },
+      ],
+      verification: [{ text: "Added DB-backed session creation before redirect." }],
+      notes: [{ text: "Summary is too generic and duplicates the state dump." }],
+      reflections: [{ text: "Need prior-session thoughts in the handoff." }],
+    },
+    [
+      'Ralph compaction handoff for loop "rust-store-mvp-v1" at iteration 49/300.',
+      "",
+      "Pi skipped compaction and created a fresh session for this Ralph loop.",
+      "",
+      "## Prior Session Continuity",
+      "- Last assistant thought: pull thoughts from the parent session instead of repeating the task list.",
+      "",
+      "## Continuity Delta",
+      "The agent had already completed DB-backed session creation and was moving to cookie issuance. The handoff should carry over the prior-session thought about avoiding duplicated summaries.",
+      "",
+      "## Why Fresh Context Was Needed",
+      "Repeated summary formatting produced low-signal handoffs.",
+      "",
+      "## Next Steps",
+      "- Add cookie issuance with centralized flags.",
+    ].join("\n"),
+  );
+
+  assert.match(prompt, /## Prior Session Continuity/);
+  assert.match(prompt, /pull thoughts from the parent session/);
+  assert.match(prompt, /## Continuity Delta/);
+  assert.equal((prompt.match(/## Continuity Delta/g) ?? []).length, 1);
+  assert.doesNotMatch(prompt, /## Handoff Summary/);
 });

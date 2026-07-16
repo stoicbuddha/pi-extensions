@@ -62,6 +62,14 @@ test("deferred compaction queue marks the handoff before sending the follow-up p
 
 test("compaction summarizer input and prompt avoid elevating Ralph bookkeeping mismatches into primary work", () => {
   assert.doesNotMatch(indexSource, /currentTaskId: loop\.currentTaskId/);
+  assert.match(indexSource, /parentSessionContinuity:/);
+  assert.match(indexSource, /const parentSessionContinuity = loadParentSessionContinuity\(ctx\);/);
+  assert.match(indexSource, /## Prior Session Continuity/);
+  assert.match(indexSource, /## Continuity Delta/);
+  assert.match(indexSource, /Use Ralph canonical state as the source of truth and the continuity delta below as supporting context\./);
+  assert.match(indexSource, /buildCompactionHandoffPrompt\(loop, analysis, parentSessionContinuity\)/);
+  assert.match(routingSource, /DEFAULT_JUDGE_CONFIDENCE_THRESHOLD = 0\.7/);
+  assert.match(toolsSource, /## Continuity Delta/);
 });
 
 test("summarizeRecovery prefers review data when present", () => {
