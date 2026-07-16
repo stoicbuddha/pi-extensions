@@ -1102,14 +1102,19 @@ async function maybeQueueDeferredCompactionHandoff(ctx: any, pi: ExtensionAPI, t
 	);
 	const prompt = COMPACTION_HANDOFF_TOOL_PROMPT(loop.name);
 	try {
-		await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-		handoffHelpers.markPendingRalphHandoffQueued(ctx, loop.name, true);
-		debugLog(
-			`[ralph] compaction handoff deferred-queue complete loop=${loop.name} generation=${pending.generation} trigger=${trigger}`,
-		);
+		if (!handoffHelpers.markPendingRalphHandoffQueued(ctx, loop.name, true)) {
+			debugLog(
+				`[ralph] compaction handoff deferred-queue skipped loop=${loop.name} generation=${pending.generation} trigger=${trigger} reason=queue_mark_failed`,
+			);
+			return;
+		}
 		if (ctx.hasUI) {
 			ctx.ui.notify(`Ralph compaction handoff queued for ${loop.name}.`, "warning");
 		}
+		await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+		debugLog(
+			`[ralph] compaction handoff deferred-queue complete loop=${loop.name} generation=${pending.generation} trigger=${trigger}`,
+		);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		debugLog(

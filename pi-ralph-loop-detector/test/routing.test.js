@@ -13,6 +13,8 @@ import {
 } from "../routing.js";
 
 const indexSource = fs.readFileSync(path.join(import.meta.dirname, "..", "index.ts"), "utf8");
+const routingSource = fs.readFileSync(path.join(import.meta.dirname, "..", "routing.js"), "utf8");
+const toolsSource = fs.readFileSync(path.join(import.meta.dirname, "..", "ralph-tools.js"), "utf8");
 
 test("uses the fixed child-agent priority order", () => {
   assert.deepEqual(selectRecoveryChildren(), RECOVERY_CHILD_PRIORITY);
@@ -47,6 +49,15 @@ test("compaction handoff prompt tells the next session to use web access for exa
   assert.match(indexSource, /use the web access tool to research the exact issue before guessing/);
   assert.match(indexSource, /delegate early: use researcher for sourced web investigation or oracle for a second-opinion diagnosis/);
   assert.match(indexSource, /Do not keep brute-forcing the same exact technical issue in the main session/);
+});
+
+test("deferred compaction queue marks the handoff before sending the follow-up prompt", () => {
+  const markIndex = indexSource.indexOf("if (!handoffHelpers.markPendingRalphHandoffQueued(ctx, loop.name, true)) {");
+  const sendIndex = indexSource.indexOf("await pi.sendUserMessage(prompt, { deliverAs: \"followUp\" });");
+
+  assert.ok(markIndex !== -1);
+  assert.ok(sendIndex !== -1);
+  assert.ok(markIndex < sendIndex);
 });
 
 test("compaction summarizer input and prompt avoid elevating Ralph bookkeeping mismatches into primary work", () => {
@@ -106,8 +117,8 @@ test("session_before_compact stores handoff and deferred hooks queue a tool-call
   assert.match(indexSource, /async function maybeQueueDeferredCompactionHandoff\(ctx: any, pi: ExtensionAPI, trigger: string\): Promise<void>/);
   assert.match(indexSource, /pi\.on\("session_compact", async \(_event, ctx\) => \{/);
   assert.match(indexSource, /await maybeQueueDeferredCompactionHandoff\(ctx, pi, "session_compact"\);/);
+  assert.match(indexSource, /if \(!handoffHelpers\.markPendingRalphHandoffQueued\(ctx, loop\.name, true\)\) \{/);
   assert.match(indexSource, /await pi\.sendUserMessage\(prompt, \{ deliverAs: "followUp" \}\);/);
-  assert.match(indexSource, /handoffHelpers\.markPendingRalphHandoffQueued\(ctx, loop\.name, true\);/);
   assert.match(indexSource, /compaction handoff deferred-queue complete/);
 });
 
@@ -119,4 +130,5 @@ test("queued handoff turns log provider and tool-call lifecycle", () => {
   assert.match(indexSource, /handoff-turn tool_call/);
   assert.match(indexSource, /handoff-turn tool_result/);
   assert.match(indexSource, /handoff-turn agent_end/);
+  assert.match(toolsSource, /function getSessionControlCtx\(ctx\)/);
 });
