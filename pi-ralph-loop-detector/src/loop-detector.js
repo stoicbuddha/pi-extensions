@@ -155,6 +155,7 @@ export class LoopDetector {
     this.lastJudgeOutcome = null;
     this.pendingIntents = [];
     this.intentMismatches = [];
+    this.lastReviewedTriggerSignature = null;
   }
 
   getState() {
@@ -203,9 +204,18 @@ export class LoopDetector {
 
     const trigger = this.#evaluateHeuristics();
     if (!trigger) {
+      this.lastReviewedTriggerSignature = null;
       this.#debug("heuristics.none", {
         eventType: normalizedEvent.type,
         eventTool: normalizedEvent.toolName ?? null,
+      });
+      return null;
+    }
+    const triggerSignature = buildTriggerSignature(trigger);
+    if (triggerSignature && triggerSignature === this.lastReviewedTriggerSignature) {
+      this.#debug("heuristics.reviewed_skip", {
+        trigger: trigger.kind,
+        signature: triggerSignature,
       });
       return null;
     }
@@ -226,6 +236,7 @@ export class LoopDetector {
     this.#debug("review.result", review);
 
     if (!judgeOutcome.is_loop || judgeOutcome.action === "continue") {
+      this.lastReviewedTriggerSignature = triggerSignature;
       this.#debug("intervention.skip", {
         trigger: trigger.kind,
         reason: judgeOutcome.reason,
@@ -257,6 +268,7 @@ export class LoopDetector {
 
     this.lastInterventionType = intervention.type;
     this.cooldownRemaining = this.config.cooldownEvents;
+    this.lastReviewedTriggerSignature = null;
     this.#resetLoopEvidence();
     this.#debug("intervention.emit", intervention);
 
@@ -317,6 +329,7 @@ export class LoopDetector {
     this.events = [];
     this.pendingIntents = [];
     this.intentMismatches = [];
+    this.lastReviewedTriggerSignature = null;
   }
 
   #shouldClearCooldownEarly(event) {
@@ -794,6 +807,31 @@ export function buildNormalizedSummary(trigger) {
     actualToolSequence: trigger.actualToolSequence ?? [],
     notes: trigger.notes ?? [],
   };
+}
+
+function buildTriggerSignature(trigger) {
+  if (!trigger || typeof trigger !== "object") return null;
+  const normalizedKind = normalizeReviewedTriggerKind(trigger.kind);
+  const signature = {
+    kind: normalizedKind,
+    offendingTool: trigger.offendingTool ?? null,
+    argsSignature: normalizedKind === "tool_repetition" ? null : trigger.argsSignature ?? null,
+    repeatCount: Number.isFinite(trigger.repeatCount) ? trigger.repeatCount : null,
+    mismatchCount: Number.isFinite(trigger.mismatchCount) ? trigger.mismatchCount : null,
+    failureCount: Number.isFinite(trigger.failureCount) ? trigger.failureCount : null,
+    cycleCount: Number.isFinite(trigger.cycleCount) ? trigger.cycleCount : null,
+    repeatedMessageCount: Number.isFinite(trigger.repeatedMessageCount) ? trigger.repeatedMessageCount : null,
+    expectedTools: Array.isArray(trigger.expectedTools) ? trigger.expectedTools : [],
+    actualToolSequence: Array.isArray(trigger.actualToolSequence) ? trigger.actualToolSequence : [],
+  };
+  return JSON.stringify(signature);
+}
+
+function normalizeReviewedTriggerKind(kind) {
+  if (kind === "same_call_repetition" || kind === "same_tool_repetition") {
+    return "tool_repetition";
+  }
+  return kind ?? null;
 }
 
 export function buildInterventionMessage(type, trigger, offendingTool) {

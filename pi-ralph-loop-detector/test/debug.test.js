@@ -6,7 +6,7 @@ import { LoopDetector } from "../src/index.js";
 test("emits debug trace for heuristic and judge evaluation", async () => {
   const debugEvents = [];
   const detector = new LoopDetector({
-    sameTool: { minRepeats: 3 },
+    sameTool: { minRepeats: 3, recentActions: 10 },
     tools: {
       rollback_status: {
         sameToolRepeats: 2,
@@ -197,4 +197,51 @@ test("builds repeated cycles even when assistant text arrives after the tool res
 
   assert.equal(outcome.trigger.kind, "cycle_repetition");
   assert.equal(outcome.trigger.offendingTool, "ToolKitMCP_set_project_cwd");
+});
+
+test("does not re-judge the same reviewed repetition on unrelated later events", async () => {
+  let judgeCalls = 0;
+  const detector = new LoopDetector({
+    sameTool: { minRepeats: 3, recentActions: 10 },
+    tools: {
+      foo: {
+        sameToolRepeats: 3,
+        successCountsAsProgress: false,
+      },
+    },
+    judge: async () => {
+      judgeCalls += 1;
+      return {
+        is_loop: false,
+        confidence: 1,
+        reason: "allowed repetition",
+        action: "continue",
+        offendingTool: "foo",
+      };
+    },
+  });
+
+  await detector.handleEvent({ type: "tool_call", toolName: "foo", args: { x: 1 } });
+  await detector.handleEvent({ type: "tool_result", toolName: "foo", args: { x: 1 }, ok: true, result: "ok" });
+  await detector.handleEvent({ type: "tool_call", toolName: "foo", args: { x: 1 } });
+  await detector.handleEvent({ type: "tool_result", toolName: "foo", args: { x: 1 }, ok: true, result: "ok" });
+
+  const firstOutcome = await detector.handleEvent({ type: "tool_call", toolName: "foo", args: { x: 1 } });
+  assert.equal(firstOutcome?.trigger.kind, "same_call_repetition");
+  assert.equal(judgeCalls, 1);
+
+  assert.equal(await detector.handleEvent({ type: "tool_result", toolName: "foo", args: { x: 1 }, ok: true, result: "ok" }), null);
+  assert.equal(await detector.handleEvent({ type: "tool_call", toolName: "bar", args: { y: 1 } }), null);
+  assert.equal(await detector.handleEvent({ type: "tool_result", toolName: "bar", args: { y: 1 }, ok: true, result: "ok" }), null);
+  assert.equal(await detector.handleEvent({ type: "tool_call", toolName: "baz", args: { z: 1 } }), null);
+  assert.equal(judgeCalls, 1);
+
+  assert.equal(await detector.handleEvent({ type: "tool_result", toolName: "baz", args: { z: 1 }, ok: true, result: "ok" }), null);
+  let secondOutcome = await detector.handleEvent({ type: "tool_call", toolName: "foo", args: { x: 1 } });
+  if (!secondOutcome) {
+    await detector.handleEvent({ type: "tool_result", toolName: "foo", args: { x: 1 }, ok: true, result: "ok" });
+    secondOutcome = await detector.handleEvent({ type: "tool_call", toolName: "foo", args: { x: 1 } });
+  }
+  assert.equal(secondOutcome?.trigger.offendingTool, "foo");
+  assert.equal(judgeCalls, 2);
 });

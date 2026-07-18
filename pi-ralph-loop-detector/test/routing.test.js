@@ -52,7 +52,7 @@ test("compaction handoff prompt tells the next session to use web access for exa
 });
 
 test("deferred compaction queue marks the handoff before sending the follow-up prompt", () => {
-  const markIndex = indexSource.indexOf("if (!handoffHelpers.markPendingRalphHandoffQueued(ctx, loop.name, true)) {");
+  const markIndex = indexSource.indexOf("if (!handoffHelpers.markPendingRalphHandoffQueued(storeCtx, loop.name, true)) {");
   const sendIndex = indexSource.indexOf("await pi.sendUserMessage(prompt, { deliverAs: \"followUp\" });");
 
   assert.ok(markIndex !== -1);
@@ -130,9 +130,11 @@ test("session_before_compact stores handoff and deferred hooks queue a tool-call
   assert.doesNotMatch(indexSource, /loopName: "\$\{loopName\}"/);
   assert.match(indexSource, /Do not continue normal work in this session before calling that tool\./);
   assert.match(indexSource, /async function maybeQueueDeferredCompactionHandoff\(ctx: any, pi: ExtensionAPI, trigger: string\): Promise<void>/);
+  assert.match(indexSource, /const storeCtx = getRalphStoreCtx\(ctx\);/);
+  assert.match(indexSource, /const pending = getPendingRalphHandoff\(storeCtx\);/);
+  assert.match(indexSource, /markPendingRalphHandoffQueued\(storeCtx, loop\.name, true\)/);
   assert.match(indexSource, /pi\.on\("session_compact", async \(_event, ctx\) => \{/);
   assert.match(indexSource, /await maybeQueueDeferredCompactionHandoff\(ctx, pi, "session_compact"\);/);
-  assert.match(indexSource, /if \(!handoffHelpers\.markPendingRalphHandoffQueued\(ctx, loop\.name, true\)\) \{/);
   assert.match(indexSource, /await pi\.sendUserMessage\(prompt, \{ deliverAs: "followUp" \}\);/);
   assert.match(indexSource, /compaction handoff deferred-queue complete/);
 });

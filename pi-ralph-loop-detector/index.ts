@@ -12,6 +12,7 @@ import {
 	dispatchPendingRalphHandoff,
 	ensurePendingRalphHandoff,
 	getActiveRalphLoop,
+	getRalphStoreCtx,
 	getSessionActiveRalphLoop,
 	getPendingRalphHandoff,
 	markPendingRalphHandoffQueued,
@@ -1165,7 +1166,8 @@ async function prepareCompactionHandoff(state: RuntimeState, event: any, ctx: an
 }
 
 async function maybeQueueDeferredCompactionHandoff(ctx: any, pi: ExtensionAPI, trigger: string): Promise<void> {
-	const pending = getPendingRalphHandoff(ctx);
+	const storeCtx = getRalphStoreCtx(ctx);
+	const pending = getPendingRalphHandoff(storeCtx);
 	if (!pending) {
 		debugLog(`[ralph] compaction handoff deferred-queue skipped trigger=${trigger} reason=no_pending_handoff`);
 		return;
@@ -1177,7 +1179,7 @@ async function maybeQueueDeferredCompactionHandoff(ctx: any, pi: ExtensionAPI, t
 		);
 		return;
 	}
-	if (typeof ctx?.hasPendingMessages === "function" && ctx.hasPendingMessages()) {
+	if (typeof storeCtx?.hasPendingMessages === "function" && storeCtx.hasPendingMessages()) {
 		debugLog(
 			`[ralph] compaction handoff deferred-queue skipped loop=${loop.name} generation=${pending.generation} trigger=${trigger} reason=pending_messages`,
 		);
@@ -1201,14 +1203,14 @@ async function maybeQueueDeferredCompactionHandoff(ctx: any, pi: ExtensionAPI, t
 	);
 	const prompt = COMPACTION_HANDOFF_TOOL_PROMPT(loop.name);
 	try {
-		if (!handoffHelpers.markPendingRalphHandoffQueued(ctx, loop.name, true)) {
+		if (!handoffHelpers.markPendingRalphHandoffQueued(storeCtx, loop.name, true)) {
 			debugLog(
 				`[ralph] compaction handoff deferred-queue skipped loop=${loop.name} generation=${pending.generation} trigger=${trigger} reason=queue_mark_failed`,
 			);
 			return;
 		}
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Ralph compaction handoff queued for ${loop.name}.`, "warning");
+		if (storeCtx?.hasUI) {
+			storeCtx.ui.notify(`Ralph compaction handoff queued for ${loop.name}.`, "warning");
 		}
 		await pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 		debugLog(

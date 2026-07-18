@@ -56,6 +56,11 @@ function debugLog(message) {
   }
 }
 
+function isStaleExtensionContextError(error) {
+  const detail = error instanceof Error ? error.message : String(error);
+  return detail.includes("This extension ctx is stale after session replacement or reload.");
+}
+
 function rememberSessionControlCtx(ctx) {
   if (!ctx || typeof ctx.newSession !== "function") return;
   latestSessionControlCtx = ctx;
@@ -66,6 +71,33 @@ function getSessionControlCtx(ctx) {
   if (latestSessionControlCtx && typeof latestSessionControlCtx.newSession === "function") {
     return latestSessionControlCtx;
   }
+  return ctx;
+}
+
+export function getRalphStoreCtx(ctx) {
+  if (ctx) {
+    try {
+      if (typeof ctx.cwd === "string") {
+        return ctx;
+      }
+    } catch (error) {
+      if (!isStaleExtensionContextError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  const fallbackCtx = getSessionControlCtx(null);
+  if (fallbackCtx && fallbackCtx !== ctx) {
+    try {
+      if (typeof fallbackCtx.cwd === "string") {
+        return fallbackCtx;
+      }
+    } catch {
+      // Ignore stale fallback contexts and return the original ctx below.
+    }
+  }
+
   return ctx;
 }
 
