@@ -31,6 +31,7 @@ test("/ralph resume resolves paused or selected loops without active-loop fallba
 test("exports Ralph stop steering for natural assistant stops", () => {
   assert.match(source, /export async function maybeDispatchStoppedLoopSteering\(ctx, pi, options = \{\}\)/);
   assert.match(source, /if \(stopReason !== "stop"\) return false;/);
+  assert.match(source, /const loop = getSessionActiveRalphLoop\(ctx\);/);
   assert.match(source, /if \(loop\.pendingHandoff\) return false;/);
   assert.match(source, /loop\.lastDoneReminderAt = loop\.iteration;/);
   assert.match(source, /call the actual ralph_done tool now using the tool interface/);
@@ -110,10 +111,17 @@ test("compact plan summary includes actionable task context", () => {
 
 test("ralph_done resolves the running loop through session hints", () => {
   assert.match(source, /const sessionLoopHints = new Map\(\);/);
+  assert.match(source, /const sessionActiveLoops = new Map\(\);/);
   assert.match(source, /function rememberLoopHint\(ctx, loopName\)/);
+  assert.match(source, /function rememberActiveLoopSession\(ctx, loopName\)/);
+  assert.match(source, /export function getSessionActiveRalphLoop\(ctx\)/);
+  assert.match(source, /const loopName = getActiveLoopSessionName\(ctx\);/);
   assert.match(source, /function getCurrentLoopWithHint\(store, ctx, loopName\)/);
   assert.match(source, /const loop = getCurrentLoopWithHint\(store, ctx\);/);
   assert.match(source, /rememberLoopHint\(ctx, loop\.name\);/);
+  assert.match(source, /rememberActiveLoopSession\(ctx, loop\?\.name\);/);
+  assert.match(source, /rememberActiveLoopSession\(replacementCtx, loop\?\.name\);/);
+  assert.match(source, /rememberActiveLoopSession\(ctx, null\);/);
   assert.match(source, /if \(!hasRemainingTaskWork\(loop\)\) \{\s+setStatus\(loop, "completed"\);/s);
   assert.match(source, /All Ralph tasks are complete\. Loop stopped\./);
 });

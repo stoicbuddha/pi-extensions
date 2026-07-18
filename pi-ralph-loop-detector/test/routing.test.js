@@ -112,6 +112,13 @@ test("agent_end wires natural assistant stops into Ralph stop steering", () => {
   assert.match(indexSource, /stopReason: typeof lastAssistant\?\.stopReason === "string" \? lastAssistant\.stopReason : ""/);
 });
 
+test("loop detector arms itself only for sessions explicitly running Ralph", () => {
+  assert.match(indexSource, /getSessionActiveRalphLoop/);
+  assert.match(indexSource, /function safeGetSessionActiveRalphLoop\(ctx: any\)/);
+  assert.match(indexSource, /const activeLoop = safeGetSessionActiveRalphLoop\(ctx\);/);
+  assert.match(indexSource, /sessionActiveLoop=/);
+});
+
 test("session_before_compact stores handoff and deferred hooks queue a tool-call prompt after compaction", () => {
   assert.match(indexSource, /pi\.on\("session_before_compact", async \(event, ctx\) => \{/);
   assert.match(indexSource, /const prepared = await prepareCompactionHandoff\(runtime, event, ctx, pi\);/);

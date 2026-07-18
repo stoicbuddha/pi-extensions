@@ -40,6 +40,7 @@ const RALPH_CONTEXT_END = "<!-- RALPH_LOOP_CONTEXT_END -->";
 let latestSessionControlCtx = null;
 let latestLoopHint = null;
 const sessionLoopHints = new Map();
+const sessionActiveLoops = new Map();
 const RALPH_DEBUG_LOG = "/tmp/pi-ralph-loop-detector.log";
 
 function nowIso() {
@@ -86,6 +87,24 @@ function getLoopHint(ctx) {
     return sessionLoopHints.get(key) ?? null;
   }
   return latestLoopHint;
+}
+
+function rememberActiveLoopSession(ctx, loopName) {
+  const key = getSessionHintKey(ctx);
+  if (!key) return;
+  if (typeof loopName === "string" && loopName.trim()) {
+    const normalized = loopName.trim();
+    sessionActiveLoops.set(key, normalized);
+    rememberLoopHint(ctx, normalized);
+    return;
+  }
+  sessionActiveLoops.delete(key);
+}
+
+function getActiveLoopSessionName(ctx) {
+  const key = getSessionHintKey(ctx);
+  if (!key || !sessionActiveLoops.has(key)) return null;
+  return sessionActiveLoops.get(key) ?? null;
 }
 
 function escapeRegExp(text) {
@@ -1378,12 +1397,14 @@ async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh",
   if (!canNewSession) {
     logHandoffStage(loop, `${mode}-no-newSession`);
     logPromptDispatch(loop, `${mode}/followUp-fallback`, prompt);
+    rememberActiveLoopSession(ctx, loop?.name);
     if (await deliverIterationPrompt(ctx, prompt)) {
       if (typeof onDispatched === "function") {
         await onDispatched(ctx);
       }
       return true;
     }
+    rememberActiveLoopSession(ctx, null);
     if (await deliverIterationPrompt(pi, prompt)) {
       if (typeof onDispatched === "function") {
         await onDispatched(ctx);
@@ -1403,6 +1424,7 @@ async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh",
       withSession: async (replacementCtx) => {
         rememberSessionControlCtx(replacementCtx);
         rememberLoopHint(replacementCtx, loop?.name);
+        rememberActiveLoopSession(replacementCtx, loop?.name);
         logHandoffStage(loop, `${mode}-withSession-enter`, { parentSession });
         await deliverFreshSessionPrompt(replacementCtx, prompt);
         logHandoffStage(loop, `${mode}-withSession-delivered`);
@@ -1428,6 +1450,7 @@ async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh",
 
   logHandoffStage(loop, `${mode}-followUp-fallback-start`);
   logPromptDispatch(loop, `${mode}/followUp`, prompt);
+  rememberActiveLoopSession(ctx, loop?.name);
   if (await deliverIterationPrompt(ctx, prompt)) {
     if (typeof onDispatched === "function") {
       await onDispatched(ctx);
@@ -1435,6 +1458,7 @@ async function dispatchFreshContextPrompt(pi, ctx, loop, prompt, mode = "fresh",
     return true;
   }
 
+  rememberActiveLoopSession(ctx, null);
   if (await deliverIterationPrompt(pi, prompt)) {
     if (typeof onDispatched === "function") {
       await onDispatched(ctx);
@@ -1957,12 +1981,25 @@ export function getActiveRalphLoop(ctx) {
   return loop;
 }
 
+export function getSessionActiveRalphLoop(ctx) {
+  const store = loadStore(ctx);
+  const loopName = getActiveLoopSessionName(ctx);
+  if (!loopName) return null;
+  const loop = getCurrentLoop(store, loopName);
+  if (!loop || loop.status !== "active") {
+    rememberActiveLoopSession(ctx, null);
+    return null;
+  }
+  rememberLoopHint(ctx, loop.name);
+  return loop;
+}
+
 export async function maybeDispatchStoppedLoopSteering(ctx, pi, options = {}) {
   const stopReason = typeof options.stopReason === "string" ? options.stopReason : "";
   if (stopReason !== "stop") return false;
 
   const store = loadStore(ctx);
-  const loop = getCurrentLoop(store);
+  const loop = getSessionActiveRalphLoop(ctx);
   if (!loop || loop.status !== "active") return false;
   if (loop.pendingHandoff) return false;
 
@@ -2031,6 +2068,7 @@ async function resumeLoop(pi, ctx, store, loop) {
   if (!hasRemainingTaskWork(loop)) {
     setStatus(loop, "completed");
     persistLoop(ctx, store, loop);
+    rememberActiveLoopSession(ctx, null);
     if (ctx.hasUI) ctx.ui.notify(`Loop already complete: ${loop.name}`, "info");
     return;
   }
@@ -2085,6 +2123,7 @@ export function registerRalphSurface(pi) {
       }
       setStatus(loop, "paused");
       persistLoop(ctx, store, loop);
+      rememberActiveLoopSession(ctx, null);
       if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}`, "info");
       return;
     }
@@ -2230,6 +2269,7 @@ export function registerRalphSurface(pi) {
     loop.status = "completed";
     loop.completedAt = nowIso();
     persistLoop(ctx, store, loop);
+    rememberActiveLoopSession(ctx, null);
     if (ctx.hasUI) ctx.ui.notify(`Stopped Ralph loop: ${loop.name}`, "info");
   });
 
@@ -2459,17 +2499,20 @@ export function registerRalphSurface(pi) {
       if (!loop) return { content: [{ type: "text", text: "No active Ralph loop." }], details: {} };
       if (loop.status !== "active") return { content: [{ type: "text", text: "Ralph loop is not active." }], details: {} };
       rememberLoopHint(ctx, loop.name);
+      rememberActiveLoopSession(ctx, loop.name);
       loop.iteration += 1;
       addVerification(loop, "Iteration advanced via ralph_done");
       if (!hasRemainingTaskWork(loop)) {
         setStatus(loop, "completed");
         saveStore(ctx, store);
+        rememberActiveLoopSession(ctx, null);
         if (ctx.hasUI) ctx.ui.notify(`Completed Ralph loop: ${loop.name}. No unfinished tasks remain.`, "info");
         return { content: [{ type: "text", text: "All Ralph tasks are complete. Loop stopped." }], details: { loop } };
       }
       if (loop.maxIterations > 0 && loop.iteration > loop.maxIterations) {
         setStatus(loop, "completed");
         saveStore(ctx, store);
+        rememberActiveLoopSession(ctx, null);
         return { content: [{ type: "text", text: "Max iterations reached. Loop stopped." }], details: { loop } };
       }
       persistLoop(ctx, store, loop);
@@ -2477,6 +2520,7 @@ export function registerRalphSurface(pi) {
       if (!checkpointResult.ok) {
         setStatus(loop, "paused");
         persistLoop(ctx, store, loop);
+        rememberActiveLoopSession(ctx, null);
         if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}. ${checkpointResult.message}`, "warning");
         return { content: [{ type: "text", text: `Error: ${checkpointResult.message}` }], details: { loop } };
       }
@@ -2499,6 +2543,7 @@ export function registerRalphSurface(pi) {
           setStatus(loop, "paused");
           addVerification(loop, "Paused after ralph_done because fresh-context dispatch failed");
           persistLoop(ctx, store, loop);
+          rememberActiveLoopSession(ctx, null);
           if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}. Fresh-context dispatch failed after ralph_done. Resume manually once the handoff path is healthy.`, "warning");
           return {
             content: [{ type: "text", text: `Error: iteration advanced, but fresh-context dispatch failed for loop "${loop.name}". Ralph paused for manual resume.` }],
@@ -2515,6 +2560,7 @@ export function registerRalphSurface(pi) {
         setStatus(loop, "paused");
         addVerification(loop, "Paused after ralph_done because follow-up dispatch failed");
         persistLoop(ctx, store, loop);
+        rememberActiveLoopSession(ctx, null);
         if (ctx.hasUI) ctx.ui.notify(`Paused Ralph loop: ${loop.name}. Follow-up dispatch failed after ralph_done. Resume manually once the queue path is healthy.`, "warning");
         return {
           content: [{ type: "text", text: `Error: iteration advanced, but follow-up dispatch failed for loop "${loop.name}". Ralph paused for manual resume.` }],
@@ -2526,8 +2572,7 @@ export function registerRalphSurface(pi) {
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
-    const store = loadStore(ctx);
-    const loop = getCurrentLoopWithHint(store, ctx);
+    const loop = getSessionActiveRalphLoop(ctx);
     if (!loop || loop.status !== "active") return;
     rememberLoopHint(ctx, loop.name);
     const basePrompt = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";

@@ -12,6 +12,7 @@ import {
 	dispatchPendingRalphHandoff,
 	ensurePendingRalphHandoff,
 	getActiveRalphLoop,
+	getSessionActiveRalphLoop,
 	getPendingRalphHandoff,
 	markPendingRalphHandoffQueued,
 	maybeDispatchStoppedLoopSteering,
@@ -148,6 +149,18 @@ function safeGetActiveRalphLoop(ctx: any) {
 	} catch (error) {
 		if (isStaleExtensionContextError(error)) {
 			debugLog("[ralph] ignored stale extension ctx while reading active Ralph loop");
+			return null;
+		}
+		throw error;
+	}
+}
+
+function safeGetSessionActiveRalphLoop(ctx: any) {
+	try {
+		return getSessionActiveRalphLoop(ctx);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) {
+			debugLog("[ralph] ignored stale extension ctx while reading session-active Ralph loop");
 			return null;
 		}
 		throw error;
@@ -1284,7 +1297,7 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 		let runtime = createRuntimeState(safeLoadProjectConfig(null), createJudgeBridge(pi, () => runtime.hostContext));
 
 		function syncActiveLoop(ctx: any): string | null {
-			const activeLoop = safeGetActiveRalphLoop(ctx);
+			const activeLoop = safeGetSessionActiveRalphLoop(ctx);
 			const activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
 			if (!activeLoopName) {
 				if (runtime.activeLoopName !== null || runtime.events.length > 0 || runtime.halted || runtime.lastOutcome) {
@@ -1498,13 +1511,14 @@ async function handleJudgeOutcome(state: RuntimeState, ctx: any, pi: ExtensionAP
 		const previousSessionFile =
 			typeof (_event as any)?.previousSessionFile === "string" ? (_event as any).previousSessionFile : undefined;
 		const activeLoop = safeGetActiveRalphLoop(ctx);
+		const sessionActiveLoop = safeGetSessionActiveRalphLoop(ctx);
 		const wasEnabled = runtime.enabled;
 		runtime = createRuntimeState(safeLoadProjectConfig(ctx), createJudgeBridge(pi, () => runtime.hostContext));
 		runtime.hostContext = ctx;
-		runtime.activeLoopName = typeof activeLoop?.name === "string" ? activeLoop.name : null;
+		runtime.activeLoopName = typeof sessionActiveLoop?.name === "string" ? sessionActiveLoop.name : null;
 		runtime.enabled = wasEnabled;
 		debugLog(
-			`[ralph] session_start reason=${reason ?? "unknown"} previousSessionFile=${JSON.stringify(previousSessionFile ?? null)} activeLoop=${JSON.stringify(runtime.activeLoopName)}`,
+			`[ralph] session_start reason=${reason ?? "unknown"} previousSessionFile=${JSON.stringify(previousSessionFile ?? null)} activeLoop=${JSON.stringify(typeof activeLoop?.name === "string" ? activeLoop.name : null)} sessionActiveLoop=${JSON.stringify(runtime.activeLoopName)}`,
 		);
 		if (ctx.hasUI) {
 			ctx.ui.notify("Ralph loop detector loaded for this session.", "info");
