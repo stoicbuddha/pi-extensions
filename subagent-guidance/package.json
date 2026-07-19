@@ -1,0 +1,28 @@
+{
+  "name": "@tmustier/pi-subagent-guidance",
+  "version": "0.1.0",
+  "description": "Appends parent-only subagent orchestration guidance from SUBAGENT_USE.md while skipping pi-subagents child sessions.",
+  "license": "MIT",
+  "author": "Thomas Mustier",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tmustier/pi-extensions.git",
+    "directory": "subagent-guidance"
+  },
+  "bugs": "https://github.com/tmustier/pi-extensions/issues",
+  "homepage": "https://github.com/tmustier/pi-extensions/tree/main/subagent-guidance",
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0"
+  }
+}

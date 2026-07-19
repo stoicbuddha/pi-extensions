@@ -10,6 +10,7 @@ Personal extensions for the [Pi coding agent](https://github.com/badlogic/pi-mon
 | [tab-status](tab-status/) | Manage as many parallel sessions as your mind can handle. Terminal tab indicators for <br>✅ done / 🚧 stuck / 🛑 timed out |
 | [pi-ralph-wiggum](pi-ralph-wiggum/) | Run arbitrarily-long tasks without diluting model attention. Flat version without subagents like [ralph-loop](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/ralph-loop) |
 | [agent-guidance](agent-guidance/) | Switch between Claude/Codex/Gemini with model-specific guidance (CLAUDE.md, CODEX.md, GEMINI.md) |
+| [subagent-guidance](subagent-guidance/) | Append parent-only subagent orchestration guidance from `SUBAGENT_USE.md` without leaking it into child subagents |
 | [/usage](usage-extension/) | 📊 Usage statistics dashboard. See cost, tokens, and messages by provider/model across Today, This Week, Last Week, and All Time — with a compact view for narrow terminals |
 | [/paste](raw-paste/) | Paste editable text, not [paste #1 +21 lines]. Running `/paste` with optional keybinding |
 | [/code](code-actions/) | Pick code blocks or inline snippets from assistant messages to copy, insert, or run with `/code` |
@@ -59,6 +60,7 @@ If you keep a local clone, add extensions to your `~/.pi/agent/settings.json`:
     "~/pi-extensions/arcade/mario-not/mario-not.ts",
     "~/pi-extensions/pi-ralph-wiggum",
     "~/pi-extensions/agent-guidance/agent-guidance.ts",
+    "~/pi-extensions/subagent-guidance/index.ts",
     "~/pi-extensions/raw-paste",
     "~/pi-extensions/code-actions",
     "~/pi-extensions/session-recap",

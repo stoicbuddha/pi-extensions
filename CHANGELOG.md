@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.43] - 2026-07-19
+
+### Added
+- Add `subagent-guidance`, a small Pi extension that appends `~/.pi/agent/SUBAGENT_USE.md` only for parent sessions and skips `pi-subagents` child sessions.
+
 ## [0.1.42] - 2026-05-13
 
 ### Changed

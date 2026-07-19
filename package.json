@@ -20,6 +20,7 @@
       "./pi-ralph-wiggum/index.ts",
       "./pi-ralph-loop-detector/index.ts",
       "./session-recap/index.ts",
+      "./subagent-guidance/index.ts",
       "./tab-status/tab-status.ts",
       "./usage-extension/index.ts"
     ],
